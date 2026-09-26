@@ -80,6 +80,9 @@ export function renderTimeline(parsed: ParsedTrace, options: { all?: boolean } =
       case "recovery_action":
         lines.push(`  ${stamp(ev)}  recovery ${ev.action} ${ev.toolName}${ev.error ? ` "${clip(ev.error, 80)}"` : ""}`);
         continue;
+      case "compaction":
+        lines.push(`  ${stamp(ev)}  compaction (${ev.trigger}) tokens=${ev.tokensBefore} cut=@${ev.cutIndex} summary=${ev.summaryChars} chars`);
+        continue;
       default:
         if (options.all) lines.push(`  ${stamp(ev)}  ${ev.type}`);
     }

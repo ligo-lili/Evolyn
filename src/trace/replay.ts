@@ -27,7 +27,7 @@ export interface ReplayState {
   messageSeqs: number[];
   /** Every tool call seen, with its latest state machine position. */
   calls: Map<string, ReplayToolCall>;
-  /** approval / recovery_action audit events seen so far. */
+  /** approval / recovery_action / compaction audit events seen so far. */
   audits: TraceEvent[];
 }
 
@@ -115,6 +115,7 @@ export class ReplayMachine {
       }
       case "approval":
       case "recovery_action":
+      case "compaction":
         s.audits.push(event);
         break;
       default:
@@ -183,6 +184,7 @@ export function explain(
   for (const audit of st.audits.slice(-3)) {
     if (audit.type === "approval") why.push(`审批：${audit.decision} ${audit.toolName}${audit.reason ? ` (${audit.reason})` : ""}`);
     else if (audit.type === "recovery_action") why.push(`恢复动作：${audit.action} ${audit.toolName}`);
+    else if (audit.type === "compaction") why.push(`上下文已压缩（seq ${audit.seq}，压缩前 ${audit.tokensBefore} tokens）——模型看到的是摘要 + 近期消息`);
   }
 
   return { state: st, why };

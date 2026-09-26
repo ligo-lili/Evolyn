@@ -3,3 +3,7 @@ dist/
 .harness/
 *.log
 .env
+ 
+# demo run artifacts 
+/hello.txt 
+/note.txt

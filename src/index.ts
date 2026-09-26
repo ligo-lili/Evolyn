@@ -8,6 +8,15 @@ export { createApprovalHook, DEFAULT_APPROVAL_POLICY, type ApprovalMode, type Ap
 export { applyFaultToTools, FaultController, formatFaultSpec, parseFaultSpec, type FaultPoint, type FaultSpec } from "./execution/fault.js";
 export { CheckpointWriter, type CheckpointState, type ToolCallState, type TrackedToolCall } from "./execution/checkpoint.js";
 export {
+  assembleSystemPrompt,
+  renderExperienceBlock,
+  renderSkillBlock,
+  type ExperienceEntry,
+  type PromptSections,
+  type SkillEntry,
+} from "./context/assembler.js";
+export { createContextTransformer, findCutIndex, type CompactionOptions } from "./context/compaction.js";
+export {
   loadCrashedRun,
   planRecovery,
   toolResultMessage,

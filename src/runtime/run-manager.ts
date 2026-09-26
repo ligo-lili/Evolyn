@@ -13,6 +13,8 @@ import { TraceEventRepo } from "../storage/repos/trace-events.js";
 import { CheckpointRepo } from "../storage/repos/checkpoints.js";
 import { CheckpointWriter } from "../execution/checkpoint.js";
 import { loadCrashedRun, planRecovery, toolResultMessage } from "../execution/recovery.js";
+import { createContextTransformer } from "../context/compaction.js";
+import type { CompactionSettings } from "@earendil-works/pi-agent-core";
 import { TraceRecorder, JsonlTraceSink, type TraceSink } from "../trace/recorder.js";
 import { applyFaultToTools, FaultController, formatFaultSpec, parseFaultSpec } from "../execution/fault.js";
 import { createApprovalHook, type ApprovalOptions } from "./approval.js";
@@ -60,6 +62,12 @@ export interface RunOptions {
   approval?: ApprovalOptions;
   /** Fault injection spec "point:toolName" for crash demos/tests, e.g. "after_tool_call:send_notification". */
   fault?: string;
+  /** Context compaction overrides; defaults to pi's threshold math on the run's model. */
+  compaction?: {
+    settings?: Partial<CompactionSettings>;
+    /** Injectable summarizer for tests; default calls models.completeSimple. */
+    summaryFn?: (prefix: readonly AgentMessage[]) => Promise<string>;
+  };
 }
 
 export interface ResumeOptions {
@@ -70,6 +78,11 @@ export interface ResumeOptions {
   reporter?: RunReporter;
   database?: string | false;
   traceDir?: string;
+  /** Context compaction overrides for the resumed agent. */
+  compaction?: {
+    settings?: Partial<CompactionSettings>;
+    summaryFn?: (prefix: readonly AgentMessage[]) => Promise<string>;
+  };
 }
 
 function sumUsage(messages: readonly AgentMessage[]): Usage | undefined {
@@ -149,6 +162,13 @@ export class RunManager {
 
     const tools = applyFaultToTools(options.tools ?? DEMO_TOOLS, faultSpec);
     const approvalHook = options.approval ? createApprovalHook(options.approval, (event) => recorder?.record(event)) : undefined;
+    const contextTransformer = createContextTransformer({
+      contextWindow: options.model.contextWindow,
+      model: options.model,
+      settings: options.compaction?.settings,
+      summaryFn: options.compaction?.summaryFn,
+      onEvent: (event) => recorder?.record(event),
+    });
     const agent = createAgent({
       model: options.model,
       systemPrompt,
@@ -156,6 +176,7 @@ export class RunManager {
       streamFn: options.streamFn,
       sessionId: record.id,
       beforeToolCall: approvalHook,
+      transformContext: contextTransformer,
     });
     const faultController = faultSpec ? new FaultController(faultSpec) : undefined;
     // Checkpoint AFTER the trace sinks: a checkpoint may lag the log but never lead it.
@@ -307,6 +328,12 @@ export class RunManager {
       streamFn: options.streamFn,
       sessionId: record.id,
       messages: transcript,
+      transformContext: createContextTransformer({
+        contextWindow: model.contextWindow,
+        model,
+        summaryFn: options.compaction?.summaryFn,
+        onEvent: (event) => recorder.record(event),
+      }),
     });
     const checkpointWriter = new CheckpointWriter(new CheckpointRepo(database), record.id, () => recorder.lastSeq, {
       messages: transcript.length + synthetic.length,

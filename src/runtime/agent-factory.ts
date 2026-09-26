@@ -14,6 +14,8 @@ export interface CreateAgentOptions {
   messages?: AgentMessage[];
   /** Optional tool gate (approval policy, fault injection, …). */
   beforeToolCall?: AgentOptions["beforeToolCall"];
+  /** Optional per-request context transform (compaction, injection, …). */
+  transformContext?: AgentOptions["transformContext"];
 }
 
 /**
@@ -37,5 +39,6 @@ export function createAgent(options: CreateAgentOptions): Agent {
     },
     sessionId: options.sessionId,
     beforeToolCall: options.beforeToolCall,
+    transformContext: options.transformContext,
   });
 }

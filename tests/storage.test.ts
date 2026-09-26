@@ -124,7 +124,7 @@ describe("SQLite storage", () => {
     const db = openDatabase(p);
     try {
       const row = db.prepare("SELECT COUNT(*) AS n FROM schema_migrations").get() as { n: unknown };
-      expect(Number(row.n)).toBe(2);
+      expect(Number(row.n)).toBe(3);
     } finally {
       db.close();
     }

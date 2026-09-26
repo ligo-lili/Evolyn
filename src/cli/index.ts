@@ -14,6 +14,8 @@ import { ConsoleReporter } from "../runtime/reporter.js";
 import { RunManager } from "../runtime/run-manager.js";
 import type { ApprovalMode } from "../runtime/approval.js";
 import type { TraceEvent } from "../trace/schema.js";
+import { distillRunById } from "../memory/distiller.js";
+import { ExperienceRepo } from "../memory/store.js";
 
 interface ParsedArgs {
   command: string;
@@ -55,6 +57,9 @@ const HELP = `agent-harness — durable execution harness on top of Pi Agent Run
 Usage:
   agent-harness run "<task>" [--model provider/model-id]
   agent-harness resume [runId]           recover an interrupted run (default: latest)
+  agent-harness experience search <query> [--limit <n>]   search stored experience
+  agent-harness experience list          show recent experience records
+  agent-harness experience distill <runId>                distill a run manually
   agent-harness models [provider]          list providers, or a provider's models
   agent-harness trace list                 list recorded runs
   agent-harness trace show <runId> [--all] render a run's execution timeline
@@ -99,6 +104,57 @@ async function main(): Promise<number> {
     const models = getModelRegistry().getModels(provider).map((m) => `${provider}/${m.id}`);
     console.log(models.length ? models.join("\n") : `(no models registered for "${provider}")`);
     return 0;
+  }
+
+  if (command === "experience") {
+    const sub = positional[0];
+    const db = openDatabase(defaultDbPath());
+    try {
+      const repo = new ExperienceRepo(db);
+      if (sub === "search") {
+        const query = positional.slice(1).join(" ").trim();
+        if (!query) {
+          console.error("usage: agent-harness experience search <query> [--limit <n>]");
+          return 2;
+        }
+        const limit = typeof flags.limit === "string" ? Number(flags.limit) : 3;
+        const hits = repo.search(query, Number.isFinite(limit) && limit > 0 ? limit : 3);
+        if (hits.length === 0) {
+          console.log("(no matching experience yet)");
+          return 0;
+        }
+        hits.forEach((h, i) => {
+          console.log(`#${i + 1} [${h.taskType}] ${h.outcome} — ${h.summaryZh}`);
+          console.log(`    approach: ${h.approach}`);
+          console.log(`    pitfalls: ${h.pitfalls}`);
+          console.log(`    run: ${h.runId}`);
+        });
+        return 0;
+      }
+      if (sub === "list") {
+        const items = repo.listRecent(20);
+        if (items.length === 0) {
+          console.log("(no experience stored yet — runs are distilled automatically unless --no-distill)");
+          return 0;
+        }
+        for (const e of items) console.log(`[${e.taskType}] ${e.outcome} — ${e.summaryZh}  (${e.createdAt.slice(0, 19)}, run ${e.runId})`);
+        return 0;
+      }
+      if (sub === "distill") {
+        const id = positional[1];
+        if (!id) {
+          console.error("usage: agent-harness experience distill <runId>");
+          return 2;
+        }
+        const record = await distillRunById(id);
+        console.log(`experience: stored (${record.taskType}, ${record.outcome}) — ${record.summaryZh}`);
+        return 0;
+      }
+      console.error("usage: agent-harness experience search <query> | experience list | experience distill <runId>");
+      return 2;
+    } finally {
+      db.close();
+    }
   }
 
   if (command === "trace") {
@@ -205,6 +261,14 @@ async function main(): Promise<number> {
     }
     if (result.tracePath) console.log(`trace: ${result.tracePath}`);
     if (record.error) console.error(`error: ${record.error}`);
+    if (flags["no-distill"] !== true) {
+      try {
+        const stored = await distillRunById(record.id);
+        console.log(`experience: stored (${stored.taskType}, ${stored.outcome}) — ${stored.summaryZh}`);
+      } catch (err) {
+        console.error(`experience: distill failed (${err instanceof Error ? err.message : err})`);
+      }
+    }
     manager.close();
     return record.status === "completed" ? 0 : 1;
   }
@@ -232,6 +296,7 @@ async function main(): Promise<number> {
     console.error(`unknown --approval mode "${approvalFlag}" (expected auto-approve | auto-deny)`);
     return 2;
   }
+  const noDistill = flags["no-distill"] === true;
   const manager = new RunManager();
   const startedAt = Date.now();
   const result = await manager.run({
@@ -253,6 +318,16 @@ async function main(): Promise<number> {
   }
   if (result.tracePath) console.log(`trace: ${result.tracePath}`);
   if (record.error) console.error(`error: ${record.error}`);
+  if (noDistill) {
+    console.log("experience: skipped (--no-distill)");
+  } else {
+    try {
+      const stored = await distillRunById(record.id);
+      console.log(`experience: stored (${stored.taskType}, ${stored.outcome}) — ${stored.summaryZh}`);
+    } catch (err) {
+      console.error(`experience: distill failed (${err instanceof Error ? err.message : err})`);
+    }
+  }
   manager.close();
   return record.status === "completed" ? 0 : 1;
 }

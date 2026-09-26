@@ -59,6 +59,34 @@ export const MIGRATIONS: Migration[] = [
     name: "runs-system-prompt",
     sql: `ALTER TABLE runs ADD COLUMN system_prompt TEXT;`,
   },
+  {
+    // Experience memory (阶段 9). English fields feed the FTS5 index (default
+    // tokenizer); summary_zh is the display-facing rendering (bilingual policy).
+    id: 3,
+    name: "experience-memory",
+    sql: `
+      CREATE TABLE experiences (
+        id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(id),
+        task_type TEXT NOT NULL,
+        summary_en TEXT NOT NULL,
+        summary_zh TEXT NOT NULL,
+        approach TEXT NOT NULL,
+        pitfalls TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        keywords_en TEXT NOT NULL,
+        model TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE VIRTUAL TABLE experiences_fts USING fts5(
+        exp_id UNINDEXED,
+        summary_en,
+        approach,
+        pitfalls,
+        keywords_en
+      );
+    `,
+  },
 ];
 
 export function migrate(db: DatabaseSync): void {

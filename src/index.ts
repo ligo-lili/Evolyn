@@ -17,6 +17,18 @@ export {
 } from "./context/assembler.js";
 export { createContextTransformer, findCutIndex, type CompactionOptions } from "./context/compaction.js";
 export {
+  buildRunDigest,
+  distillExperience,
+  distillRunById,
+  fallbackDraft,
+  parseExperienceDraft,
+  type CompleteFn,
+  type DistillOptions,
+  type ExperienceDraft,
+  type RunDigest,
+} from "./memory/distiller.js";
+export { ExperienceRepo, newExperienceId, type ExperienceRecord } from "./memory/store.js";
+export {
   loadCrashedRun,
   planRecovery,
   toolResultMessage,

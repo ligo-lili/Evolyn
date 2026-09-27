@@ -36,6 +36,9 @@ const QWEN_MODELS: Model<"openai-completions">[] = [
   qwenModel("qwen-turbo", 131_072, 8_192),
   qwenModel("qwen3-max", 131_072, 8_192),
   qwenModel("qwen3.7-plus", 131_072, 8_192),
+  // 27B dense thinking model — reasoning_content rides along on DashScope;
+  // larger completion budget so thinking + answer fit.
+  qwenModel("qwen3.5-27b", 131_072, 16_384),
 ];
 
 function qwenProvider(): Provider<"openai-completions"> {

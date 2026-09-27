@@ -67,7 +67,9 @@ export class TraceRecorder {
       ts: new Date().toISOString(),
       runId: this.runId,
     };
-    const event = { ...envelope, ...payload } as TraceEvent;
+    // Envelope LAST: a payload field must never override the harness-owned
+    // envelope (v/seq/ts/runId are the log's spine).
+    const event = { ...payload, ...envelope } as TraceEvent;
     for (const sink of this.sinks) sink.append(event);
   }
 }

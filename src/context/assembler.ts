@@ -7,6 +7,13 @@ export interface PromptSections {
   skills?: string;
   /** Ordinary Memory pointers — the model reads the full text on demand. */
   experiences?: string;
+  /** 阶段 13: workspace orientation map for the coding toolset. */
+  workspace?: string;
+}
+
+export function renderWorkspaceBlock(tree: string): string {
+  if (!tree.trim()) return "";
+  return `<workspace>\n${tree.trim()}\n</workspace>`;
 }
 
 export interface SkillEntry {
@@ -42,6 +49,7 @@ export function assembleSystemPrompt(sections: PromptSections = {}): string {
   const parts: string[] = [];
   parts.push((sections.base ?? DEFAULT_SYSTEM_PROMPT).trim());
   if (sections.core?.trim()) parts.push(sections.core.trim());
+  if (sections.workspace?.trim()) parts.push(sections.workspace.trim());
   if (sections.skills?.trim()) parts.push(sections.skills.trim());
   if (sections.experiences?.trim()) parts.push(sections.experiences.trim());
   return parts.join("\n\n");

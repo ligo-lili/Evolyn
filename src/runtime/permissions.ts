@@ -39,12 +39,28 @@ const DESTRUCTIVE_COMMAND_PATTERNS: RegExp[] = [
 /**
  * Static permission metadata per known tool. An UNKNOWN tool is assumed to
  * need every capability and be destructive — untrusted by default.
+ *
+ * 阶段 13: pi's coding tools (read/edit/write/grep/ls/find/bash/powershell)
+ * carry no capability metadata of their own, so they are mapped here. The
+ * shell tools are destructive with process:exec + net:outbound (a command can
+ * reach the network); destructive-command patterns are HEURISTICS that only
+ * enrich the audit trail — they do not intercept (the gate for shell risk is
+ * the approval mode, see approval.ts).
  */
 export const TOOL_PERMISSIONS: Readonly<Record<string, ToolPermissions>> = {
   read_file: { capabilities: ["fs:read"], risk: "readonly" },
   write_file: { capabilities: ["fs:write"], risk: "mutating" },
   exec: { capabilities: ["fs:read", "fs:write", "process:exec", "net:outbound"], risk: "destructive" },
   send_notification: { capabilities: ["notify:send", "net:outbound"], risk: "external" },
+  // pi coding tools (阶段 13)
+  read: { capabilities: ["fs:read"], risk: "readonly" },
+  grep: { capabilities: ["fs:read"], risk: "readonly" },
+  ls: { capabilities: ["fs:read"], risk: "readonly" },
+  find: { capabilities: ["fs:read"], risk: "readonly" },
+  edit: { capabilities: ["fs:write", "fs:read"], risk: "mutating" },
+  write: { capabilities: ["fs:write"], risk: "mutating" },
+  bash: { capabilities: ["fs:read", "fs:write", "process:exec", "net:outbound"], risk: "destructive" },
+  powershell: { capabilities: ["fs:read", "fs:write", "process:exec", "net:outbound"], risk: "destructive" },
 };
 
 const UNKNOWN_TOOL_PERMISSIONS: ToolPermissions = { capabilities: [...ALL_CAPABILITIES], risk: "destructive" };
@@ -65,7 +81,7 @@ export function assessRisk(toolName: string, args: unknown): RiskAssessment {
   const reasons: string[] = [];
   let risk = base.risk;
   const command = (args as { command?: unknown } | null)?.command;
-  if (toolName === "exec" && typeof command === "string") {
+  if ((toolName === "exec" || toolName === "bash" || toolName === "powershell") && typeof command === "string") {
     for (const pattern of DESTRUCTIVE_COMMAND_PATTERNS) {
       if (pattern.test(command)) {
         risk = "destructive";

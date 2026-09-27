@@ -116,8 +116,18 @@ export function findCutIndex(messages: readonly AgentMessage[], keepRecentTokens
   let cut = boundary;
   while (cut > 1 && messages[cut]?.role !== "user") cut--;
   if (cut > 1) return cut;
+  // Mid-turn fallback: the slice must never START with a toolResult whose
+  // assistant caller is above the cut (an orphaned toolResult gets the next
+  // request rejected). Find the LAST toolResult of the contiguous block and
+  // cut after it — an assistant keeps all of its toolResults together. When
+  // the block reaches the transcript end, the cut is the array length (empty
+  // tail is legal; capping it back into the block would orphan its head).
   for (let j = boundary; j > 1; j--) {
-    if (messages[j]?.role === "toolResult") return Math.min(j + 1, messages.length - 1);
+    if (messages[j]?.role === "toolResult") {
+      let end = j;
+      while (end + 1 < messages.length && messages[end + 1]?.role === "toolResult") end++;
+      return end + 1;
+    }
   }
   return messages.length - 1;
 }

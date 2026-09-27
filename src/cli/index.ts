@@ -13,8 +13,9 @@ import { TraceEventRepo } from "../storage/repos/trace-events.js";
 import { tracesDir } from "../runtime/paths.js";
 import { ConsoleReporter } from "../runtime/reporter.js";
 import { RunManager } from "../runtime/run-manager.js";
-import { createPermissionGate, type ApprovalMode } from "../runtime/approval.js";
+import { createPermissionGate, type ApprovalMode, type ApprovalOptions } from "../runtime/approval.js";
 import { ALL_CAPABILITIES, type Capability } from "../runtime/permissions.js";
+import type { ToolsetSpec } from "../runtime/run-manager.js";
 import type { TraceEvent } from "../trace/schema.js";
 import { distillRunById } from "../memory/distiller.js";
 import { MemoryStore } from "../memory/store.js";
@@ -77,10 +78,11 @@ function parseArgs(argv: string[]): ParsedArgs {
 const HELP = `agent-harness — durable execution harness on top of Pi Agent Runtime
 
 Usage:
-  agent-harness run "<task>" [--model provider/model-id] [--yolo]
-                    [--approval auto-approve|auto-deny|interactive]
+  agent-harness run "<task>" [--model provider/model-id] [--tools demo|coding]
+                    [--yolo] [--approval auto-approve|auto-deny|interactive]
                     [--capabilities fs:read,fs:write,...] [--fault point:tool]
   agent-harness resume [runId]           recover an interrupted run (default: latest)
+                    [--yolo] — approval gates apply to recovered tool executions too
   agent-harness memory core              show/create the always-resident Core Memory file
   agent-harness memory list              list Ordinary Memory files (authoritative markdown)
   agent-harness memory search <query> [--limit <n>] [--hybrid]   FTS5, or FTS+embeddings fused (RRF)
@@ -119,7 +121,9 @@ Model providers: openai, anthropic, deepseek (built into pi-ai), qwen
 slash, e.g. openrouter/qwen/qwen3.8-27b:free).
 API keys are read from the environment:
   OPENAI_API_KEY  ANTHROPIC_API_KEY  DEEPSEEK_API_KEY  DASHSCOPE_API_KEY|QWEN_API_KEY  OPENROUTER_API_KEY
-Default model comes from HARNESS_MODEL. Traces land in .harness/traces/<runId>.jsonl.`;
+Default model comes from HARNESS_MODEL. Traces land in .harness/traces/<runId>.jsonl.
+Approval: the CLI defaults to INTERACTIVE approval (non-interactive shells
+auto-deny mutating tools); --yolo opts in to full autonomy explicitly.`;
 
 function isTracePath(id: string): boolean {
   return id.endsWith(".jsonl") || id.includes("/") || id.includes("\\");
@@ -139,6 +143,24 @@ function loadRunEvents(id: string): TraceEvent[] {
 
 async function main(): Promise<number> {
   const { command, positional, flags } = parseArgs(process.argv.slice(2));
+
+  // Shared flag parsing (run and resume both gate on these).
+  const approvalFlag = typeof flags.approval === "string" ? flags.approval : undefined;
+  if (approvalFlag !== undefined && approvalFlag !== "auto-approve" && approvalFlag !== "auto-deny" && approvalFlag !== "interactive") {
+    console.error(`unknown --approval mode "${approvalFlag}" (expected auto-approve | auto-deny | interactive)`);
+    return 2;
+  }
+  const capabilitiesFlag = typeof flags.capabilities === "string" ? flags.capabilities : undefined;
+  let capabilities: readonly Capability[] | undefined;
+  if (capabilitiesFlag) {
+    const requested = capabilitiesFlag.split(",").map((c) => c.trim()).filter(Boolean) as readonly Capability[];
+    const invalid = requested.filter((c) => !ALL_CAPABILITIES.includes(c as never));
+    if (invalid.length > 0) {
+      console.error(`unknown capabilities: ${invalid.join(", ")} (available: ${ALL_CAPABILITIES.join(", ")})`);
+      return 2;
+    }
+    capabilities = requested;
+  }
 
   if (command === "models") {
     const provider = positional[0];
@@ -665,7 +687,21 @@ async function main(): Promise<number> {
       return 0;
     }
     const startedAt = Date.now();
-    const result = await manager.resume(targetId, { reporter: new ConsoleReporter() });
+    const toolsFlag = typeof flags.tools === "string" ? flags.tools : undefined;
+    if (toolsFlag !== undefined && toolsFlag !== "demo" && toolsFlag !== "coding") {
+      console.error(`unknown --tools "${toolsFlag}" (expected demo | coding)`);
+      return 2;
+    }
+    const result = await manager.resume(targetId, {
+      reporter: new ConsoleReporter(),
+      // 阶段 13: recovered tool executions go through the same approval gate AND
+      // the same toolset — resume with --tools coding when the crashed run used it.
+      tools: toolsFlag as ToolsetSpec | undefined,
+      approval: {
+        mode: flags.yolo === true ? "auto-approve" : ((typeof flags.approval === "string" ? (flags.approval as ApprovalMode) : undefined) ?? "interactive"),
+        capabilities: capabilities as readonly Capability[] | undefined,
+      },
+    });
     const record = result.record;
     console.log("");
     console.log(`resumed run ${record.id}`);
@@ -711,31 +747,30 @@ async function main(): Promise<number> {
   }
 
   const model = resolveModel(spec);
-  const approvalFlag = typeof flags.approval === "string" ? flags.approval : undefined;
-  if (approvalFlag && approvalFlag !== "auto-approve" && approvalFlag !== "auto-deny" && approvalFlag !== "interactive") {
-    console.error(`unknown --approval mode "${approvalFlag}" (expected auto-approve | auto-deny | interactive)`);
+
+  const noDistill = flags["no-distill"] === true;
+  const toolsFlag = typeof flags.tools === "string" ? flags.tools : undefined;
+  if (toolsFlag !== undefined && toolsFlag !== "demo" && toolsFlag !== "coding") {
+    console.error(`unknown --tools "${toolsFlag}" (expected demo | coding)`);
     return 2;
   }
-  const capabilitiesFlag = typeof flags.capabilities === "string" ? flags.capabilities : undefined;
-  let capabilities: readonly string[] | undefined;
-  if (capabilitiesFlag) {
-    const requested = capabilitiesFlag.split(",").map((c) => c.trim()).filter(Boolean);
-    const invalid = requested.filter((c) => !ALL_CAPABILITIES.includes(c as never));
-    if (invalid.length > 0) {
-      console.error(`unknown capabilities: ${invalid.join(", ")} (available: ${ALL_CAPABILITIES.join(", ")})`);
-      return 2;
-    }
-    capabilities = requested;
-  }
-  const noDistill = flags["no-distill"] === true;
   const manager = new RunManager();
   const startedAt = Date.now();
+  // 阶段 13 (P0): the shell is a real one — the CLI defaults to interactive
+  // approval (non-TTY auto-denies everything mutating) and --yolo is the
+  // explicit opt-in to full autonomy. The LIBRARY default (auto-approve all)
+  // is unchanged for backwards compatibility; scripts must opt in explicitly.
+  const approvalMode: ApprovalMode = flags.yolo === true ? "auto-approve" : ((approvalFlag as ApprovalMode | undefined) ?? "interactive");
+  if (approvalMode === "interactive" && !process.stdin.isTTY) {
+    console.warn("[approval] interactive mode in a non-interactive shell: mutating tools will be auto-denied (use --yolo to override)");
+  }
   const result = await manager.run({
     task,
     model,
     reporter: new ConsoleReporter(),
+    tools: toolsFlag as ToolsetSpec | undefined,
     approval: {
-      mode: flags.yolo === true ? "auto-approve" : (approvalFlag as ApprovalMode | undefined),
+      mode: approvalMode,
       capabilities: capabilities as readonly Capability[] | undefined,
     },
     fault: typeof flags.fault === "string" ? flags.fault : undefined,

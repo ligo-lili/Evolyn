@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
-import type { AgentEvent, AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
+import type { AgentEvent, AgentOptions, AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
 import type { Api, AssistantMessage, Model, Usage } from "@earendil-works/pi-ai";
 import type { DatabaseSync } from "node:sqlite";
-import { DEFAULT_SYSTEM_PROMPT } from "../config.js";
+import { CODING_SYSTEM_PROMPT, DEFAULT_SYSTEM_PROMPT } from "../config.js";
 import { HarnessError } from "../errors.js";
 import { resolveModel } from "../providers.js";
 import { openDatabase, defaultDbPath } from "../storage/db.js";
@@ -13,7 +13,8 @@ import { TraceEventRepo } from "../storage/repos/trace-events.js";
 import { CheckpointRepo } from "../storage/repos/checkpoints.js";
 import { CheckpointWriter } from "../execution/checkpoint.js";
 import { loadCrashedRun, planRecovery, toolResultMessage } from "../execution/recovery.js";
-import { assembleSystemPrompt, renderExperienceBlock, renderSkillBlock } from "../context/assembler.js";
+import { assembleSystemPrompt, renderExperienceBlock, renderSkillBlock, renderWorkspaceBlock } from "../context/assembler.js";
+import { buildWorkspaceTree } from "../context/workspace.js";
 import { SkillIndex, toAssemblerEntries } from "../skills/retrieve.js";
 import { createContextTransformer } from "../context/compaction.js";
 import type { CompactionSettings } from "@earendil-works/pi-agent-core";
@@ -24,13 +25,16 @@ import { MemorySearchIndex } from "../memory/search.js";
 import { MemoryStore } from "../memory/store.js";
 import { withEvidenceCapture } from "./tools/evidence.js";
 import { TraceRecorder, JsonlTraceSink, type TraceSink } from "../trace/recorder.js";
-import { applyFaultToTools, FaultController, formatFaultSpec, parseFaultSpec } from "../execution/fault.js";
+import { reconcileJsonlTrace } from "../trace/reconcile.js";
+import { applyFaultToTools, FaultController, formatFaultSpec, parseFaultSpec, type FaultSpec } from "../execution/fault.js";
 import { createPermissionGate, type ApprovalOptions } from "./approval.js";
 import { ALL_CAPABILITIES } from "./permissions.js";
 import { harnessDataDir } from "./paths.js";
 import { createAgent } from "./agent-factory.js";
 import { ConsoleReporter, type RunReporter } from "./reporter.js";
 import { DEMO_TOOLS, type AnyAgentTool } from "./tools/index.js";
+import { createCodingToolset } from "./tools/coding.js";
+import type { HarnessAuditEvent } from "../trace/schema.js";
 
 export type RunStatus = "running" | "completed" | "failed";
 
@@ -42,6 +46,47 @@ export interface SkillInjection {
 }
 
 const DEFAULT_SKILL_LIMIT = 2;
+
+/** Tool source: the demo set (default — keeps existing eval baselines
+ * comparable) or pi's coding toolset (阶段 13), or an explicit array. */
+export type ToolsetSpec = AnyAgentTool[] | "demo" | "coding";
+
+function resolveTools(tools: ToolsetSpec | undefined): AnyAgentTool[] {
+  if (tools === "coding") return createCodingToolset();
+  if (tools === "demo" || tools === undefined) return DEMO_TOOLS;
+  return tools;
+}
+
+/**
+ * 阶段 13 (P1-3): the ONE place where tools get wrapped (fault → evidence →
+ * timeout → retry) and the beforeToolCall chain is composed (limits →
+ * permission gate). run() and resume() MUST share this — a resume executing
+ * recovered tools outside the chain would run real shell commands in the
+ * workspace without permission checks or audit (coding scenario: unacceptable).
+ */
+function composeRuntime(input: {
+  tools: AnyAgentTool[];
+  faultSpec: FaultSpec | undefined;
+  evidenceDir: string;
+  limits: Required<RunLimits>;
+  retryPolicy: RetryPolicy | undefined;
+  approval: ApprovalOptions | undefined;
+  audit: (event: HarnessAuditEvent) => void;
+  onLimitViolation: (violation: LimitViolation) => void;
+}): { tools: AnyAgentTool[]; beforeToolCall: NonNullable<AgentOptions["beforeToolCall"]>; limitEnforcer: LimitEnforcer } {
+  const tools = withRetry(
+    withToolTimeout(withEvidenceCapture(applyFaultToTools(input.tools, input.faultSpec), input.evidenceDir), input.limits.toolTimeoutMs),
+    { policy: input.retryPolicy, audit: input.audit },
+  );
+  const permissionGate = createPermissionGate(input.approval, input.audit);
+  const limitEnforcer = new LimitEnforcer(input.limits, input.audit, input.onLimitViolation);
+  const beforeToolCall: NonNullable<AgentOptions["beforeToolCall"]> = async (context) => {
+    const violation = limitEnforcer.beforeToolCall(context.toolCall.name, context.args);
+    if (violation) return violation;
+    return permissionGate(context);
+  };
+  return { tools, beforeToolCall, limitEnforcer };
+}
 
 export interface RunRecord {
   id: string;
@@ -66,7 +111,9 @@ export interface RunResult {
 export interface RunOptions {
   task: string;
   model: Model<Api>;
-  tools?: AnyAgentTool[];
+  /** Tool source: "demo" (default), "coding" (阶段 13 pi toolset), or explicit tools. */
+  tools?: ToolsetSpec;
+  /** Explicit system prompt. Default: the coding prompt for tools:"coding", else the demo prompt. */
   systemPrompt?: string;
   streamFn?: StreamFn;
   reporter?: RunReporter;
@@ -103,7 +150,8 @@ export interface RunOptions {
 export interface ResumeOptions {
   /** Model for the resumed agent; defaults to resolving the run's model_spec. */
   model?: Model<Api>;
-  tools?: AnyAgentTool[];
+  /** Tool source: "demo" (default), "coding" (阶段 13), or explicit tools. */
+  tools?: ToolsetSpec;
   streamFn?: StreamFn;
   reporter?: RunReporter;
   database?: string | false;
@@ -113,6 +161,12 @@ export interface ResumeOptions {
     settings?: Partial<CompactionSettings>;
     summaryFn?: (prefix: readonly AgentMessage[]) => Promise<string>;
   };
+  /** Approval gate for the resumed run — recovery re-executions go through it (阶段 13). */
+  approval?: ApprovalOptions;
+  /** Runaway guards for the resumed run. Defaults are always enforced. */
+  limits?: RunLimits;
+  /** Tiered retry policy for idempotent tools. */
+  retry?: RetryPolicy;
 }
 
 function sumUsage(messages: readonly AgentMessage[]): Usage | undefined {
@@ -162,7 +216,7 @@ export class RunManager {
 
   async run(options: RunOptions): Promise<RunResult> {
     const faultSpec = parseFaultSpec(options.fault); // validates before anything is written
-    const basePrompt = options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
+    const basePrompt = options.systemPrompt ?? (options.tools === "coding" ? CODING_SYSTEM_PROMPT : DEFAULT_SYSTEM_PROMPT);
     const record: RunRecord = {
       id: randomUUID(),
       task: options.task,
@@ -200,6 +254,8 @@ export class RunManager {
     const systemPrompt = assembleSystemPrompt({
       base: basePrompt,
       core: core ? `<core_memory>\n${core}\n</core_memory>` : undefined,
+      // 阶段 13: the coding toolset gets a deterministic workspace map.
+      workspace: options.tools === "coding" ? renderWorkspaceBlock(buildWorkspaceTree()) : undefined,
       skills: skillBlock,
       experiences: experienceBlock,
     });
@@ -229,25 +285,22 @@ export class RunManager {
       recorder.runStart(record.task, record.modelSpec, faultSpec ? formatFaultSpec(faultSpec) : undefined, grantedCapabilities);
     }
 
-    const tools = withRetry(
-      withToolTimeout(
-        withEvidenceCapture(applyFaultToTools(options.tools ?? DEMO_TOOLS, faultSpec), path.join(harnessDataDir(process.cwd()), "evidence", record.id)),
-        limits.toolTimeoutMs,
-      ),
-      { policy: options.retry, audit: (event) => recorder?.record(event) },
-    );
+    const composed = composeRuntime({
+      tools: resolveTools(options.tools),
+      faultSpec,
+      evidenceDir: path.join(harnessDataDir(process.cwd()), "evidence", record.id),
+      limits,
+      retryPolicy: options.retry,
+      approval: options.approval,
+      audit: (event) => recorder?.record(event),
+      onLimitViolation: (violation) => {
+        limitViolation = violation;
+      },
+    });
+    const tools = composed.tools;
     // 阶段 9.7: the permission gate is ALWAYS installed — capability checks are
     // not optional. Default options grant everything (backwards compatible).
-    const permissionGate = createPermissionGate(options.approval, (event) => recorder?.record(event));
-    // 阶段 9.8: runaway guards sit in FRONT of the permission gate.
-    const limitEnforcer = new LimitEnforcer(limits, (event) => recorder?.record(event), (violation) => {
-      limitViolation = violation;
-    });
-    const composedBeforeToolCall: typeof permissionGate = async (context) => {
-      const violation = limitEnforcer.beforeToolCall(context.toolCall.name, context.args);
-      if (violation) return violation;
-      return permissionGate(context);
-    };
+    const composedBeforeToolCall = composed.beforeToolCall;
     const contextTransformer = createContextTransformer({
       contextWindow: options.model.contextWindow,
       model: options.model,
@@ -274,7 +327,7 @@ export class RunManager {
       reporter.onEvent(event);
       recorder?.onEvent(event);
       checkpointWriter?.onEvent(event);
-      limitEnforcer.onAgentEvent(event);
+      composed.limitEnforcer.onAgentEvent(event);
       faultController?.onEvent(event);
     };
     const unsubscribe = agent.subscribe(dispatch);
@@ -346,8 +399,8 @@ export class RunManager {
   async resume(runId: string, options: ResumeOptions = {}): Promise<RunResult> {
     const database = this.ensureDatabase(options.database);
     if (!database) throw new HarnessError("resume requires the SQLite database (do not pass database: false)");
-    const tools = options.tools ?? DEMO_TOOLS;
-    const crashed = loadCrashedRun(database, runId, tools);
+    const resolvedTools = resolveTools(options.tools);
+    const crashed = loadCrashedRun(database, runId, resolvedTools);
 
     const record: RunRecord = { ...crashed.record, status: "running", finishedAt: undefined, error: undefined };
     this.runs.set(record.id, record);
@@ -356,12 +409,48 @@ export class RunManager {
     const traceDir = options.traceDir ?? path.join(harnessDataDir(process.cwd()), "traces");
     mkdirSync(traceDir, { recursive: true });
     const traceFile = path.join(traceDir, `${record.id}.jsonl`);
+    // 阶段 13 (P1-2): the two sinks are written per-event (JSONL first, SQLite
+    // second) — a kill between the writes leaves a JSONL tail SQLite never saw.
+    // SQLite is the resume authority; reconcile the JSONL BEFORE continuing the
+    // seq, or duplicated seqs would permanently fail readTraceFile.
+    const sqliteEvents = new TraceEventRepo(database).getByRun(runId);
+    const reconciled = reconcileJsonlTrace(traceFile, sqliteEvents);
+    if (reconciled.truncated > 0 || reconciled.rebuilt) {
+      process.stderr.write(
+        `[harness] trace JSONL reconciled with SQLite (authoritative): dropped ${reconciled.truncated} tail event(s), rebuilt=${reconciled.rebuilt}\n`,
+      );
+    }
     const recorder = new TraceRecorder(record.id, [new JsonlTraceSink(traceFile), new TraceEventRepo(database)], {
       startSeq: crashed.lastSeq,
     });
 
     const model = options.model ?? resolveModel(crashed.record.modelSpec);
     const startedMs = Date.now();
+
+    const limits: Required<RunLimits> = {
+      maxTurns: options.limits?.maxTurns ?? DEFAULT_RUN_LIMITS.maxTurns,
+      maxToolCalls: options.limits?.maxToolCalls ?? DEFAULT_RUN_LIMITS.maxToolCalls,
+      maxRepeatedToolCalls: options.limits?.maxRepeatedToolCalls ?? DEFAULT_RUN_LIMITS.maxRepeatedToolCalls,
+      maxCostUsd: options.limits?.maxCostUsd ?? DEFAULT_RUN_LIMITS.maxCostUsd,
+      toolTimeoutMs: options.limits?.toolTimeoutMs ?? DEFAULT_RUN_LIMITS.toolTimeoutMs,
+    };
+    let limitViolation: LimitViolation | undefined;
+    // 阶段 13 (P1-3): the resumed run shares run()'s runtime composition —
+    // wrapped tools (fault/evidence/timeout/retry) and the composed
+    // limits→permission gate. Recovered re-executions are gated below; the
+    // agent's own continuation goes through beforeToolCall.
+    const composed = composeRuntime({
+      tools: resolvedTools,
+      faultSpec: undefined,
+      evidenceDir: path.join(harnessDataDir(process.cwd()), "evidence", record.id),
+      limits,
+      retryPolicy: options.retry,
+      approval: options.approval,
+      audit: (event) => recorder.record(event),
+      onLimitViolation: (violation) => {
+        limitViolation = violation;
+      },
+    });
 
     // Resolve every unresolved tool call, auditing each decision into the trace.
     const synthetic: AgentMessage[] = [];
@@ -385,10 +474,29 @@ export class RunManager {
         );
         continue;
       }
-      // reexecute: the execution genuinely happens now — record it as such.
+      // reexecute: the execution genuinely happens now — record it as such, and
+      // put it through the SAME gates as a live call (limits → permission).
+      const limitResult = composed.limitEnforcer.beforeToolCall(call.toolName, call.args);
+      const gateDecision = limitResult ?? (await composed.beforeToolCall({
+            toolCall: { id: call.toolCallId, name: call.toolName },
+            args: call.args,
+          } as unknown as Parameters<typeof composed.beforeToolCall>[0]));
       recorder.onEvent({ type: "tool_execution_start", toolCallId: call.toolCallId, toolName: call.toolName, args: call.args });
+      if (gateDecision && gateDecision.block) {
+        const reason = gateDecision.reason ?? "blocked before execution";
+        recorder.onEvent({
+          type: "tool_execution_end",
+          toolCallId: call.toolCallId,
+          toolName: call.toolName,
+          result: { content: [{ type: "text", text: reason }], details: undefined },
+          isError: true,
+        });
+        synthetic.push(toolResultMessage(call.toolCallId, call.toolName, [{ type: "text", text: reason }], true));
+        continue;
+      }
+      const wrapped = composed.tools.find((t) => t.name === call.toolName) ?? call.tool;
       try {
-        const result = await call.tool.execute(call.toolCallId, call.args, undefined, undefined);
+        const result = await wrapped.execute(call.toolCallId, call.args, undefined, undefined);
         recorder.onEvent({
           type: "tool_execution_end",
           toolCallId: call.toolCallId,
@@ -418,10 +526,11 @@ export class RunManager {
     const agent = createAgent({
       model,
       systemPrompt: resumeSystemPrompt,
-      tools,
+      tools: composed.tools,
       streamFn: options.streamFn,
       sessionId: record.id,
       messages: transcript,
+      beforeToolCall: composed.beforeToolCall,
       transformContext: createContextTransformer({
         contextWindow: model.contextWindow,
         model,
@@ -468,6 +577,12 @@ export class RunManager {
       status = "failed";
       error = err instanceof Error ? err.message : String(err);
     } finally {
+      // 阶段 9.8: a limit violation degrades the run to failed with the reason
+      // attached, even when the model itself finished cleanly afterwards.
+      if (limitViolation) {
+        status = "failed";
+        error = `run stopped by limit (${limitViolation.kind}): ${limitViolation.reason}`;
+      }
       record.status = status;
       if (error !== undefined) record.error = error;
       record.finishedAt = new Date().toISOString();

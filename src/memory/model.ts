@@ -34,6 +34,9 @@ const FRONTMATTER_FIELDS = [
   "updated",
 ] as const;
 
+/** 阶段 13 (P1-1): memory ids become file names — same slug rule as skill names. */
+export const MEMORY_ID_PATTERN = /^[a-z0-9-]{1,64}$/;
+
 export function serializeMemory(record: MemoryRecord): string {
   const frontmatter = stringifyYaml({
     id: record.id,
@@ -67,6 +70,12 @@ export function parseMemory(raw: string, source: string): MemoryRecord {
   const end = raw.indexOf("\n---", 3);
   if (end === -1) throw new Error(`${source}: unterminated frontmatter`);
   const meta = (parseYaml(raw.slice(3, end)) ?? {}) as Record<string, unknown>;
+  // 阶段 13 (P1-1): the id becomes a file path — validate it BEFORE the
+  // completeness checks so a hostile id is never waved through on a
+  // missing-field technicality.
+  if (meta.id !== undefined && !MEMORY_ID_PATTERN.test(String(meta.id))) {
+    throw new Error(`${source}: invalid id "${String(meta.id)}" (must match ${MEMORY_ID_PATTERN})`);
+  }
   for (const field of FRONTMATTER_FIELDS) {
     if (!(field in meta)) throw new Error(`${source}: frontmatter missing "${field}"`);
   }
@@ -76,8 +85,10 @@ export function parseMemory(raw: string, source: string): MemoryRecord {
     return match?.[1]?.trim() ?? "";
   };
   const outcome = String(meta.outcome);
+  const id = String(meta.id);
+  if (!MEMORY_ID_PATTERN.test(id)) throw new Error(`${source}: invalid id "${id}" (must match ${MEMORY_ID_PATTERN})`);
   return {
-    id: String(meta.id),
+    id,
     runId: String(meta.runId),
     taskType: String(meta.taskType),
     outcome: outcome === "success" || outcome === "partial" || outcome === "failed" ? outcome : "partial",

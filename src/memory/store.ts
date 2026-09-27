@@ -41,7 +41,15 @@ export class MemoryStore {
   }
 
   pathOf(id: string): string {
-    return path.join(this.ordinaryDir, `${id}.md`);
+    // 阶段 13 (P1-1): single choke point — every id → path conversion goes
+    // through the fence, so a hostile id (distiller updateOf, frontmatter id)
+    // cannot escape the memory dir.
+    const file = path.join(this.ordinaryDir, `${id}.md`);
+    const rel = path.relative(this.ordinaryDir, file);
+    if (rel === "" || rel === ".." || rel.startsWith(".." + path.sep) || path.isAbsolute(rel)) {
+      throw new HarnessError(`invalid memory id: ${id}`);
+    }
+    return file;
   }
 
   save(record: MemoryRecord): string {
@@ -78,11 +86,8 @@ export class MemoryStore {
     return records.sort((a, b) => b.updated.localeCompare(a.updated));
   }
 
-  /** Absolute path for an id, refusing to escape the memory dir (defense in depth for pointer injection). */
+  /** Alias kept for the 阶段 9.5 name — same fence as pathOf. */
   safePath(id: string): string {
-    const file = this.pathOf(id);
-    const rel = path.relative(this.ordinaryDir, file);
-    if (rel.startsWith("..") || path.isAbsolute(rel)) throw new HarnessError(`invalid memory id: ${id}`);
-    return file;
+    return this.pathOf(id);
   }
 }

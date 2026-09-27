@@ -80,6 +80,10 @@ export function promoteCandidate(candidateId: string, options: PromoteOptions = 
     }
 
     fs.mkdirSync(dirPath, { recursive: true });
+    // 阶段 13 (P1-4): on a failed pi-loader check the written file must not
+    // linger (rebuild would index a rejected skill) — restore the previous
+    // version when overwriting, remove the directory otherwise.
+    const previousRaw = existing && fs.existsSync(skillMdPath) ? fs.readFileSync(skillMdPath, "utf8") : undefined;
     fs.writeFileSync(skillMdPath, raw, "utf8");
 
     // pi-loader gate: the consumer contract, not just our parser.
@@ -88,6 +92,12 @@ export function promoteCandidate(candidateId: string, options: PromoteOptions = 
     const ownErrors = verification.diagnostics.filter((d) => d.type === "error" && ownPath(d.path));
     if (ownErrors.length > 0 || !verification.skills.some((s) => s.name === doc.name)) {
       const detail = ownErrors.map((d) => `${d.type}: ${d.message}`).join("; ") || "skill not discovered by loadSkillsFromDir";
+      try {
+        if (previousRaw !== undefined) fs.writeFileSync(skillMdPath, previousRaw, "utf8");
+        else fs.rmSync(dirPath, { recursive: true, force: true });
+      } catch {
+        process.stderr.write(`[skills] warning: failed to clean up after rejected promotion of "${doc.name}"\n`);
+      }
       throw new HarnessError(`promoted skill failed pi loadSkillsFromDir: ${detail}`);
     }
 

@@ -11,7 +11,7 @@ import { RunRepo } from "../storage/repos/runs.js";
 import { TraceEventRepo } from "../storage/repos/trace-events.js";
 import { MemorySearchIndex } from "./search.js";
 import { MemoryStore } from "./store.js";
-import type { MemoryRecord } from "./model.js";
+import { MEMORY_ID_PATTERN, type MemoryRecord } from "./model.js";
 
 export interface RunDigest {
   runId: string;
@@ -263,7 +263,10 @@ export async function distillRunById(runId: string, options: DistillOptions = {}
     const now = new Date().toISOString();
     let record: MemoryRecord;
     let merged = false;
-    const existing = draft.updateOf ? store.get(draft.updateOf) : undefined;
+    // 阶段 13 (P1-1): updateOf is LLM-controlled — only ids matching the slug
+    // rule ever reach the store (hostile strings are ignored, not merged).
+    const updateOf = draft.updateOf && MEMORY_ID_PATTERN.test(draft.updateOf) ? draft.updateOf : undefined;
+    const existing = updateOf ? store.get(updateOf) : undefined;
     if (existing) {
       // Write-time reflection: this run confirms the existing memory. Original
       // runId provenance is preserved; content is refined by this run.

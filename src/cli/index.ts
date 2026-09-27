@@ -17,6 +17,7 @@ import type { TraceEvent } from "../trace/schema.js";
 import { distillRunById } from "../memory/distiller.js";
 import { MemoryStore } from "../memory/store.js";
 import { MemorySearchIndex } from "../memory/search.js";
+import { localEmbedder } from "../memory/embedding.js";
 
 interface ParsedArgs {
   command: string;
@@ -60,8 +61,8 @@ Usage:
   agent-harness resume [runId]           recover an interrupted run (default: latest)
   agent-harness memory core              show/create the always-resident Core Memory file
   agent-harness memory list              list Ordinary Memory files (authoritative markdown)
-  agent-harness memory search <query> [--limit <n>]       search memory (FTS5)
-  agent-harness memory rebuild           rebuild the search index from the .md files
+  agent-harness memory search <query> [--limit <n>] [--hybrid]   FTS5, or FTS+embeddings fused (RRF)
+  agent-harness memory rebuild [--vector]      rebuild indexes from the .md files (--vector embeds)
   agent-harness memory distill <runId>   distill a run manually
   agent-harness models [provider]          list providers, or a provider's models
   agent-harness trace list                 list recorded runs
@@ -142,17 +143,20 @@ async function main(): Promise<number> {
     if (sub === "search") {
       const query = positional.slice(1).join(" ").trim();
       if (!query) {
-        console.error("usage: agent-harness memory search <query> [--limit <n>]");
+        console.error("usage: agent-harness memory search <query> [--limit <n>] [--hybrid]");
         return 2;
       }
       const db = openDatabase(dbPath);
       try {
+        const index = new MemorySearchIndex(db);
         const limit = typeof flags.limit === "string" ? Number(flags.limit) : 3;
-        const hits = new MemorySearchIndex(db).searchFts(query, Number.isFinite(limit) && limit > 0 ? limit : 3);
+        const capped = Number.isFinite(limit) && limit > 0 ? limit : 3;
+        const hits = flags.hybrid === true ? await index.searchHybrid(query, capped, localEmbedder()) : index.searchFts(query, capped);
         if (hits.length === 0) {
           console.log("(no matching memory — try `memory rebuild` if you edited the .md files)");
           return 0;
         }
+        if (flags.hybrid === true) console.log("(hybrid: FTS5 + local embeddings, fused with RRF)");
         hits.forEach((h, i) => {
           console.log(`#${i + 1} [${h.taskType}] ${h.outcome} ×${h.confirmations} — ${h.summaryZh}`);
           console.log(`    approach: ${h.approach}`);
@@ -167,8 +171,13 @@ async function main(): Promise<number> {
     if (sub === "rebuild") {
       const db = openDatabase(dbPath);
       try {
-        const n = new MemorySearchIndex(db).rebuild(store);
-        console.log(`index rebuilt from ${n} memory file(s)`);
+        const index = new MemorySearchIndex(db);
+        const n = index.rebuild(store);
+        let vectors = 0;
+        if (flags.vector === true) {
+          vectors = await index.rebuildVectors(store, localEmbedder());
+        }
+        console.log(`index rebuilt from ${n} memory file(s)${flags.vector === true ? `, ${vectors} vector(s) embedded` : ""}`);
       } finally {
         db.close();
       }

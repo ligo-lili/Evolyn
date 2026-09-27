@@ -30,8 +30,16 @@ export {
   type RunDigest,
 } from "./memory/distiller.js";
 export { MemoryStore } from "./memory/store.js";
-export { MemorySearchIndex } from "./memory/search.js";
+export { MemorySearchIndex, passageText } from "./memory/search.js";
 export { parseMemory, serializeMemory, type MemoryRecord } from "./memory/model.js";
+export {
+  cosineSimilarity,
+  localEmbedder,
+  rrfCombine,
+  E5_PREFIXES,
+  type LocalEmbedderOptions,
+  type PassageEmbedder,
+} from "./memory/embedding.js";
 export {
   loadCrashedRun,
   planRecovery,

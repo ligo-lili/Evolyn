@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import { cosineSimilarity, rrfCombine, type PassageEmbedder } from "./embedding.js";
 import type { MemoryRecord } from "./model.js";
 import type { MemoryStore } from "./store.js";
 
@@ -22,11 +23,18 @@ function rowToRecord(r: Row): MemoryRecord {
   };
 }
 
+/** The text a memory is embedded from — bilingual, all retrievable fields. */
+export function passageText(record: MemoryRecord): string {
+  return [record.summaryEn, record.summaryZh, record.approach, record.pitfalls, record.keywordsEn.join(" ")]
+    .filter(Boolean)
+    .join("\n");
+}
+
 /**
  * Derived, rebuildable search index over the authoritative Markdown memory
- * files (阶段 9.5). FTS5 today; hybrid vector + RRF lands in 9.6 as another
- * rebuildable projection. If the index is lost or stale, `memory rebuild`
- * repopulates it from the files.
+ * files (阶段 9.5). Two projections: FTS5 (lexical) and memory_vectors
+ * (embeddings, 阶段 9.6) — both rebuilt from the .md files. searchHybrid fuses
+ * the two rankings with Reciprocal Rank Fusion.
  */
 export class MemorySearchIndex {
   constructor(private readonly db: DatabaseSync) {}
@@ -63,9 +71,10 @@ export class MemorySearchIndex {
   reset(): void {
     this.db.exec("DELETE FROM experiences_fts");
     this.db.exec("DELETE FROM experiences");
+    this.db.exec("DELETE FROM memory_vectors");
   }
 
-  /** Wipe and repopulate the index from the Markdown store. Returns record count. */
+  /** Wipe and repopulate the FTS index from the Markdown store. Returns record count. */
   rebuild(store: MemoryStore): number {
     this.reset();
     const records = store.list();
@@ -73,12 +82,27 @@ export class MemorySearchIndex {
     return records.length;
   }
 
-  /**
-   * FTS5 MATCH with quoted OR terms (recall-first: a partial keyword match
-   * still surfaces the record; bm25 ranks fuller matches higher) + bm25
-   * ordering; empty queries match nothing.
-   */
-  searchFts(query: string, limit = 3): MemoryRecord[] {
+  /** Wipe and re-embed every memory. Downloads the model on first use. */
+  async rebuildVectors(store: MemoryStore, embedder: PassageEmbedder): Promise<number> {
+    this.db.exec("DELETE FROM memory_vectors");
+    const records = store.list();
+    if (records.length === 0) return 0;
+    const vectors = await embedder.embedPassages(records.map(passageText));
+    const insert = this.db.prepare("INSERT OR REPLACE INTO memory_vectors (exp_id, dim, vec) VALUES (?, ?, ?)");
+    records.forEach((record, i) => {
+      const vec = vectors[i];
+      if (!vec) return;
+      insert.run(record.id, vec.length, Buffer.from(Float32Array.from(vec).buffer));
+    });
+    return records.length;
+  }
+
+  vectorCount(): number {
+    const row = this.db.prepare("SELECT COUNT(*) AS n FROM memory_vectors").get() as Row;
+    return Number(row.n);
+  }
+
+  private ftsRanked(query: string, limit: number): Array<{ id: string; rank: number }> {
     const terms = query
       .trim()
       .split(/\s+/)
@@ -87,11 +111,61 @@ export class MemorySearchIndex {
     if (terms.length === 0) return [];
     const rows = this.db
       .prepare(
-        `SELECT e.* FROM experiences_fts f JOIN experiences e ON e.id = f.exp_id
+        `SELECT e.id FROM experiences_fts f JOIN experiences e ON e.id = f.exp_id
          WHERE experiences_fts MATCH ? ORDER BY bm25(experiences_fts) LIMIT ?`,
       )
       .all(terms.join(" OR "), limit) as Row[];
-    return rows.map(rowToRecord);
+    return rows.map((r, i) => ({ id: String(r.id), rank: i + 1 }));
+  }
+
+  /** FTS5-only recall (OR semantics, bm25 ranking). */
+  searchFts(query: string, limit = 3): MemoryRecord[] {
+    const ids = this.ftsRanked(query, limit);
+    return ids
+      .map(({ id }) => {
+        const row = this.db.prepare("SELECT * FROM experiences WHERE id = ?").get(id) as Row | undefined;
+        return row ? rowToRecord(row) : undefined;
+      })
+      .filter((r): r is MemoryRecord => r !== undefined);
+  }
+
+  /**
+   * 阶段 9.6 hybrid recall: FTS ranking fused with embedding cosine ranking
+   * via RRF. Degrades gracefully to FTS-only when no vectors are built or the
+   * embedder is omitted.
+   */
+  async searchHybrid(
+    query: string,
+    limit: number,
+    embedder?: PassageEmbedder,
+    opts: { pool?: number } = {},
+  ): Promise<MemoryRecord[]> {
+    const pool = opts.pool ?? Math.max(limit * 5, 25);
+    const fts = this.ftsRanked(query, pool);
+    let vectorRanking: Array<{ id: string; rank: number }> = [];
+    if (embedder && this.vectorCount() > 0 && query.trim()) {
+      const queryVector = await embedder.embedQuery(query);
+      const rows = this.db.prepare("SELECT exp_id, vec, dim FROM memory_vectors").all() as Row[];
+      const scored = rows
+        .map((r) => {
+          const dim = Number(r.dim);
+          const blob = r.vec as Buffer;
+          // Copy the byte range into a fresh, 4-byte-aligned ArrayBuffer.
+          const aligned = blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength);
+          const vec = Array.from(new Float32Array(aligned)).slice(0, dim);
+          return { id: String(r.exp_id), score: cosineSimilarity(queryVector, vec) };
+        })
+        .sort((a, b) => b.score - a.score);
+      vectorRanking = scored.map((s, i) => ({ id: s.id, rank: i + 1 }));
+    }
+    const fused = vectorRanking.length > 0 ? rrfCombine([fts, vectorRanking]) : fts;
+    return fused
+      .slice(0, limit)
+      .map(({ id }) => {
+        const row = this.db.prepare("SELECT * FROM experiences WHERE id = ?").get(id) as Row | undefined;
+        return row ? rowToRecord(row) : undefined;
+      })
+      .filter((r): r is MemoryRecord => r !== undefined);
   }
 
   listRecent(limit = 20): MemoryRecord[] {

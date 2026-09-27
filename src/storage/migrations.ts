@@ -100,6 +100,19 @@ export const MIGRATIONS: Migration[] = [
       ALTER TABLE experiences ADD COLUMN updated TEXT;
     `,
   },
+  {
+    // 阶段 9.6: vector recall as another rebuildable projection. Float32 blobs;
+    // populated by `memory rebuild --vector` with the local embedding model.
+    id: 5,
+    name: "memory-vectors",
+    sql: `
+      CREATE TABLE memory_vectors (
+        exp_id TEXT PRIMARY KEY REFERENCES experiences(id),
+        dim INTEGER NOT NULL,
+        vec BLOB NOT NULL
+      );
+    `,
+  },
 ];
 
 export function migrate(db: DatabaseSync): void {

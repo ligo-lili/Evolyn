@@ -74,8 +74,8 @@ export function renderTimeline(parsed: ParsedTrace, options: { all?: boolean } =
       case "tool_execution_end":
         lines.push(`  ${stamp(ev)}  exec_done ${ev.toolName}${ev.isError ? " (ERROR)" : ""}`);
         continue;
-      case "approval":
-        lines.push(`  ${stamp(ev)}  approval ${ev.decision} ${ev.toolName}${ev.reason ? ` (${ev.reason})` : ""}`);
+      case "permission":
+        lines.push(`  ${stamp(ev)}  permission ${ev.decision} ${ev.risk} ${ev.toolName}${ev.reason ? ` (${ev.reason})` : ""}`);
         continue;
       case "recovery_action":
         lines.push(`  ${stamp(ev)}  recovery ${ev.action} ${ev.toolName}${ev.error ? ` "${clip(ev.error, 80)}"` : ""}`);
@@ -104,7 +104,7 @@ export function renderSummary(s: TraceSummary): string {
   }
   if (s.toolCalls.length === 0) lines.push("  tools: (none)");
   lines.push(`  tokens: in=${s.tokens.input} out=${s.tokens.output} total=${s.tokens.total} cost=$${s.tokens.cost.toFixed(4)}`);
-  lines.push(`  errors: ${s.errorCount}  approval denials: ${s.approvalDenials}  recovery actions: ${s.recoveryActions}`);
+  lines.push(`  errors: ${s.errorCount}  permission denials: ${s.permissionDenials}  recovery actions: ${s.recoveryActions}`);
   return lines.join("\n");
 }
 

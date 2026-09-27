@@ -12,7 +12,8 @@ import { TraceEventRepo } from "../storage/repos/trace-events.js";
 import { tracesDir } from "../runtime/paths.js";
 import { ConsoleReporter } from "../runtime/reporter.js";
 import { RunManager } from "../runtime/run-manager.js";
-import type { ApprovalMode } from "../runtime/approval.js";
+import { createPermissionGate, type ApprovalMode } from "../runtime/approval.js";
+import { ALL_CAPABILITIES, type Capability } from "../runtime/permissions.js";
 import type { TraceEvent } from "../trace/schema.js";
 import { distillRunById } from "../memory/distiller.js";
 import { MemoryStore } from "../memory/store.js";
@@ -57,7 +58,9 @@ function parseArgs(argv: string[]): ParsedArgs {
 const HELP = `agent-harness — durable execution harness on top of Pi Agent Runtime
 
 Usage:
-  agent-harness run "<task>" [--model provider/model-id]
+  agent-harness run "<task>" [--model provider/model-id] [--yolo]
+                    [--approval auto-approve|auto-deny|interactive]
+                    [--capabilities fs:read,fs:write,...] [--fault point:tool]
   agent-harness resume [runId]           recover an interrupted run (default: latest)
   agent-harness memory core              show/create the always-resident Core Memory file
   agent-harness memory list              list Ordinary Memory files (authoritative markdown)
@@ -341,9 +344,20 @@ async function main(): Promise<number> {
 
   const model = resolveModel(spec);
   const approvalFlag = typeof flags.approval === "string" ? flags.approval : undefined;
-  if (approvalFlag && approvalFlag !== "auto-approve" && approvalFlag !== "auto-deny") {
-    console.error(`unknown --approval mode "${approvalFlag}" (expected auto-approve | auto-deny)`);
+  if (approvalFlag && approvalFlag !== "auto-approve" && approvalFlag !== "auto-deny" && approvalFlag !== "interactive") {
+    console.error(`unknown --approval mode "${approvalFlag}" (expected auto-approve | auto-deny | interactive)`);
     return 2;
+  }
+  const capabilitiesFlag = typeof flags.capabilities === "string" ? flags.capabilities : undefined;
+  let capabilities: readonly string[] | undefined;
+  if (capabilitiesFlag) {
+    const requested = capabilitiesFlag.split(",").map((c) => c.trim()).filter(Boolean);
+    const invalid = requested.filter((c) => !ALL_CAPABILITIES.includes(c as never));
+    if (invalid.length > 0) {
+      console.error(`unknown capabilities: ${invalid.join(", ")} (available: ${ALL_CAPABILITIES.join(", ")})`);
+      return 2;
+    }
+    capabilities = requested;
   }
   const noDistill = flags["no-distill"] === true;
   const manager = new RunManager();
@@ -352,7 +366,10 @@ async function main(): Promise<number> {
     task,
     model,
     reporter: new ConsoleReporter(),
-    approval: approvalFlag ? { mode: approvalFlag as ApprovalMode } : undefined,
+    approval: {
+      mode: flags.yolo === true ? "auto-approve" : (approvalFlag as ApprovalMode | undefined),
+      capabilities: capabilities as readonly Capability[] | undefined,
+    },
     fault: typeof flags.fault === "string" ? flags.fault : undefined,
   });
 

@@ -36,8 +36,8 @@ export class TraceRecorder {
     this.seq = options.startSeq ?? 0;
   }
 
-  runStart(task: string, modelSpec: string, fault?: string): void {
-    this.append({ type: "run_start", task, modelSpec, fault });
+  runStart(task: string, modelSpec: string, fault?: string, capabilities?: readonly string[]): void {
+    this.append({ type: "run_start", task, modelSpec, fault, capabilities });
   }
 
   onEvent = (event: AgentEvent): void => {

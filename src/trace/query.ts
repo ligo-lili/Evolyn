@@ -19,7 +19,7 @@ export interface TraceSummary {
   toolCalls: ToolCallStat[];
   tokens: { input: number; output: number; total: number; cost: number };
   errorCount: number;
-  approvalDenials: number;
+  permissionDenials: number;
   recoveryActions: number;
   eventCount: number;
 }
@@ -35,7 +35,7 @@ export function summarize(events: readonly TraceEvent[]): TraceSummary {
     toolCalls: [],
     tokens: { input: 0, output: 0, total: 0, cost: 0 },
     errorCount: 0,
-    approvalDenials: 0,
+    permissionDenials: 0,
     recoveryActions: 0,
     eventCount: events.length,
   };
@@ -78,8 +78,8 @@ export function summarize(events: readonly TraceEvent[]): TraceSummary {
         if (event.isError) summary.errorCount++;
         break;
       }
-      case "approval":
-        if (event.decision === "deny") summary.approvalDenials++;
+      case "permission":
+        if (event.decision === "deny") summary.permissionDenials++;
         break;
       case "recovery_action":
         summary.recoveryActions++;

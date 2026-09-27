@@ -132,7 +132,7 @@ describe("trace replay (阶段 7)", () => {
 
     const summary = summarize(events);
     expect(summary.errorCount).toBeGreaterThanOrEqual(1);
-    expect(summary.approvalDenials).toBe(1);
+    expect(summary.permissionDenials).toBe(1);
     const errors = collectErrors(events);
     expect(errors.length).toBeGreaterThanOrEqual(1);
     expect(errors.some((e) => e.type === "tool_execution_end" && e.isError)).toBe(true);

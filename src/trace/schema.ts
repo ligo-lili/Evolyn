@@ -1,5 +1,6 @@
 import type { AgentEvent } from "@earendil-works/pi-agent-core";
 import type { RunStatus } from "../runtime/run-manager.js";
+import type { RiskClass } from "../runtime/permissions.js";
 
 /**
  * Trace schema: a run's full execution log. Envelope fields ride on every
@@ -19,15 +20,16 @@ export interface TraceEnvelope {
 }
 
 export type RunLifecycleEvent =
-  | { type: "run_start"; task: string; modelSpec: string; fault?: string }
+  | { type: "run_start"; task: string; modelSpec: string; fault?: string; capabilities?: readonly string[] }
   | { type: "run_end"; status: RunStatus; error?: string; durationMs: number };
 
 /**
  * Harness-originated audit events (not pi AgentEvents): decisions and actions
- * the harness itself takes around the agent loop.
+ * the harness itself takes around the agent loop. Together with the run
+ * lifecycle they form the audit log (阶段 9.7).
  */
 export type HarnessAuditEvent =
-  | { type: "approval"; toolName: string; decision: "allow" | "deny"; reason?: string }
+  | { type: "permission"; toolName: string; decision: "allow" | "deny"; risk: RiskClass; reason?: string }
   | { type: "recovery_action"; toolCallId: string; toolName: string; action: "reexecute" | "rebuild_result" | "synthesize_error"; error?: string }
   | { type: "compaction"; trigger: "threshold" | "rolling"; tokensBefore: number; summaryChars: number; cutIndex: number };
 

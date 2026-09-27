@@ -21,7 +21,8 @@ import { MemoryStore } from "../memory/store.js";
 import { withEvidenceCapture } from "./tools/evidence.js";
 import { TraceRecorder, JsonlTraceSink, type TraceSink } from "../trace/recorder.js";
 import { applyFaultToTools, FaultController, formatFaultSpec, parseFaultSpec } from "../execution/fault.js";
-import { createApprovalHook, type ApprovalOptions } from "./approval.js";
+import { createPermissionGate, type ApprovalOptions } from "./approval.js";
+import { ALL_CAPABILITIES } from "./permissions.js";
 import { harnessDataDir } from "./paths.js";
 import { createAgent } from "./agent-factory.js";
 import { ConsoleReporter, type RunReporter } from "./reporter.js";
@@ -175,6 +176,7 @@ export class RunManager {
     const traceEnabled = options.trace !== false;
     let traceFile: string | undefined;
     let recorder: TraceRecorder | undefined;
+    const grantedCapabilities = options.approval?.capabilities ?? ALL_CAPABILITIES;
     if (traceEnabled) {
       const traceDir = options.traceDir ?? path.join(harnessDataDir(process.cwd()), "traces");
       mkdirSync(traceDir, { recursive: true });
@@ -182,14 +184,16 @@ export class RunManager {
       const sinks: TraceSink[] = [new JsonlTraceSink(traceFile)];
       if (database) sinks.push(new TraceEventRepo(database));
       recorder = new TraceRecorder(record.id, sinks);
-      recorder.runStart(record.task, record.modelSpec, faultSpec ? formatFaultSpec(faultSpec) : undefined);
+      recorder.runStart(record.task, record.modelSpec, faultSpec ? formatFaultSpec(faultSpec) : undefined, grantedCapabilities);
     }
 
     const tools = withEvidenceCapture(
       applyFaultToTools(options.tools ?? DEMO_TOOLS, faultSpec),
       path.join(harnessDataDir(process.cwd()), "evidence", record.id),
     );
-    const approvalHook = options.approval ? createApprovalHook(options.approval, (event) => recorder?.record(event)) : undefined;
+    // 阶段 9.7: the permission gate is ALWAYS installed — capability checks are
+    // not optional. Default options grant everything (backwards compatible).
+    const permissionGate = createPermissionGate(options.approval, (event) => recorder?.record(event));
     const contextTransformer = createContextTransformer({
       contextWindow: options.model.contextWindow,
       model: options.model,
@@ -204,7 +208,7 @@ export class RunManager {
       tools,
       streamFn: options.streamFn,
       sessionId: record.id,
-      beforeToolCall: approvalHook,
+      beforeToolCall: permissionGate,
       transformContext: contextTransformer,
     });
     const faultController = faultSpec ? new FaultController(faultSpec) : undefined;

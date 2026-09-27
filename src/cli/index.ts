@@ -424,8 +424,10 @@ async function main(): Promise<number> {
         return 2;
       }
       const runner = defaultEvalRunner(spec);
-      console.log(`running ${taskSet.tasks.length} task(s) × 2 arms (baseline / +skill "${skillName}")…`);
-      const report = await runEvalComparison(taskSet, { runner, skillName });
+      const repeatsFlag = typeof flags.repeats === "string" ? Number(flags.repeats) : 1;
+      const repeats = Number.isFinite(repeatsFlag) && repeatsFlag >= 1 ? Math.floor(repeatsFlag) : 1;
+      console.log(`running ${taskSet.tasks.length} task(s) × ${repeats} repeat(s) × 2 arms (baseline / +skill "${skillName}")…`);
+      const report = await runEvalComparison(taskSet, { runner, skillName, repeats });
       console.log(renderEvalReport(report));
       return 0;
     }
@@ -602,6 +604,8 @@ async function main(): Promise<number> {
       capabilities: capabilities as readonly Capability[] | undefined,
     },
     fault: typeof flags.fault === "string" ? flags.fault : undefined,
+    // --no-skills: manual baseline for hand-run A/B demos (阶段 10 eval does this itself)
+    skills: flags["no-skills"] === true ? false : undefined,
   });
 
   const record = result.record;

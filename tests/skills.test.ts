@@ -8,7 +8,7 @@ import { PatternRepo } from "../src/storage/repos/patterns.js";
 import { SkillCandidateRepo } from "../src/storage/repos/candidates.js";
 import { extractRunToolTrace, minePatterns, MIN_PATTERN_SUPPORT, minePatternsFromDb, patternId } from "../src/learning/miner.js";
 import { draftSkillFromPattern } from "../src/learning/candidate.js";
-import { judgeRun, loadTaskSet, renderEvalReport, runEvalComparison, type EvalRunner } from "../src/learning/eval.js";
+import { judgeRun, loadTaskSet, readBackVerified, renderEvalReport, runEvalArm, runEvalComparison, type EvalRunner } from "../src/learning/eval.js";
 import { promoteCandidate } from "../src/skills/promote.js";
 import { SkillIndex } from "../src/skills/retrieve.js";
 import { parseSkillMd, serializeSkillMd, validateSkillName, SKILL_DESCRIPTION_MAX } from "../src/skills/format.js";
@@ -334,7 +334,76 @@ describe("scripted A/B eval (阶段 10)", () => {
     tmp.leave();
   });
 
-  it("compares both arms and declares the verdict against the baseline", async () => {
+  it("judges v2 checks: line count, exact lines, uniqueness, sorting, per-line regex", () => {
+    tmp.enter();
+    const write = (name: string, content: string) => fs.writeFileSync(path.join(tmp.dir, name), content, "utf8");
+    const ok = { taskId: "t", status: "completed" };
+    // line count
+    write("five.txt", "a\nb\nc\nd\ne\n");
+    expect(judgeRun({ id: "t", task: "x", expectFile: "five.txt", expectLines: 5 }, ok).pass).toBe(true);
+    expect(judgeRun({ id: "t", task: "x", expectFile: "five.txt", expectLines: 6 }, ok).reason).toContain("expected 6");
+    // exact lines (order-sensitive)
+    write("words.txt", "alpha\nbeta\ngamma\n");
+    expect(judgeRun({ id: "t", task: "x", expectFile: "words.txt", expectLinesExact: ["alpha", "beta", "gamma"] }, ok).pass).toBe(true);
+    expect(judgeRun({ id: "t", task: "x", expectFile: "words.txt", expectLinesExact: ["alpha", "gamma", "beta"] }, ok).reason).toContain("line 2");
+    // uniqueness
+    write("dup.txt", "a\nb\na\n");
+    expect(judgeRun({ id: "t", task: "x", expectFile: "dup.txt", expectUnique: true }, ok).reason).toContain("duplicate");
+    // sorting (case-insensitive)
+    write("sorted.txt", "ant\nBee\ncow\n");
+    expect(judgeRun({ id: "t", task: "x", expectFile: "sorted.txt", expectSorted: true }, ok).pass).toBe(true);
+    write("unsorted.txt", "cow\nant\nbee\n");
+    expect(judgeRun({ id: "t", task: "x", expectFile: "unsorted.txt", expectSorted: true }, ok).reason).toContain("alphabetical");
+    // descending order
+    write("desc.txt", "cow\nBee\nant\n");
+    expect(judgeRun({ id: "t", task: "x", expectFile: "desc.txt", expectSorted: "desc" }, ok).pass).toBe(true);
+    write("asc.txt", "ant\nBee\ncow\n");
+    expect(judgeRun({ id: "t", task: "x", expectFile: "asc.txt", expectSorted: "desc" }, ok).reason).toContain("reverse");
+    // per-line regex
+    write("nums.txt", "item-1\nitem-2\n");
+    expect(judgeRun({ id: "t", task: "x", expectFile: "nums.txt", expectLineRegex: "^item-\\d+$" }, ok).pass).toBe(true);
+    write("bad.txt", "item-1\nitem two\n");
+    expect(judgeRun({ id: "t", task: "x", expectFile: "bad.txt", expectLineRegex: "^item-\\d+$" }, ok).reason).toContain("item two");
+    tmp.leave();
+  });
+
+  it("resets the workspace before every run: fixtures rewritten, stale artifacts removed", async () => {
+    tmp.enter();
+    const seen: string[] = [];
+    const taskSet = {
+      name: "fixture",
+      tasks: [
+        {
+          id: "update",
+          task: "make pantry.txt contain exactly flour, sugar",
+          setupFiles: { "pantry.txt": "flour\nsugar\n" },
+          expectFile: "pantry.txt",
+        },
+      ],
+    };
+    const mutatingRunner: EvalRunner = async (task) => {
+      seen.push(fs.readFileSync(path.join(tmp.dir, "pantry.txt"), "utf8"));
+      // simulate the model rewriting the file (as a real run would)
+      fs.writeFileSync(path.join(tmp.dir, "pantry.txt"), "flour\nsugar\nsalt\npepper\n", "utf8");
+      return { taskId: task.id, status: "completed" };
+    };
+    const arm = await runEvalArm(taskSet, mutatingRunner, false, 2);
+    // both repeats saw the pristine fixture — the second did not inherit run 1's rewrite
+    expect(seen).toEqual(["flour\nsugar\n", "flour\nsugar\n"]);
+    expect(arm.taskSummaries).toEqual([{ taskId: "update", passes: 2, repeats: 2, failures: [] }]);
+    // stale artifact from the previous run is removed before the next one
+    fs.writeFileSync(path.join(tmp.dir, "art.txt"), "old", "utf8");
+    let existedDuringPrepare = false;
+    const probingRunner: EvalRunner = async (task) => {
+      existedDuringPrepare = fs.existsSync(path.join(tmp.dir, "art.txt"));
+      return { taskId: task.id, status: "completed" };
+    };
+    await runEvalArm({ name: "s", tasks: [{ id: "a", task: "x", expectFile: "art.txt" }] }, probingRunner, false);
+    expect(existedDuringPrepare).toBe(false);
+    tmp.leave();
+  });
+
+  it("aggregates repeats into per-task summaries and an honest verdict", async () => {
     const taskSet = {
       name: "notes",
       tasks: [
@@ -342,23 +411,47 @@ describe("scripted A/B eval (阶段 10)", () => {
         { id: "t2", task: "note two" },
       ],
     };
-    // baseline: 1/2 pass; treatment: 2/2
-    const runner: EvalRunner = async (task, skills) => ({
-      taskId: task.id,
-      status: skills === false && task.id === "t2" ? "failed" : "completed",
-      tokens: 5,
-    });
-    const report = await runEvalComparison(taskSet, { runner, skillName: "note-file-workflow" });
-    expect(report.baseline.passRate).toBe(0.5);
+    // baseline passes t1 always and t2 once in two repeats; treatment passes everything
+    let t2Calls = 0;
+    const runner: EvalRunner = async (task, skills) => {
+      const failBaseline = skills === false && task.id === "t2" && ++t2Calls % 2 === 1;
+      return { taskId: task.id, status: failBaseline ? "failed" : "completed", tokens: 5 };
+    };
+    const report = await runEvalComparison(taskSet, { runner, skillName: "note-file-workflow", repeats: 2 });
+    expect(report.repeats).toBe(2);
+    expect(report.baseline.results).toHaveLength(4);
+    expect(report.baseline.passRate).toBe(3 / 4);
     expect(report.treatment.passRate).toBe(1);
     expect(report.verdict).toBe("candidate-wins");
-    expect(renderEvalReport(report)).toContain("candidate-wins");
+    const rendered = renderEvalReport(report);
+    expect(rendered).toContain("t1: 2/2 vs 2/2");
+    expect(rendered).toContain("t2: 1/2 vs 2/2");
+    expect(rendered).toContain("candidate-wins");
 
     const reversed = await runEvalComparison(taskSet, {
       runner: async (task, skills) => ({ taskId: task.id, status: skills !== false && task.id === "t1" ? "failed" : "completed" }),
       skillName: "note-file-workflow",
     });
     expect(reversed.verdict).toBe("baseline-wins");
+  });
+
+  it("detects read-back verification from the transcript", () => {
+    const toolCall = (name: string, path: string) => ({ type: "toolCall" as const, id: name + path, name, arguments: { path } });
+    const assistant = (...calls: ReturnType<typeof toolCall>[]) =>
+      ({ role: "assistant", content: calls, stopReason: "toolUse", timestamp: 1 }) as never;
+    // write then read the same path → verified
+    expect(readBackVerified([assistant(toolCall("write_file", "a.txt")), assistant(toolCall("read_file", "a.txt"))])).toBe(true);
+    // read before any write → not verified
+    expect(readBackVerified([assistant(toolCall("read_file", "a.txt")), assistant(toolCall("write_file", "a.txt"))])).toBe(false);
+    // read of a different path → not verified
+    expect(readBackVerified([assistant(toolCall("write_file", "a.txt")), assistant(toolCall("read_file", "b.txt"))])).toBe(false);
+    // reading the injected skill file is not a read-back
+    expect(readBackVerified([assistant(toolCall("read_file", ".harness/skills/promoted/s/SKILL.md")), assistant(toolCall("write_file", "a.txt"))])).toBe(false);
+    // multiple writes, read-back of the second → verified
+    expect(
+      readBackVerified([assistant(toolCall("write_file", "a.txt")), assistant(toolCall("write_file", "b.txt")), assistant(toolCall("read_file", "b.txt"))]),
+    ).toBe(true);
+    expect(readBackVerified([])).toBe(false);
   });
 
   it("loads and validates task sets", () => {

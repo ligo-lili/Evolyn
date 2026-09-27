@@ -1,0 +1,54 @@
+{
+ "name": "probe-hard",
+ "tasks": [
+  {
+   "id": "long-exact-order",
+   "task": "Create a file probe-rainbow.txt with exactly 12 colors in this exact order: red, orange, yellow, green, blue, indigo, violet, pink, brown, black, white, gray — one per line.",
+   "expectFile": "probe-rainbow.txt",
+   "expectLinesExact": [
+    "red",
+    "orange",
+    "yellow",
+    "green",
+    "blue",
+    "indigo",
+    "violet",
+    "pink",
+    "brown",
+    "black",
+    "white",
+    "gray"
+   ]
+  },
+  {
+   "id": "long-sorted",
+   "task": "Create a file probe-countries.txt with exactly 15 country names, one per line, alphabetically sorted (A to Z), no duplicates.",
+   "expectFile": "probe-countries.txt",
+   "expectLines": 15,
+   "expectSorted": true,
+   "expectUnique": true
+  },
+  {
+   "id": "fib-count",
+   "task": "Create a file probe-fib.txt with the first 15 Fibonacci numbers starting from 1, 1 (so it begins 1, 1, 2, 3, 5, ...), one per line.",
+   "expectFile": "probe-fib.txt",
+   "expectLinesExact": [
+    "1",
+    "1",
+    "2",
+    "3",
+    "5",
+    "8",
+    "13",
+    "21",
+    "34",
+    "55",
+    "89",
+    "144",
+    "233",
+    "377",
+    "610"
+   ]
+  }
+ ]
+}

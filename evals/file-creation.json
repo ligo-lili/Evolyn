@@ -1,0 +1,95 @@
+{
+  "name": "file-creation-v1",
+  "description": "File-creation discipline. Every requirement is stated in the task text — both arms see the same spec; checks only verify what was stated. Headroom evidence (2026-09-27): 24 baseline probe runs across 12 task designs (evals/probes/) all passed, AND the formal 36-run eval showed the no-skill baseline self-verifies 18/18 (read-back after write) — deepseek-flash has no pass-rate headroom AND no adoption headroom here, so a write-verify skill is redundant at a +18% token cost for this model. Pass rate + adoption cannot discriminate skills in this domain; skill gating needs a domain/model with failure mass (weaker eval model, multi-file/long-horizon tasks).",
+  "tasks": [
+    {
+      "id": "sorted-list",
+      "task": "Create a file sorted-list.txt with exactly 8 tree names, one per line, alphabetically sorted (A to Z), no duplicates.",
+      "expectFile": "sorted-list.txt",
+      "expectLines": 8,
+      "expectSorted": true,
+      "expectUnique": true
+    },
+    {
+      "id": "exact-format",
+      "task": "Create a file checklist.txt containing exactly 10 lines. Line k must be exactly item-k in lowercase with no spaces (so the first line is item-1 and the last line is item-10).",
+      "expectFile": "checklist.txt",
+      "expectLinesExact": [
+        "item-1",
+        "item-2",
+        "item-3",
+        "item-4",
+        "item-5",
+        "item-6",
+        "item-7",
+        "item-8",
+        "item-9",
+        "item-10"
+      ]
+    },
+    {
+      "id": "update-existing",
+      "task": "The file pantry.txt already lists some staples. Make pantry.txt contain exactly these 7 items, one per line, in this order: flour, sugar, rice, beans, salt, pepper, oil.",
+      "setupFiles": {
+        "pantry.txt": "flour\nsugar\nrice\nbeans\n"
+      },
+      "expectFile": "pantry.txt",
+      "expectLinesExact": [
+        "flour",
+        "sugar",
+        "rice",
+        "beans",
+        "salt",
+        "pepper",
+        "oil"
+      ]
+    },
+    {
+      "id": "precision-format",
+      "task": "Create a file version.txt whose entire content is exactly one line: version: 1.0.0",
+      "expectFile": "version.txt",
+      "expectLinesExact": [
+        "version: 1.0.0"
+      ]
+    },
+    {
+      "id": "ordered-domain-list",
+      "task": "Create a file planets.txt listing the 8 planets of the solar system, one per line, ordered from closest to the sun to farthest, each name capitalized (e.g. Mercury).",
+      "expectFile": "planets.txt",
+      "expectLinesExact": [
+        "Mercury",
+        "Venus",
+        "Earth",
+        "Mars",
+        "Jupiter",
+        "Saturn",
+        "Uranus",
+        "Neptune"
+      ]
+    },
+    {
+      "id": "arith-transform",
+      "task": "The file mult-source.txt contains 14 numbers, one per line. Create a file mult-doubled7.txt containing each of those numbers multiplied by 7, in the same order, one per line.",
+      "setupFiles": {
+        "mult-source.txt": "47\n123\n8\n265\n89\n12\n334\n71\n156\n99\n210\n45\n178\n63\n"
+      },
+      "expectFile": "mult-doubled7.txt",
+      "expectLinesExact": [
+        "329",
+        "861",
+        "56",
+        "1855",
+        "623",
+        "84",
+        "2338",
+        "497",
+        "1092",
+        "693",
+        "1470",
+        "315",
+        "1246",
+        "441"
+      ]
+    }
+  ]
+}

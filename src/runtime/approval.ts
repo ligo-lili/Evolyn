@@ -51,7 +51,7 @@ export function defaultApproveFn(): ApproveFn {
 export function createPermissionGate(
   options: ApprovalOptions | undefined,
   audit: (event: HarnessAuditEvent) => void,
-): AgentOptions["beforeToolCall"] {
+): NonNullable<AgentOptions["beforeToolCall"]> {
   const mode = options?.mode ?? "auto-approve";
   const granted: readonly Capability[] = options?.capabilities ?? ALL_CAPABILITIES;
   const approver = options?.approveFn ?? defaultApproveFn();

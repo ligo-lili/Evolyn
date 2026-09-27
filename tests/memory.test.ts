@@ -132,8 +132,8 @@ describe("write-time reflection (阶段 9.5)", () => {
 
     const second = await distillRunById(result2.record.id, {
       database: dbPath,
-      complete: async (prompt) => {
-        expect(prompt).toContain("EXISTING memory candidates");
+      complete: async (messages) => {
+        expect(messages.map((m) => m.content).join("\n")).toContain("EXISTING memory candidates");
         return JSON.stringify({
           updateOf: first.record.id,
           taskType: "file-organization",

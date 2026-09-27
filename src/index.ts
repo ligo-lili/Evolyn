@@ -40,7 +40,8 @@ export {
   distillRunById,
   fallbackDraft,
   parseExperienceDraft,
-  type CompleteFn,
+  parseExperienceDraftStrict,
+  MEMORY_DRAFT_SCHEMA,
   type DistillOptions,
   type DistillOutcome,
   type ExperienceDraft,
@@ -49,6 +50,18 @@ export {
 export { MemoryStore } from "./memory/store.js";
 export { MemorySearchIndex, passageText } from "./memory/search.js";
 export { parseMemory, serializeMemory, type MemoryRecord } from "./memory/model.js";
+export {
+  completeStructured,
+  defaultChat,
+  type ChatFn,
+  type ChatTurn,
+  type SchemaTool,
+  type StructuredOptions,
+  type StructuredResult,
+} from "./llm/structured.js";
+export { isTransientError, withRetry, type RetryPolicy } from "./runtime/retry.js";
+export { DEFAULT_RUN_LIMITS, LimitEnforcer, type LimitViolation, type RunLimits } from "./runtime/limits.js";
+export { withToolTimeout } from "./runtime/tools/timeout.js";
 export {
   cosineSimilarity,
   localEmbedder,

@@ -1,8 +1,10 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
+import { Type } from "typebox";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { HarnessError } from "../errors.js";
+import { completeStructured, defaultChat, type ChatFn } from "../llm/structured.js";
 import { resolveModel, getModelRegistry } from "../providers.js";
 import { defaultDbPath, openDatabase } from "../storage/db.js";
 import { RunRepo } from "../storage/repos/runs.js";
@@ -138,54 +140,79 @@ export function fallbackDraft(digest: RunDigest): ExperienceDraft {
   };
 }
 
-/** Tolerant parsing: find the first {...} blob, normalize fields, fall back on garbage. */
+/** Tolerant wrapper: strict parse, falling back to a naive draft on garbage. */
 export function parseExperienceDraft(raw: string, digest: RunDigest): ExperienceDraft {
   try {
-    const start = raw.indexOf("{");
-    const end = raw.lastIndexOf("}");
-    if (start === -1 || end <= start) throw new Error("no JSON object found");
-    const parsed = JSON.parse(raw.slice(start, end + 1)) as Record<string, unknown>;
-    const keywords = Array.isArray(parsed.keywordsEn)
-      ? parsed.keywordsEn.map((k) => String(k)).filter(Boolean).slice(0, 8)
-      : String(parsed.keywordsEn ?? "").split(/[,\s]+/).filter(Boolean).slice(0, 8);
-    const draft: ExperienceDraft = {
-      updateOf: typeof parsed.updateOf === "string" && parsed.updateOf.trim() ? parsed.updateOf.trim() : undefined,
-      taskType: slugify(parsed.taskType, "uncategorized"),
-      summaryEn: String(parsed.summaryEn ?? "").trim() || `Run ${digest.status} for task: ${digest.task}`,
-      summaryZh: String(parsed.summaryZh ?? "").trim() || fallbackDraft(digest).summaryZh,
-      approach: String(parsed.approach ?? "").trim() || "Not recorded.",
-      pitfalls: String(parsed.pitfalls ?? "").trim() || "Not recorded.",
-      outcome: normalizeOutcome(parsed.outcome, digest.status),
-      keywordsEn: keywords,
-    };
-    return draft;
+    return parseExperienceDraftStrict(raw, digest);
   } catch {
     return fallbackDraft(digest);
   }
 }
 
-export function defaultComplete(model: Model<Api>): CompleteFn {
-  const models = getModelRegistry();
-  return async (prompt: string) => {
-    const assistant = await models.completeSimple(model, {
-      systemPrompt: DISTILL_SYSTEM_PROMPT,
-      messages: [{ role: "user", content: prompt, timestamp: Date.now() } as never],
-    });
-    return textOf(assistant.content);
+/** Strict parse — throws on anything that is not a well-formed draft JSON. */
+export function parseExperienceDraftStrict(raw: string, digest: RunDigest): ExperienceDraft {
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start === -1 || end <= start) throw new Error("no JSON object found in response");
+  const parsed = JSON.parse(raw.slice(start, end + 1)) as Record<string, unknown>;
+  const keywords = Array.isArray(parsed.keywordsEn)
+    ? parsed.keywordsEn.map((k) => String(k)).filter(Boolean).slice(0, 8)
+    : String(parsed.keywordsEn ?? "").split(/[,\s]+/).filter(Boolean).slice(0, 8);
+  return {
+    updateOf: typeof parsed.updateOf === "string" && parsed.updateOf.trim() ? parsed.updateOf.trim() : undefined,
+    taskType: slugify(parsed.taskType, "uncategorized"),
+    summaryEn: String(parsed.summaryEn ?? "").trim() || `Run ${digest.status} for task: ${digest.task}`,
+    summaryZh: String(parsed.summaryZh ?? "").trim() || fallbackDraft(digest).summaryZh,
+    approach: String(parsed.approach ?? "").trim() || "Not recorded.",
+    pitfalls: String(parsed.pitfalls ?? "").trim() || "Not recorded.",
+    outcome: normalizeOutcome(parsed.outcome, digest.status),
+    keywordsEn: keywords,
   };
 }
 
-export async function distillExperience(digest: RunDigest, complete: CompleteFn, candidates: MemoryRecord[] = []): Promise<ExperienceDraft> {
-  const raw = await complete(buildDistillPrompt(digest, candidates));
-  return parseExperienceDraft(raw, digest);
+export const MEMORY_DRAFT_SCHEMA = Type.Object({
+  updateOf: Type.Optional(Type.String({ description: "id of an existing memory this run confirms" })),
+  taskType: Type.String(),
+  summaryEn: Type.String(),
+  summaryZh: Type.String(),
+  approach: Type.String(),
+  pitfalls: Type.String(),
+  outcome: Type.Union([Type.Literal("success"), Type.Literal("partial"), Type.Literal("failed")]),
+  keywordsEn: Type.Array(Type.String()),
+});
+
+export function defaultChatForModel(model: Model<Api>): ChatFn {
+  return defaultChat(model, { systemPrompt: DISTILL_SYSTEM_PROMPT });
+}
+
+export async function distillExperience(
+  digest: RunDigest,
+  complete: ChatFn,
+  candidates: MemoryRecord[] = [],
+): Promise<ExperienceDraft> {
+  // 阶段 9.8: direct parse → re-prompt with the parse error → constrained
+  // decoding (schema tool); distillRunById applies the naive draft as the
+  // last-resort fallback when even this pipeline fails.
+  const { value } = await completeStructured({
+    prompt: buildDistillPrompt(digest, candidates),
+    parse: (raw) => parseExperienceDraftStrict(raw, digest),
+    complete,
+    maxReprompts: 1,
+    schemaTool: {
+      name: "store_memory",
+      description: "Store the distilled memory record. Call this with the complete JSON payload.",
+      parameters: MEMORY_DRAFT_SCHEMA,
+    },
+  });
+  return value;
 }
 
 export interface DistillOptions {
   database?: string;
   /** Cheap distillation model spec; defaults to HARNESS_DISTILL_MODEL or deepseek/deepseek-flash. */
   distillModelSpec?: string;
-  /** Injectable completion for tests; default goes through the pi-ai registry. */
-  complete?: CompleteFn;
+  /** Injectable chat for tests; default goes through the pi-ai registry. */
+  complete?: ChatFn;
 }
 
 export interface DistillOutcome {
@@ -222,8 +249,16 @@ export async function distillRunById(runId: string, options: DistillOptions = {}
     const candidates = index.searchFts(digest.task, 3);
 
     const spec = options.distillModelSpec ?? process.env.HARNESS_DISTILL_MODEL ?? "deepseek/deepseek-flash";
-    const complete = options.complete ?? defaultComplete(resolveModel(spec));
-    const draft = await distillExperience(digest, complete, candidates);
+    const complete = options.complete ?? defaultChatForModel(resolveModel(spec));
+    let draft: ExperienceDraft;
+    try {
+      draft = await distillExperience(digest, complete, candidates);
+    } catch (err) {
+      // Last-resort fallback (阶段 9.8): even the structured pipeline failed —
+      // store a naive record rather than losing the run's experience entirely.
+      process.stderr.write(`[memory] structured distillation failed (${err instanceof Error ? err.message : err}); using naive draft\n`);
+      draft = fallbackDraft(digest);
+    }
 
     const now = new Date().toISOString();
     let record: MemoryRecord;

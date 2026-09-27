@@ -16,6 +16,9 @@ import { loadCrashedRun, planRecovery, toolResultMessage } from "../execution/re
 import { assembleSystemPrompt, renderExperienceBlock } from "../context/assembler.js";
 import { createContextTransformer } from "../context/compaction.js";
 import type { CompactionSettings } from "@earendil-works/pi-agent-core";
+import { DEFAULT_RUN_LIMITS, LimitEnforcer, type LimitViolation, type RunLimits } from "./limits.js";
+import { withRetry, type RetryPolicy } from "./retry.js";
+import { withToolTimeout } from "./tools/timeout.js";
 import { MemorySearchIndex } from "../memory/search.js";
 import { MemoryStore } from "../memory/store.js";
 import { withEvidenceCapture } from "./tools/evidence.js";
@@ -75,6 +78,10 @@ export interface RunOptions {
   };
   /** Ordinary-memory retrieval for pointer injection. Default: 3 hits when an index exists. */
   memory?: { limit?: number };
+  /** Runaway guards (turns/tool calls/repeats/cost). Defaults are always enforced. */
+  limits?: RunLimits;
+  /** Tiered retry policy for idempotent tools (transient errors only). */
+  retry?: RetryPolicy;
 }
 
 export interface ResumeOptions {
@@ -173,6 +180,15 @@ export class RunManager {
     record.systemPrompt = systemPrompt;
     runRepo?.insert(record);
 
+    const limits: Required<RunLimits> = {
+      maxTurns: options.limits?.maxTurns ?? DEFAULT_RUN_LIMITS.maxTurns,
+      maxToolCalls: options.limits?.maxToolCalls ?? DEFAULT_RUN_LIMITS.maxToolCalls,
+      maxRepeatedToolCalls: options.limits?.maxRepeatedToolCalls ?? DEFAULT_RUN_LIMITS.maxRepeatedToolCalls,
+      maxCostUsd: options.limits?.maxCostUsd ?? DEFAULT_RUN_LIMITS.maxCostUsd,
+      toolTimeoutMs: options.limits?.toolTimeoutMs ?? DEFAULT_RUN_LIMITS.toolTimeoutMs,
+    };
+    let limitViolation: LimitViolation | undefined;
+
     const traceEnabled = options.trace !== false;
     let traceFile: string | undefined;
     let recorder: TraceRecorder | undefined;
@@ -187,13 +203,25 @@ export class RunManager {
       recorder.runStart(record.task, record.modelSpec, faultSpec ? formatFaultSpec(faultSpec) : undefined, grantedCapabilities);
     }
 
-    const tools = withEvidenceCapture(
-      applyFaultToTools(options.tools ?? DEMO_TOOLS, faultSpec),
-      path.join(harnessDataDir(process.cwd()), "evidence", record.id),
+    const tools = withRetry(
+      withToolTimeout(
+        withEvidenceCapture(applyFaultToTools(options.tools ?? DEMO_TOOLS, faultSpec), path.join(harnessDataDir(process.cwd()), "evidence", record.id)),
+        limits.toolTimeoutMs,
+      ),
+      { policy: options.retry, audit: (event) => recorder?.record(event) },
     );
     // 阶段 9.7: the permission gate is ALWAYS installed — capability checks are
     // not optional. Default options grant everything (backwards compatible).
     const permissionGate = createPermissionGate(options.approval, (event) => recorder?.record(event));
+    // 阶段 9.8: runaway guards sit in FRONT of the permission gate.
+    const limitEnforcer = new LimitEnforcer(limits, (event) => recorder?.record(event), (violation) => {
+      limitViolation = violation;
+    });
+    const composedBeforeToolCall: typeof permissionGate = async (context) => {
+      const violation = limitEnforcer.beforeToolCall(context.toolCall.name, context.args);
+      if (violation) return violation;
+      return permissionGate(context);
+    };
     const contextTransformer = createContextTransformer({
       contextWindow: options.model.contextWindow,
       model: options.model,
@@ -208,7 +236,7 @@ export class RunManager {
       tools,
       streamFn: options.streamFn,
       sessionId: record.id,
-      beforeToolCall: permissionGate,
+      beforeToolCall: composedBeforeToolCall,
       transformContext: contextTransformer,
     });
     const faultController = faultSpec ? new FaultController(faultSpec) : undefined;
@@ -220,6 +248,7 @@ export class RunManager {
       reporter.onEvent(event);
       recorder?.onEvent(event);
       checkpointWriter?.onEvent(event);
+      limitEnforcer.onAgentEvent(event);
       faultController?.onEvent(event);
     };
     const unsubscribe = agent.subscribe(dispatch);
@@ -244,6 +273,12 @@ export class RunManager {
       status = "failed";
       error = err instanceof Error ? err.message : String(err);
     } finally {
+      // 阶段 9.8: a limit violation degrades the run to failed with the reason
+      // attached, even when the model itself finished cleanly afterwards.
+      if (limitViolation) {
+        status = "failed";
+        error = `run stopped by limit (${limitViolation.kind}): ${limitViolation.reason}`;
+      }
       record.status = status;
       if (error !== undefined) record.error = error;
       record.finishedAt = new Date().toISOString();

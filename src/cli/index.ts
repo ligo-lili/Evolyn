@@ -15,7 +15,8 @@ import { RunManager } from "../runtime/run-manager.js";
 import type { ApprovalMode } from "../runtime/approval.js";
 import type { TraceEvent } from "../trace/schema.js";
 import { distillRunById } from "../memory/distiller.js";
-import { ExperienceRepo } from "../memory/store.js";
+import { MemoryStore } from "../memory/store.js";
+import { MemorySearchIndex } from "../memory/search.js";
 
 interface ParsedArgs {
   command: string;
@@ -57,9 +58,11 @@ const HELP = `agent-harness — durable execution harness on top of Pi Agent Run
 Usage:
   agent-harness run "<task>" [--model provider/model-id]
   agent-harness resume [runId]           recover an interrupted run (default: latest)
-  agent-harness experience search <query> [--limit <n>]   search stored experience
-  agent-harness experience list          show recent experience records
-  agent-harness experience distill <runId>                distill a run manually
+  agent-harness memory core              show/create the always-resident Core Memory file
+  agent-harness memory list              list Ordinary Memory files (authoritative markdown)
+  agent-harness memory search <query> [--limit <n>]       search memory (FTS5)
+  agent-harness memory rebuild           rebuild the search index from the .md files
+  agent-harness memory distill <runId>   distill a run manually
   agent-harness models [provider]          list providers, or a provider's models
   agent-harness trace list                 list recorded runs
   agent-harness trace show <runId> [--all] render a run's execution timeline
@@ -106,55 +109,88 @@ async function main(): Promise<number> {
     return 0;
   }
 
-  if (command === "experience") {
+  if (command === "memory") {
     const sub = positional[0];
-    const db = openDatabase(defaultDbPath());
-    try {
-      const repo = new ExperienceRepo(db);
-      if (sub === "search") {
-        const query = positional.slice(1).join(" ").trim();
-        if (!query) {
-          console.error("usage: agent-harness experience search <query> [--limit <n>]");
-          return 2;
+    const dbPath = defaultDbPath();
+    const store = new MemoryStore(path.join(path.dirname(dbPath), "memory"));
+    if (sub === "core") {
+      const existing = store.readCore();
+      if (existing !== undefined && flags.edit !== true) {
+        console.log(existing);
+      } else {
+        if (existing === undefined) {
+          store.writeCore("# Core Memory\n\n<项目级事实、用户偏好、长期约束。每轮 run 都会注入 system prompt。>\n");
+          console.log(`created ${store.corePath} — edit it freely; it is injected into every run.`);
+        } else {
+          console.log(`core memory file: ${store.corePath}`);
         }
+      }
+      return 0;
+    }
+    if (sub === "list") {
+      const records = store.list();
+      if (records.length === 0) {
+        console.log("(no memory yet — runs are distilled automatically unless --no-distill)");
+        return 0;
+      }
+      for (const m of records) {
+        console.log(`[${m.taskType}] ${m.outcome} ×${m.confirmations} — ${m.summaryZh}`);
+        console.log(`    ${path.relative(process.cwd(), store.pathOf(m.id))}`);
+      }
+      return 0;
+    }
+    if (sub === "search") {
+      const query = positional.slice(1).join(" ").trim();
+      if (!query) {
+        console.error("usage: agent-harness memory search <query> [--limit <n>]");
+        return 2;
+      }
+      const db = openDatabase(dbPath);
+      try {
         const limit = typeof flags.limit === "string" ? Number(flags.limit) : 3;
-        const hits = repo.search(query, Number.isFinite(limit) && limit > 0 ? limit : 3);
+        const hits = new MemorySearchIndex(db).searchFts(query, Number.isFinite(limit) && limit > 0 ? limit : 3);
         if (hits.length === 0) {
-          console.log("(no matching experience yet)");
+          console.log("(no matching memory — try `memory rebuild` if you edited the .md files)");
           return 0;
         }
         hits.forEach((h, i) => {
-          console.log(`#${i + 1} [${h.taskType}] ${h.outcome} — ${h.summaryZh}`);
+          console.log(`#${i + 1} [${h.taskType}] ${h.outcome} ×${h.confirmations} — ${h.summaryZh}`);
           console.log(`    approach: ${h.approach}`);
           console.log(`    pitfalls: ${h.pitfalls}`);
-          console.log(`    run: ${h.runId}`);
+          console.log(`    file: ${path.relative(process.cwd(), store.pathOf(h.id))} (run ${h.runId})`);
         });
-        return 0;
+      } finally {
+        db.close();
       }
-      if (sub === "list") {
-        const items = repo.listRecent(20);
-        if (items.length === 0) {
-          console.log("(no experience stored yet — runs are distilled automatically unless --no-distill)");
-          return 0;
-        }
-        for (const e of items) console.log(`[${e.taskType}] ${e.outcome} — ${e.summaryZh}  (${e.createdAt.slice(0, 19)}, run ${e.runId})`);
-        return 0;
-      }
-      if (sub === "distill") {
-        const id = positional[1];
-        if (!id) {
-          console.error("usage: agent-harness experience distill <runId>");
-          return 2;
-        }
-        const record = await distillRunById(id);
-        console.log(`experience: stored (${record.taskType}, ${record.outcome}) — ${record.summaryZh}`);
-        return 0;
-      }
-      console.error("usage: agent-harness experience search <query> | experience list | experience distill <runId>");
-      return 2;
-    } finally {
-      db.close();
+      return 0;
     }
+    if (sub === "rebuild") {
+      const db = openDatabase(dbPath);
+      try {
+        const n = new MemorySearchIndex(db).rebuild(store);
+        console.log(`index rebuilt from ${n} memory file(s)`);
+      } finally {
+        db.close();
+      }
+      return 0;
+    }
+    if (sub === "distill") {
+      const id = positional[1];
+      if (!id) {
+        console.error("usage: agent-harness memory distill <runId>");
+        return 2;
+      }
+      const outcome = await distillRunById(id);
+      console.log(
+        outcome.merged
+          ? `memory: confirmed existing ${outcome.record.id} (×${outcome.record.confirmations})`
+          : `memory: created ${outcome.record.id} (${outcome.record.taskType}, ${outcome.record.outcome})`,
+      );
+      console.log(`    ${outcome.file}`);
+      return 0;
+    }
+    console.error("usage: agent-harness memory core | memory list | memory search <query> | memory rebuild | memory distill <runId>");
+    return 2;
   }
 
   if (command === "trace") {
@@ -263,10 +299,14 @@ async function main(): Promise<number> {
     if (record.error) console.error(`error: ${record.error}`);
     if (flags["no-distill"] !== true) {
       try {
-        const stored = await distillRunById(record.id);
-        console.log(`experience: stored (${stored.taskType}, ${stored.outcome}) — ${stored.summaryZh}`);
+        const outcome = await distillRunById(record.id);
+        console.log(
+          outcome.merged
+            ? `memory: confirmed existing ${outcome.record.id} (×${outcome.record.confirmations})`
+            : `memory: created (${outcome.record.taskType}, ${outcome.record.outcome}) — ${outcome.record.summaryZh}`,
+        );
       } catch (err) {
-        console.error(`experience: distill failed (${err instanceof Error ? err.message : err})`);
+        console.error(`memory: distill failed (${err instanceof Error ? err.message : err})`);
       }
     }
     manager.close();
@@ -319,13 +359,17 @@ async function main(): Promise<number> {
   if (result.tracePath) console.log(`trace: ${result.tracePath}`);
   if (record.error) console.error(`error: ${record.error}`);
   if (noDistill) {
-    console.log("experience: skipped (--no-distill)");
+    console.log("memory: skipped (--no-distill)");
   } else {
     try {
-      const stored = await distillRunById(record.id);
-      console.log(`experience: stored (${stored.taskType}, ${stored.outcome}) — ${stored.summaryZh}`);
+      const outcome = await distillRunById(record.id);
+      console.log(
+        outcome.merged
+          ? `memory: confirmed existing ${outcome.record.id} (×${outcome.record.confirmations})`
+          : `memory: created (${outcome.record.taskType}, ${outcome.record.outcome}) — ${outcome.record.summaryZh}`,
+      );
     } catch (err) {
-      console.error(`experience: distill failed (${err instanceof Error ? err.message : err})`);
+      console.error(`memory: distill failed (${err instanceof Error ? err.message : err})`);
     }
   }
   manager.close();

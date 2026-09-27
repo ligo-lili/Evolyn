@@ -13,8 +13,12 @@ import { TraceEventRepo } from "../storage/repos/trace-events.js";
 import { CheckpointRepo } from "../storage/repos/checkpoints.js";
 import { CheckpointWriter } from "../execution/checkpoint.js";
 import { loadCrashedRun, planRecovery, toolResultMessage } from "../execution/recovery.js";
+import { assembleSystemPrompt, renderExperienceBlock } from "../context/assembler.js";
 import { createContextTransformer } from "../context/compaction.js";
 import type { CompactionSettings } from "@earendil-works/pi-agent-core";
+import { MemorySearchIndex } from "../memory/search.js";
+import { MemoryStore } from "../memory/store.js";
+import { withEvidenceCapture } from "./tools/evidence.js";
 import { TraceRecorder, JsonlTraceSink, type TraceSink } from "../trace/recorder.js";
 import { applyFaultToTools, FaultController, formatFaultSpec, parseFaultSpec } from "../execution/fault.js";
 import { createApprovalHook, type ApprovalOptions } from "./approval.js";
@@ -66,8 +70,10 @@ export interface RunOptions {
   compaction?: {
     settings?: Partial<CompactionSettings>;
     /** Injectable summarizer for tests; default calls models.completeSimple. */
-    summaryFn?: (prefix: readonly AgentMessage[]) => Promise<string>;
+    summaryFn?: (prefix: readonly AgentMessage[], previousSummary?: string) => Promise<string>;
   };
+  /** Ordinary-memory retrieval for pointer injection. Default: 3 hits when an index exists. */
+  memory?: { limit?: number };
 }
 
 export interface ResumeOptions {
@@ -132,19 +138,38 @@ export class RunManager {
 
   async run(options: RunOptions): Promise<RunResult> {
     const faultSpec = parseFaultSpec(options.fault); // validates before anything is written
-    const systemPrompt = options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
+    const basePrompt = options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
     const record: RunRecord = {
       id: randomUUID(),
       task: options.task,
       modelSpec: `${options.model.provider}/${options.model.id}`,
       status: "running",
       startedAt: new Date().toISOString(),
-      systemPrompt,
     };
     this.runs.set(record.id, record);
 
     const database = this.ensureDatabase(options.database);
     const runRepo = database ? new RunRepo(database) : undefined;
+
+    // 阶段 9.5 memory injection: Core Memory is always resident; Ordinary
+    // Memory enters as pointers (model reads the full file on demand).
+    const memoryStore = new MemoryStore(path.join(harnessDataDir(process.cwd()), "memory"));
+    const core = memoryStore.readCore();
+    let experienceBlock: string | undefined;
+    if (database) {
+      const hits = new MemorySearchIndex(database).searchFts(options.task, options.memory?.limit ?? 3);
+      if (hits.length > 0) {
+        experienceBlock = renderExperienceBlock(
+          hits.map((h) => ({ summaryZh: h.summaryZh, path: path.relative(process.cwd(), memoryStore.pathOf(h.id)) })),
+        );
+      }
+    }
+    const systemPrompt = assembleSystemPrompt({
+      base: basePrompt,
+      core: core ? `<core_memory>\n${core}\n</core_memory>` : undefined,
+      experiences: experienceBlock,
+    });
+    record.systemPrompt = systemPrompt;
     runRepo?.insert(record);
 
     const traceEnabled = options.trace !== false;
@@ -160,7 +185,10 @@ export class RunManager {
       recorder.runStart(record.task, record.modelSpec, faultSpec ? formatFaultSpec(faultSpec) : undefined);
     }
 
-    const tools = applyFaultToTools(options.tools ?? DEMO_TOOLS, faultSpec);
+    const tools = withEvidenceCapture(
+      applyFaultToTools(options.tools ?? DEMO_TOOLS, faultSpec),
+      path.join(harnessDataDir(process.cwd()), "evidence", record.id),
+    );
     const approvalHook = options.approval ? createApprovalHook(options.approval, (event) => recorder?.record(event)) : undefined;
     const contextTransformer = createContextTransformer({
       contextWindow: options.model.contextWindow,
@@ -168,6 +196,7 @@ export class RunManager {
       settings: options.compaction?.settings,
       summaryFn: options.compaction?.summaryFn,
       onEvent: (event) => recorder?.record(event),
+      tidy: { evidenceBase: path.join(".harness", "evidence", record.id) },
     });
     const agent = createAgent({
       model: options.model,

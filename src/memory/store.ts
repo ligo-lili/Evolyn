@@ -1,102 +1,88 @@
-import type { DatabaseSync } from "node:sqlite";
-import { randomUUID } from "node:crypto";
-
-export interface ExperienceRecord {
-  id: string;
-  runId: string;
-  taskType: string;
-  summaryEn: string;
-  summaryZh: string;
-  approach: string;
-  pitfalls: string;
-  outcome: string;
-  keywordsEn: string;
-  model?: string;
-  createdAt: string;
-}
-
-type Row = Record<string, unknown>;
-
-function rowToExperience(r: Row): ExperienceRecord {
-  return {
-    id: String(r.id),
-    runId: String(r.run_id),
-    taskType: String(r.task_type),
-    summaryEn: String(r.summary_en),
-    summaryZh: String(r.summary_zh),
-    approach: String(r.approach),
-    pitfalls: String(r.pitfalls),
-    outcome: String(r.outcome),
-    keywordsEn: String(r.keywords_en),
-    model: r.model == null ? undefined : String(r.model),
-    createdAt: String(r.created_at),
-  };
-}
+import fs from "node:fs";
+import path from "node:path";
+import { HarnessError } from "../errors.js";
+import { parseMemory, serializeMemory, type MemoryRecord } from "./model.js";
 
 /**
- * Experience memory over SQLite + FTS5. Search queries run against the English
- * fields (default tokenizer); each hit ranks by bm25 and carries the Chinese
- * summary for display.
+ * Markdown-authoritative memory storage (阶段 9.5).
+ * Layout under the memory dir:
+ *   core.md               — Core Memory, always injected into the system prompt
+ *   ordinary/<id>.md      — Ordinary Memory, one experience per file
+ * Every derived index (FTS5, later vectors) can be rebuilt from these files.
  */
-export class ExperienceRepo {
-  constructor(private readonly db: DatabaseSync) {}
+export class MemoryStore {
+  constructor(readonly dir: string) {}
 
-  insert(record: ExperienceRecord): void {
-    this.db
-      .prepare(
-        "INSERT INTO experiences (id, run_id, task_type, summary_en, summary_zh, approach, pitfalls, outcome, keywords_en, model, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      )
-      .run(
-        record.id,
-        record.runId,
-        record.taskType,
-        record.summaryEn,
-        record.summaryZh,
-        record.approach,
-        record.pitfalls,
-        record.outcome,
-        record.keywordsEn,
-        record.model ?? null,
-        record.createdAt,
-      );
-    this.db
-      .prepare("INSERT INTO experiences_fts (exp_id, summary_en, approach, pitfalls, keywords_en) VALUES (?, ?, ?, ?, ?)")
-      .run(record.id, record.summaryEn, record.approach, record.pitfalls, record.keywordsEn);
+  get corePath(): string {
+    return path.join(this.dir, "core.md");
   }
 
-  /** FTS5 MATCH with quoted terms; empty queries return nothing rather than everything. */
-  search(query: string, limit = 3): ExperienceRecord[] {
-    const terms = query
-      .trim()
-      .split(/\s+/)
-      .filter(Boolean)
-      .map((t) => `"${t.replace(/"/g, "")}"`);
-    if (terms.length === 0) return [];
-    const rows = this.db
-      .prepare(
-        `SELECT e.* FROM experiences_fts f JOIN experiences e ON e.id = f.exp_id
-         WHERE experiences_fts MATCH ? ORDER BY bm25(experiences_fts) LIMIT ?`,
-      )
-      .all(terms.join(" "), limit) as Row[];
-    return rows.map(rowToExperience);
+  get ordinaryDir(): string {
+    return path.join(this.dir, "ordinary");
   }
 
-  get(id: string): ExperienceRecord | undefined {
-    const row = this.db.prepare("SELECT * FROM experiences WHERE id = ?").get(id) as Row | undefined;
-    return row ? rowToExperience(row) : undefined;
+  /** Core Memory body (frontmatter stripped), or undefined when absent. */
+  readCore(): string | undefined {
+    try {
+      const raw = fs.readFileSync(this.corePath, "utf8");
+      if (raw.startsWith("---")) {
+        const end = raw.indexOf("\n---", 3);
+        return end === -1 ? raw : raw.slice(raw.indexOf("\n", end + 1) + 1).trim();
+      }
+      return raw.trim();
+    } catch {
+      return undefined;
+    }
   }
 
-  listRecent(limit = 20): ExperienceRecord[] {
-    const rows = this.db.prepare("SELECT * FROM experiences ORDER BY created_at DESC LIMIT ?").all(limit) as Row[];
-    return rows.map(rowToExperience);
+  writeCore(body: string): void {
+    fs.mkdirSync(this.dir, { recursive: true });
+    fs.writeFileSync(this.corePath, body.trim() + "\n", "utf8");
   }
 
-  count(): number {
-    const row = this.db.prepare("SELECT COUNT(*) AS n FROM experiences").get() as Row;
-    return Number(row.n);
+  pathOf(id: string): string {
+    return path.join(this.ordinaryDir, `${id}.md`);
   }
-}
 
-export function newExperienceId(): string {
-  return randomUUID();
+  save(record: MemoryRecord): string {
+    fs.mkdirSync(this.ordinaryDir, { recursive: true });
+    const file = this.pathOf(record.id);
+    fs.writeFileSync(file, serializeMemory(record), "utf8");
+    return file;
+  }
+
+  get(id: string): MemoryRecord | undefined {
+    try {
+      return parseMemory(fs.readFileSync(this.pathOf(id), "utf8"), this.pathOf(id));
+    } catch {
+      return undefined;
+    }
+  }
+
+  list(): MemoryRecord[] {
+    let files: string[];
+    try {
+      files = fs.readdirSync(this.ordinaryDir).filter((f) => f.endsWith(".md"));
+    } catch {
+      return [];
+    }
+    const records: MemoryRecord[] = [];
+    for (const f of files) {
+      const file = path.join(this.ordinaryDir, f);
+      try {
+        records.push(parseMemory(fs.readFileSync(file, "utf8"), file));
+      } catch (err) {
+        process.stderr.write(`[memory] skipping unreadable ${file}: ${err instanceof Error ? err.message : err}\n`);
+      }
+    }
+    return records.sort((a, b) => b.updated.localeCompare(a.updated));
+  }
+
+  /** Absolute path for an id, refusing to escape the memory dir (defense in depth for pointer injection). */
+  safePath(id: string): string {
+    const file = this.pathOf(id);
+    const rel = path.relative(this.ordinaryDir, file);
+    if (rel.startsWith("..") || path.isAbsolute(rel)) throw new HarnessError(`invalid memory id: ${id}`);
+    return file;
+  }
 }

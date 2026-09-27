@@ -62,6 +62,8 @@ export const MIGRATIONS: Migration[] = [
   {
     // Experience memory (阶段 9). English fields feed the FTS5 index (default
     // tokenizer); summary_zh is the display-facing rendering (bilingual policy).
+    // Since 阶段 9.5 these tables are a DERIVED, rebuildable index of the
+    // authoritative Markdown files under .harness/memory/.
     id: 3,
     name: "experience-memory",
     sql: `
@@ -85,6 +87,17 @@ export const MIGRATIONS: Migration[] = [
         pitfalls,
         keywords_en
       );
+    `,
+  },
+  {
+    // Memory v2 (阶段 9.5): SQLite rows are a DERIVED, rebuildable index of the
+    // authoritative Markdown files under .harness/memory/. `memory rebuild`
+    // repopulates everything from the .md files.
+    id: 4,
+    name: "memory-index-v2",
+    sql: `
+      ALTER TABLE experiences ADD COLUMN confirmations INTEGER DEFAULT 0;
+      ALTER TABLE experiences ADD COLUMN updated TEXT;
     `,
   },
 ];

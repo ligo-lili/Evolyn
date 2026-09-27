@@ -7,6 +7,7 @@ export { ConsoleReporter, CollectingReporter, type RunReporter } from "./runtime
 export { createApprovalHook, DEFAULT_APPROVAL_POLICY, type ApprovalMode, type ApprovalOptions, type ApprovalPolicy } from "./runtime/approval.js";
 export { applyFaultToTools, FaultController, formatFaultSpec, parseFaultSpec, type FaultPoint, type FaultSpec } from "./execution/fault.js";
 export { CheckpointWriter, type CheckpointState, type ToolCallState, type TrackedToolCall } from "./execution/checkpoint.js";
+export { withEvidenceCapture } from "./runtime/tools/evidence.js";
 export {
   assembleSystemPrompt,
   renderExperienceBlock,
@@ -24,10 +25,13 @@ export {
   parseExperienceDraft,
   type CompleteFn,
   type DistillOptions,
+  type DistillOutcome,
   type ExperienceDraft,
   type RunDigest,
 } from "./memory/distiller.js";
-export { ExperienceRepo, newExperienceId, type ExperienceRecord } from "./memory/store.js";
+export { MemoryStore } from "./memory/store.js";
+export { MemorySearchIndex } from "./memory/search.js";
+export { parseMemory, serializeMemory, type MemoryRecord } from "./memory/model.js";
 export {
   loadCrashedRun,
   planRecovery,

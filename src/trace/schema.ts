@@ -29,7 +29,7 @@ export type RunLifecycleEvent =
 export type HarnessAuditEvent =
   | { type: "approval"; toolName: string; decision: "allow" | "deny"; reason?: string }
   | { type: "recovery_action"; toolCallId: string; toolName: string; action: "reexecute" | "rebuild_result" | "synthesize_error"; error?: string }
-  | { type: "compaction"; trigger: "threshold"; tokensBefore: number; summaryChars: number; cutIndex: number };
+  | { type: "compaction"; trigger: "threshold" | "rolling"; tokensBefore: number; summaryChars: number; cutIndex: number };
 
 export type TraceEventPayload = AgentEvent | RunLifecycleEvent | HarnessAuditEvent;
 

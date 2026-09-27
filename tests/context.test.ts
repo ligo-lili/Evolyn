@@ -79,12 +79,12 @@ describe("context compaction (阶段 8)", () => {
     const compacted = capturedContexts.filter((c) => JSON.stringify(c).includes("<context-summary>"));
     expect(compacted.length).toBeGreaterThanOrEqual(1);
 
-    // the audit event landed in the trace
+    // audit events landed in the trace: threshold first, rolling when the tail regrew
     const trace = readTraceFile(result.tracePath as string);
     const compactions = trace.events.filter((e) => e.type === "compaction");
-    expect(compactions).toHaveLength(1);
+    expect(compactions.length).toBeGreaterThanOrEqual(1);
     expect(compactions[0]).toMatchObject({ trigger: "threshold" });
-    expect(compactions[0] && typeof (compactions[0] as { tokensBefore: number }).tokensBefore === "number").toBe(true);
+    expect(typeof (compactions[0] as { tokensBefore: number }).tokensBefore === "number").toBe(true);
     tmp.leave();
   });
 
@@ -96,6 +96,65 @@ describe("context compaction (阶段 8)", () => {
     });
     const messages = [{ role: "user", content: "hello", timestamp: Date.now() }] as never[];
     await expect(transformer(messages)).resolves.toBe(messages);
+  });
+
+  it("rolls the summary when the tail outgrows the budget again (阶段 9.5)", async () => {
+    const events: Array<{ trigger?: string }> = [];
+    const summaryCalls: Array<{ len: number; previous?: string }> = [];
+    const transformer = createContextTransformer({
+      contextWindow: 300,
+      model: FAKE_MODEL,
+      settings: { reserveTokens: 60, keepRecentTokens: 40 },
+      summaryFn: async (prefix, previous) => {
+        summaryCalls.push({ len: prefix.length, previous });
+        return previous ? `ROLLED: ${previous}` : "FIRST SUMMARY";
+      },
+      onEvent: (e) => events.push(e as { trigger?: string }),
+    });
+
+    const big = "y".repeat(800);
+    const m = (role: string, content: unknown) => ({ role, content, timestamp: Date.now() }) as never as import("@earendil-works/pi-agent-core").AgentMessage;
+    const msgs1 = [
+      m("system", "sys"),
+      m("user", "task"),
+      m("assistant", [{ type: "toolCall", id: "c1", name: "write_file", arguments: { path: "a", content: big } }]),
+      m("toolResult", [{ type: "text", text: big }]),
+      m("assistant", [{ type: "text", text: "step1 done" }]),
+    ];
+    const out1 = await transformer(msgs1);
+    expect(JSON.stringify(out1)).toContain("FIRST SUMMARY");
+
+    const msgs2 = [
+      ...msgs1,
+      m("user", "next step"),
+      m("assistant", [{ type: "text", text: big }]),
+      m("toolResult", [{ type: "text", text: big }]),
+    ];
+    const out2 = await transformer(msgs2);
+    expect(JSON.stringify(out2)).toContain("ROLLED:");
+    expect(summaryCalls[1]?.previous).toBe("FIRST SUMMARY"); // fold the previous summary in
+    expect(events.map((e) => (e.type === "compaction" ? e.trigger : undefined))).toEqual(["threshold", "rolling"]);
+  });
+
+  it("tidy condenses old tool results but keeps the current turn verbatim", async () => {
+    const { tidyToolResults } = await import("../src/context/compaction.js");
+    const big = "z".repeat(800);
+    const m = (role: string, content: unknown) => ({ role, content, timestamp: Date.now() }) as never as import("@earendil-works/pi-agent-core").AgentMessage;
+    const messages = [
+      m("system", "sys"),
+      m("user", "turn1"),
+      m("assistant", [{ type: "text", text: "x" }]),
+      { role: "toolResult", toolCallId: "old", toolName: "exec", content: [{ type: "text", text: big }], isError: false, timestamp: 1 } as never as import("@earendil-works/pi-agent-core").AgentMessage,
+      m("user", "turn2"),
+      { role: "toolResult", toolCallId: "new", toolName: "exec", content: [{ type: "text", text: big }], isError: false, timestamp: 2 } as never as import("@earendil-works/pi-agent-core").AgentMessage,
+    ];
+    const tidied = tidyToolResults(messages, { keepChars: 100, evidenceBase: ".harness/evidence/run-1" });
+    const oldText = JSON.stringify(tidied[3]);
+    const newText = JSON.stringify(tidied[5]);
+    expect(oldText).toContain("(truncated; full output:");
+    expect(oldText).toContain("run-1/old.md");
+    expect(oldText.length).toBeLessThan(JSON.stringify(messages[3]).length);
+    expect(newText).toContain(big); // current turn untouched
   });
 });
 

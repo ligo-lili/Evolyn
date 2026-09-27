@@ -35,6 +35,7 @@ const QWEN_MODELS: Model<"openai-completions">[] = [
   qwenModel("qwen-plus", 131_072, 8_192),
   qwenModel("qwen-turbo", 131_072, 8_192),
   qwenModel("qwen3-max", 131_072, 8_192),
+  qwenModel("qwen3.7-plus", 131_072, 8_192),
 ];
 
 function qwenProvider(): Provider<"openai-completions"> {

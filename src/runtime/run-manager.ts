@@ -13,7 +13,8 @@ import { TraceEventRepo } from "../storage/repos/trace-events.js";
 import { CheckpointRepo } from "../storage/repos/checkpoints.js";
 import { CheckpointWriter } from "../execution/checkpoint.js";
 import { loadCrashedRun, planRecovery, toolResultMessage } from "../execution/recovery.js";
-import { assembleSystemPrompt, renderExperienceBlock } from "../context/assembler.js";
+import { assembleSystemPrompt, renderExperienceBlock, renderSkillBlock } from "../context/assembler.js";
+import { SkillIndex, toAssemblerEntries } from "../skills/retrieve.js";
 import { createContextTransformer } from "../context/compaction.js";
 import type { CompactionSettings } from "@earendil-works/pi-agent-core";
 import { DEFAULT_RUN_LIMITS, LimitEnforcer, type LimitViolation, type RunLimits } from "./limits.js";
@@ -32,6 +33,15 @@ import { ConsoleReporter, type RunReporter } from "./reporter.js";
 import { DEMO_TOOLS, type AnyAgentTool } from "./tools/index.js";
 
 export type RunStatus = "running" | "completed" | "failed";
+
+/** 阶段 10 skill injection: FTS top-k by default, forced names via `only`. */
+export interface SkillInjection {
+  limit?: number;
+  /** Force specific skill names (eval A/B, demos); bypasses retrieval ranking. */
+  only?: readonly string[];
+}
+
+const DEFAULT_SKILL_LIMIT = 2;
 
 export interface RunRecord {
   id: string;
@@ -78,6 +88,12 @@ export interface RunOptions {
   };
   /** Ordinary-memory retrieval for pointer injection. Default: 3 hits when an index exists. */
   memory?: { limit?: number };
+  /**
+   * 阶段 10 skill injection for <available_skills>. Default: FTS top-2 from
+   * the promoted skill index when a database is attached; `false` disables
+   * (eval baseline arm).
+   */
+  skills?: SkillInjection | false;
   /** Runaway guards (turns/tool calls/repeats/cost). Defaults are always enforced. */
   limits?: RunLimits;
   /** Tiered retry policy for idempotent tools (transient errors only). */
@@ -172,9 +188,19 @@ export class RunManager {
         );
       }
     }
+    // 阶段 10 skill injection: promoted skills enter as <available_skills> —
+    // the model reads the SKILL.md body on demand, mirroring pi's mechanism.
+    let skillBlock: string | undefined;
+    if (database && options.skills !== false) {
+      const index = new SkillIndex(database);
+      const only = options.skills?.only;
+      const hits = only?.length ? index.getByName(only) : index.search(options.task, options.skills?.limit ?? DEFAULT_SKILL_LIMIT);
+      if (hits.length > 0) skillBlock = renderSkillBlock(toAssemblerEntries(hits, process.cwd()));
+    }
     const systemPrompt = assembleSystemPrompt({
       base: basePrompt,
       core: core ? `<core_memory>\n${core}\n</core_memory>` : undefined,
+      skills: skillBlock,
       experiences: experienceBlock,
     });
     record.systemPrompt = systemPrompt;

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import fs from "node:fs";
 import path from "node:path";
 import { HarnessError } from "../errors.js";
 import { defaultModelSpec } from "../config.js";
@@ -19,6 +20,14 @@ import { distillRunById } from "../memory/distiller.js";
 import { MemoryStore } from "../memory/store.js";
 import { MemorySearchIndex } from "../memory/search.js";
 import { localEmbedder } from "../memory/embedding.js";
+import { minePatternsFromDb } from "../learning/miner.js";
+import { draftSkillFromPattern } from "../learning/candidate.js";
+import { defaultEvalRunner, loadTaskSet, renderEvalReport, runEvalComparison } from "../learning/eval.js";
+import { promoteCandidate } from "../skills/promote.js";
+import { SkillIndex, toAssemblerEntries } from "../skills/retrieve.js";
+import { PatternRepo } from "../storage/repos/patterns.js";
+import { SkillCandidateRepo } from "../storage/repos/candidates.js";
+import { promotedSkillsDir, skillsDir } from "../runtime/paths.js";
 
 interface ParsedArgs {
   command: string;
@@ -67,6 +76,20 @@ Usage:
   agent-harness memory search <query> [--limit <n>] [--hybrid]   FTS5, or FTS+embeddings fused (RRF)
   agent-harness memory rebuild [--vector]      rebuild indexes from the .md files (--vector embeds)
   agent-harness memory distill <runId>   distill a run manually
+  agent-harness skill mine [--min-support <n>]
+                                           mine tool-sequence / error-repair patterns from finished runs
+  agent-harness skill patterns             list mined patterns
+  agent-harness skill draft <patternId> [--model <spec>]
+                                           distill a draft SKILL.md from a pattern (hard rule: support>=3)
+  agent-harness skill candidates           list skill candidates
+  agent-harness skill show <candidateId>   print a candidate's SKILL.md
+  agent-harness skill promote <candidateId> [--force]
+                                           promote a candidate to .harness/skills/promoted/<name>/SKILL.md
+  agent-harness skill list                 list promoted skills
+  agent-harness skill retrieve "<task>"    preview which skills a run would inject
+  agent-harness skill rebuild              rebuild the skill index from the promoted SKILL.md files
+  agent-harness skill eval <taskset.json> --skill <name> [--model <spec>]
+                                           scripted A/B: no-skill baseline vs skill-injected
   agent-harness models [provider]          list providers, or a provider's models
   agent-harness trace list                 list recorded runs
   agent-harness trace show <runId> [--all] render a run's execution timeline
@@ -202,6 +225,214 @@ async function main(): Promise<number> {
       return 0;
     }
     console.error("usage: agent-harness memory core | memory list | memory search <query> | memory rebuild | memory distill <runId>");
+    return 2;
+  }
+
+  if (command === "skill") {
+    const sub = positional[0];
+    const dbPath = defaultDbPath();
+
+    if (sub === "mine") {
+      const db = openDatabase(dbPath);
+      try {
+        const minSupport = typeof flags["min-support"] === "string" ? Number(flags["min-support"]) : undefined;
+        if (minSupport !== undefined && (!Number.isFinite(minSupport) || minSupport < 3)) {
+          console.error("--min-support is floored at 3: single-run patterns are not minable");
+          return 2;
+        }
+        const drafts = minePatternsFromDb(db, minSupport !== undefined ? { minSupport } : {});
+        const count = new PatternRepo(db).replaceAll(drafts);
+        console.log(`mined ${count} pattern(s) with support >= ${minSupport ?? 3} from finished runs`);
+        for (const p of new PatternRepo(db).list()) {
+          console.log(`[${p.kind}] ${p.signature} — support ${p.support} (${p.traceRefs.length} trace(s)) id=${p.id}`);
+        }
+        if (count === 0) console.log("(no pattern cleared the threshold — run a few similar tasks first)");
+      } finally {
+        db.close();
+      }
+      return 0;
+    }
+
+    if (sub === "patterns") {
+      const db = openDatabase(dbPath);
+      try {
+        const patterns = new PatternRepo(db).list();
+        if (patterns.length === 0) {
+          console.log("(no patterns — run `skill mine`)");
+          return 0;
+        }
+        for (const p of patterns) {
+          console.log(`[${p.kind}] ${p.signature} — support ${p.support} id=${p.id}`);
+          console.log(`    runs: ${p.traceRefs.join(", ")}`);
+        }
+      } finally {
+        db.close();
+      }
+      return 0;
+    }
+
+    if (sub === "draft") {
+      const patternId = positional[1];
+      if (!patternId) {
+        console.error("usage: agent-harness skill draft <patternId> [--model <spec>]");
+        return 2;
+      }
+      const outcome = await draftSkillFromPattern(patternId, {
+        modelSpec: typeof flags.model === "string" ? flags.model : undefined,
+        skillsRoot: skillsDir(),
+      });
+      console.log(
+        `candidate ${outcome.candidate.id} (${outcome.method === "llm" ? "LLM distillation" : "mechanical fallback"}) — support ${outcome.candidate.provenance.support}, pattern ${outcome.candidate.provenance.patternSignature}`,
+      );
+      console.log(`    ${outcome.file}`);
+      return 0;
+    }
+
+    if (sub === "candidates") {
+      const db = openDatabase(dbPath);
+      try {
+        const candidates = new SkillCandidateRepo(db).list();
+        if (candidates.length === 0) {
+          console.log("(no candidates — run `skill draft <patternId>`)");
+          return 0;
+        }
+        for (const c of candidates) {
+          console.log(`[${c.status}] ${c.name} — ${c.description.slice(0, 90)}`);
+          console.log(`    id=${c.id} pattern=${c.provenance.patternSignature} support=${c.provenance.support}`);
+          console.log(`    ${path.relative(process.cwd(), c.skillMdPath)}`);
+        }
+      } finally {
+        db.close();
+      }
+      return 0;
+    }
+
+    if (sub === "show") {
+      const id = positional[1];
+      if (!id) {
+        console.error("usage: agent-harness skill show <candidateId>");
+        return 2;
+      }
+      const db = openDatabase(dbPath);
+      let candidate;
+      try {
+        candidate = new SkillCandidateRepo(db).get(id);
+      } finally {
+        db.close();
+      }
+      if (!candidate) {
+        console.error(`candidate "${id}" not found`);
+        return 1;
+      }
+      console.log(fs.readFileSync(candidate.skillMdPath, "utf8"));
+      return 0;
+    }
+
+    if (sub === "promote") {
+      const id = positional[1];
+      if (!id) {
+        console.error("usage: agent-harness skill promote <candidateId> [--force]");
+        return 2;
+      }
+      const outcome = promoteCandidate(id, { skillsRoot: skillsDir(), force: flags.force === true });
+      console.log(
+        outcome.overwritten
+          ? `promoted "${outcome.skill.name}" v${outcome.skill.version} (overwrote previous version)`
+          : `promoted "${outcome.skill.name}" v${outcome.skill.version}`,
+      );
+      console.log(`    ${outcome.skillMdPath}`);
+      console.log("    future runs matching this skill will see it in <available_skills>");
+      return 0;
+    }
+
+    if (sub === "list") {
+      const db = openDatabase(dbPath);
+      let skills;
+      try {
+        skills = new SkillIndex(db).list();
+      } finally {
+        db.close();
+      }
+      if (skills.length === 0) {
+        console.log("(no promoted skills — `skill draft` + `skill promote` creates them)");
+        return 0;
+      }
+      for (const s of skills) {
+        console.log(`[v${s.version}] ${s.name} — ${s.description.slice(0, 100)}`);
+        console.log(`    ${path.relative(process.cwd(), path.join(s.dirPath, "SKILL.md"))}`);
+      }
+      return 0;
+    }
+
+    if (sub === "retrieve") {
+      const query = positional.slice(1).join(" ").trim();
+      if (!query) {
+        console.error('usage: agent-harness skill retrieve "<task>"');
+        return 2;
+      }
+      const db = openDatabase(dbPath);
+      try {
+        const hits = new SkillIndex(db).search(query, 2);
+        if (hits.length === 0) {
+          console.log("(no matching skill would be injected)");
+          return 0;
+        }
+        console.log("would inject into <available_skills>:");
+        for (const e of toAssemblerEntries(hits, process.cwd())) {
+          console.log(`  ${e.name} — ${e.description.slice(0, 90)}`);
+          console.log(`      ${e.location}`);
+        }
+      } finally {
+        db.close();
+      }
+      return 0;
+    }
+
+    if (sub === "rebuild") {
+      const db = openDatabase(dbPath);
+      try {
+        const n = new SkillIndex(db).rebuild(promotedSkillsDir());
+        console.log(`skill index rebuilt from ${n} promoted skill file(s)`);
+      } finally {
+        db.close();
+      }
+      return 0;
+    }
+
+    if (sub === "eval") {
+      const file = positional[1];
+      const skillName = typeof flags.skill === "string" ? flags.skill : undefined;
+      if (!file || !skillName) {
+        console.error("usage: agent-harness skill eval <taskset.json> --skill <name> [--model <spec>]");
+        return 2;
+      }
+      const db = openDatabase(dbPath);
+      let registered;
+      try {
+        registered = new SkillIndex(db).getByName([skillName])[0];
+      } finally {
+        db.close();
+      }
+      if (!registered) {
+        console.error(`no promoted skill named "${skillName}" (see: agent-harness skill list)`);
+        return 1;
+      }
+      const taskSet = loadTaskSet(file);
+      const spec = typeof flags.model === "string" ? flags.model : defaultModelSpec();
+      if (!spec) {
+        console.error("no model selected: pass --model provider/model-id or set HARNESS_MODEL");
+        return 2;
+      }
+      const runner = defaultEvalRunner(spec);
+      console.log(`running ${taskSet.tasks.length} task(s) × 2 arms (baseline / +skill "${skillName}")…`);
+      const report = await runEvalComparison(taskSet, { runner, skillName });
+      console.log(renderEvalReport(report));
+      return 0;
+    }
+
+    console.error(
+      "usage: agent-harness skill mine | patterns | draft <patternId> | candidates | show <id> | promote <id> | list | retrieve \"<task>\" | rebuild | eval <taskset.json> --skill <name>",
+    );
     return 2;
   }
 

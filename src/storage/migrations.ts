@@ -113,6 +113,55 @@ export const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    // 阶段 10 Skill 闭环 v1. patterns are a DERIVED projection of trace_events
+    // (`skill mine` recomputes them; ids are deterministic signatures so
+    // candidate provenance survives re-mining). skill_candidates and skills
+    // hold the draft→promoted pipeline; skills_fts is the retrieval index over
+    // promoted SKILL.md files (rebuildable via `skill rebuild`).
+    id: 6,
+    name: "skill-learning-v1",
+    sql: `
+      CREATE TABLE patterns (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK (kind IN ('tool-sequence', 'error-repair')),
+        signature TEXT NOT NULL,
+        support INTEGER NOT NULL,
+        trace_refs_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE UNIQUE INDEX idx_patterns_kind_sig ON patterns(kind, signature);
+
+      CREATE TABLE skill_candidates (
+        id TEXT PRIMARY KEY,
+        pattern_id TEXT NOT NULL REFERENCES patterns(id),
+        status TEXT NOT NULL CHECK (status IN ('draft', 'promoted', 'rejected')),
+        name TEXT NOT NULL,
+        description TEXT NOT NULL,
+        skill_md_path TEXT NOT NULL,
+        provenance_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX idx_candidates_pattern ON skill_candidates(pattern_id);
+
+      CREATE TABLE skills (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        version INTEGER NOT NULL DEFAULT 1,
+        dir_path TEXT NOT NULL,
+        source_candidate_id TEXT,
+        status TEXT NOT NULL DEFAULT 'active',
+        promoted_at TEXT NOT NULL
+      );
+
+      CREATE VIRTUAL TABLE skills_fts USING fts5(
+        skill_id UNINDEXED,
+        name,
+        description,
+        body
+      );
+    `,
+  },
 ];
 
 export function migrate(db: DatabaseSync): void {

@@ -22,3 +22,14 @@ export function harnessDataDir(root: string): string {
 export function tracesDir(root: string = process.cwd()): string {
   return path.join(harnessDataDir(root), "traces");
 }
+
+/** Root for skill drafts and promoted skills (阶段 10). */
+export function skillsDir(root: string = process.cwd()): string {
+  return path.join(harnessDataDir(root), "skills");
+}
+
+/** Promoted skills, one directory per skill containing SKILL.md — the layout
+ * a pi skill loader scans. */
+export function promotedSkillsDir(root: string = process.cwd()): string {
+  return path.join(skillsDir(root), "promoted");
+}

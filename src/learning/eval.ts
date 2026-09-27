@@ -185,7 +185,7 @@ export interface EvalResult extends EvalRawRun {
  * treatment arm was wiped out by OpenRouter's free-tier daily quota).
  * Vocabulary matches the retry.ts transient-error style.
  */
-const INFRA_ERROR_PATTERN = /\b429\b|rate.?limit|quota|insufficient credits|unauthorized|\b401\b|\b403\b|invalid api key/i;
+const INFRA_ERROR_PATTERN = /\b429\b|rate.?limit|quota|insufficient credits|unauthorized|\b401\b|\b403\b|invalid api key|provider is not configured|not configured/i;
 
 export function isInfraFailure(run: EvalRawRun): boolean {
   return run.status !== "completed" && run.error !== undefined && INFRA_ERROR_PATTERN.test(run.error);

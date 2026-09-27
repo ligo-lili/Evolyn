@@ -516,6 +516,15 @@ async function main(): Promise<number> {
       console.log(
         `baseline ${recorded.id} recorded: ${arm.results.filter((r) => r.pass).length}/${runs} pass (${Math.round(arm.passRate * 100)}%), verify-read-back ${arm.verifiedRuns}/${runs}, ~${runs ? Math.round(arm.totalTokens / runs) : 0} tok/run`,
       );
+      // Surface why runs failed — an all-infra baseline (0 tokens, instant
+      // deaths) should be self-explaining, not a mystery for the operator.
+      const failures = arm.results.filter((r) => !r.pass);
+      if (failures.length > 0) {
+        console.warn(`⚠ ${failures.length}/${runs} run(s) failed (infra: ${arm.infraFailures}) — first reason: ${failures[0]?.reason}`);
+        if (arm.infraFailures === failures.length && failures.length === runs) {
+          console.warn("  every run died to infrastructure — check the API key env var for this shell before trusting this baseline");
+        }
+      }
       console.log(`later evals can compare against it: skill eval <taskset.json> --skill <name> --against-baseline`);
       return 0;
     }

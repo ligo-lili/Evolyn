@@ -13,7 +13,7 @@ import { promoteCandidate } from "../src/skills/promote.js";
 import { SkillIndex } from "../src/skills/retrieve.js";
 import { parseSkillMd, serializeSkillMd, validateSkillName, SKILL_DESCRIPTION_MAX } from "../src/skills/format.js";
 import { EvalBaselineRepo, SkillEvalRepo, skillEvalRowFromReport } from "../src/storage/repos/evals.js";
-import { buildJudgePrompt, parseJudgeVerdictStrict, type JudgeFn } from "../src/learning/eval.js";
+import { buildJudgePrompt, isInfraFailure, parseJudgeVerdictStrict, type EvalRawRun, type JudgeFn } from "../src/learning/eval.js";
 import { RunManager, type SkillInjection } from "../src/runtime/run-manager.js";
 import { CollectingReporter } from "../src/runtime/reporter.js";
 import { assistantMessage, FAKE_MODEL, makeTempCwd, scriptedStreamFn } from "./helpers.js";
@@ -595,6 +595,36 @@ describe("LLM judge (deterministic first, judge second)", () => {
     expect(prompt).toContain("do x");
     expect(prompt).toContain("check y");
     expect(prompt).toContain("my answer");
+  });
+
+  it("marks infrastructure failures (rate limit/quota/auth) and invalidates the report", async () => {
+    tmp.enter();
+    const rateLimited: EvalRawRun = { taskId: "t", status: "failed", error: '429: {"message":"Rate limit exceeded: free-models-per-day"}' };
+    expect(isInfraFailure(rateLimited)).toBe(true);
+    expect(isInfraFailure({ taskId: "t", status: "failed", error: "ENOSPC: no space left" })).toBe(false);
+    expect(isInfraFailure({ taskId: "t", status: "completed" })).toBe(false);
+    const judged = judgeRun({ id: "t", task: "x" }, rateLimited);
+    expect(judged.pass).toBe(false);
+    expect(judged.infra).toBe(true);
+
+    // one infra failure in an arm → the report stays numerically computed but is INVALID for gating
+    let call = 0;
+    const flakyRunner: EvalRunner = async (task) => {
+      call++;
+      if (call === 1) return rateLimited;
+      return { taskId: task.id, status: "completed", tokens: 5 };
+    };
+    const report = await runEvalComparison({ name: "s", tasks: [{ id: "t1", task: "x" }, { id: "t2", task: "x" }] }, {
+      runner: flakyRunner,
+      skillName: "some-skill",
+    });
+    expect(report.valid).toBe(false);
+    expect(report.invalidReason).toContain("infrastructure");
+    expect(report.baseline.infraFailures).toBe(1);
+    const rendered = renderEvalReport(report);
+    expect(rendered).toContain("⚠ INVALID REPORT");
+    expect(rendered).toContain("INVALID — do not use for gating");
+    tmp.leave();
   });
 });
 

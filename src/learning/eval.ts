@@ -174,6 +174,21 @@ export interface EvalResult extends EvalRawRun {
   pass: boolean;
   /** Why it failed — undefined when pass. */
   reason?: string;
+  /** True when the run died to provider infrastructure (rate limit/quota/auth), not the task. */
+  infra?: boolean;
+}
+
+/**
+ * Provider-infrastructure failures are NOT task failures: a 429 or an auth
+ * error says nothing about the model's ability, and counting them as task
+ * failures corrupts the comparison (阶段 12 lesson — the first weak-model
+ * treatment arm was wiped out by OpenRouter's free-tier daily quota).
+ * Vocabulary matches the retry.ts transient-error style.
+ */
+const INFRA_ERROR_PATTERN = /\b429\b|rate.?limit|quota|insufficient credits|unauthorized|\b401\b|\b403\b|invalid api key/i;
+
+export function isInfraFailure(run: EvalRawRun): boolean {
+  return run.status !== "completed" && run.error !== undefined && INFRA_ERROR_PATTERN.test(run.error);
 }
 
 export type EvalRunner = (task: EvalTask, skills: SkillInjection | false) => Promise<EvalRawRun>;
@@ -183,7 +198,8 @@ export type EvalRunner = (task: EvalTask, skills: SkillInjection | false) => Pro
  * satisfies every stated check. No model opinion involved.
  */
 export function judgeRun(task: EvalTask, run: EvalRawRun, repeat = 1): EvalResult {
-  const fail = (reason: string): EvalResult => ({ ...run, repeat, pass: false, reason });
+  const infra = isInfraFailure(run);
+  const fail = (reason: string): EvalResult => ({ ...run, repeat, pass: false, reason, ...(infra ? { infra: true } : {}) });
   if (run.status !== "completed") {
     return fail(`run ${run.status}${run.error ? `: ${run.error}` : ""}`);
   }
@@ -252,6 +268,8 @@ export interface EvalArmResult {
   passRate: number;
   /** Runs that read back a written file — the skill-adoption process metric. */
   verifiedRuns: number;
+  /** Runs that died to provider infrastructure (rate limit/quota/auth). */
+  infraFailures: number;
   totalTokens: number;
   totalDurationMs: number;
 }
@@ -271,6 +289,7 @@ function summarizeArm(arm: EvalArmResult["arm"], results: EvalResult[]): EvalArm
     taskSummaries: [...byTask.values()],
     passRate: results.length ? results.filter((r) => r.pass).length / results.length : 0,
     verifiedRuns: results.filter((r) => r.verified === true).length,
+    infraFailures: results.filter((r) => r.infra === true).length,
     totalTokens: results.reduce((sum, r) => sum + (r.tokens ?? 0), 0),
     totalDurationMs: results.reduce((sum, r) => sum + (r.durationMs ?? 0), 0),
   };
@@ -326,6 +345,9 @@ export interface EvalReport {
   baseline: EvalArmResult;
   treatment: EvalArmResult;
   verdict: EvalVerdict;
+  /** False when infrastructure failures (rate limit/quota/auth) contaminated an arm — the verdict must not gate anything. */
+  valid: boolean;
+  invalidReason?: string;
   decidedAt: string;
 }
 
@@ -338,6 +360,15 @@ export interface EvalRunOptions {
 
 function verdictOf(baseline: EvalArmResult, treatment: EvalArmResult): EvalVerdict {
   return treatment.passRate > baseline.passRate ? "candidate-wins" : treatment.passRate < baseline.passRate ? "baseline-wins" : "tie";
+}
+
+function validityOf(baseline: EvalArmResult, treatment: EvalArmResult): { valid: boolean; invalidReason?: string } {
+  const infra = baseline.infraFailures + treatment.infraFailures;
+  if (infra === 0) return { valid: true };
+  return {
+    valid: false,
+    invalidReason: `${infra} run(s) died to provider infrastructure (rate limit/quota/auth) — the comparison is not attributable to the task; re-run after the limit resets or on a paid tier`,
+  };
 }
 
 /** Full A/B: baseline (no skills) vs treatment (the named skill forced in), both fresh. */
@@ -353,6 +384,7 @@ export async function runEvalComparison(taskSet: EvalTaskSet, options: EvalRunOp
     baseline,
     treatment,
     verdict: verdictOf(baseline, treatment),
+    ...validityOf(baseline, treatment),
     decidedAt: new Date().toISOString(),
   };
 }
@@ -372,6 +404,7 @@ export async function runEvalAgainstBaseline(
     baseline: options.stored.arm,
     treatment,
     verdict: verdictOf(options.stored.arm, treatment),
+    ...validityOf(options.stored.arm, treatment),
     decidedAt: new Date().toISOString(),
   };
 }
@@ -382,12 +415,15 @@ export function renderEvalReport(report: EvalReport): string {
   const armLine = (arm: EvalArmResult, label: string) => {
     const avgTokens = runs ? Math.round(arm.totalTokens / runs) : 0;
     const avgSec = runs ? arm.totalDurationMs / runs / 1000 : 0;
+    const infra = arm.infraFailures > 0 ? `, ${arm.infraFailures} INFRA-FAILED` : "";
     return (
       `${label}: ${arm.results.filter((r) => r.pass).length}/${runs} pass (${pct(arm.passRate)}), ` +
-      `verify-read-back ${arm.verifiedRuns}/${runs}, ~${avgTokens} tok/run, ~${avgSec.toFixed(1)}s/run`
+      `verify-read-back ${arm.verifiedRuns}/${runs}, ~${avgTokens} tok/run, ~${avgSec.toFixed(1)}s/run${infra}`
     );
   };
+  const invalidPrefix = report.valid ? [] : [`  ⚠ INVALID REPORT: ${report.invalidReason}`];
   const lines = [
+    ...invalidPrefix,
     `eval "${report.taskSet}" — skill: ${report.skill} — ${report.baseline.results.length / Math.max(1, report.repeats)} task(s) × ${report.repeats} repeat(s) × 2 arms`,
     `  ${armLine(report.baseline, report.baselineSource === "stored" ? "no-skill baseline (stored)" : "no-skill baseline")}`,
     `  ${armLine(report.treatment, `with skill "${report.skill}"`)}`,
@@ -397,7 +433,7 @@ export function renderEvalReport(report: EvalReport): string {
       const failures = [...b.failures, ...(t?.failures ?? [])].slice(0, 4);
       return `    ${b.taskId}: ${b.passes}/${b.repeats} vs ${t?.passes ?? 0}/${t?.repeats ?? 0}${failures.length ? `\n      failures: ${failures.join(" | ")}` : ""}`;
     }),
-    `verdict: ${report.verdict}`,
+    `verdict: ${report.verdict}${report.valid ? "" : " (INVALID — do not use for gating)"}`,
   ];
   return lines.join("\n");
 }

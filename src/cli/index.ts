@@ -111,10 +111,11 @@ Usage:
                                            query a run's events in SQLite
   agent-harness help
 
-Model providers: openai, anthropic, deepseek (built into pi-ai) and qwen
-(DashScope compatible-mode, registered by this harness).
+Model providers: openai, anthropic, deepseek (built into pi-ai), qwen
+(DashScope compatible-mode) and openrouter (OpenAI-compatible; ids keep their
+slash, e.g. openrouter/qwen/qwen3.8-27b:free).
 API keys are read from the environment:
-  OPENAI_API_KEY  ANTHROPIC_API_KEY  DEEPSEEK_API_KEY  DASHSCOPE_API_KEY|QWEN_API_KEY
+  OPENAI_API_KEY  ANTHROPIC_API_KEY  DEEPSEEK_API_KEY  DASHSCOPE_API_KEY|QWEN_API_KEY  OPENROUTER_API_KEY
 Default model comes from HARNESS_MODEL. Traces land in .harness/traces/<runId>.jsonl.`;
 
 function isTracePath(id: string): boolean {
@@ -525,8 +526,9 @@ async function main(): Promise<number> {
       }
       for (const r of rows) {
         const pct = (v: number) => `${Math.round(v * 100)}%`;
+        const verdict = r.report.valid === false ? `${r.verdict} (INVALID)` : r.verdict;
         console.log(
-          `${r.decidedAt.slice(0, 19)} ${r.verdict.padEnd(14)} ${r.skillName} @ ${r.evalSet} (×${r.repeats}) — baseline ${pct(r.baselinePass)} vs skill ${pct(r.candidatePass)}`,
+          `${r.decidedAt.slice(0, 19)} ${verdict.padEnd(23)} ${r.skillName} @ ${r.evalSet} (×${r.repeats}) — baseline ${pct(r.baselinePass)} vs skill ${pct(r.candidatePass)}`,
         );
         console.log(
           `    tokens: baseline ~${r.cost.baseline.avgTokens}/run vs skill ~${r.cost.treatment.avgTokens}/run; duration: ~${r.cost.baseline.avgDurationMs}ms vs ~${r.cost.treatment.avgDurationMs}ms`,

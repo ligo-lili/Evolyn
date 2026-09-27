@@ -4,10 +4,11 @@ import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completio
 import { HarnessError } from "./errors.js";
 
 /**
- * Model registry: pi-ai built-ins (openai, anthropic, deepseek, ...) plus our
- * own "qwen" provider for DashScope's OpenAI-compatible endpoint. This is the
- * single place where harness-side provider wiring lives; everything downstream
- * only ever sees a resolved Model.
+ * Model registry: pi-ai built-ins (openai, anthropic, deepseek, and the full
+ * OpenRouter catalog — the weak-eval-model path reads OPENROUTER_API_KEY) plus
+ * our own "qwen" provider for DashScope's OpenAI-compatible endpoint. This is
+ * the single place where harness-side provider wiring lives; everything
+ * downstream only ever sees a resolved Model.
  */
 
 const DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1";

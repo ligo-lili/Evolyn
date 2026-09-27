@@ -162,6 +162,40 @@ export const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    // 阶段 11: eval framework formalization. skill_evals persists every A/B
+    // report (verdict included) so skill iterations can be compared over time;
+    // eval_baselines stores no-skill reference arms per (eval set, model) so a
+    // regression check can run against a recorded baseline instead of re-running it.
+    id: 7,
+    name: "eval-persistence",
+    sql: `
+      CREATE TABLE skill_evals (
+        id TEXT PRIMARY KEY,
+        skill_name TEXT NOT NULL,
+        source_candidate_id TEXT,
+        eval_set TEXT NOT NULL,
+        repeats INTEGER NOT NULL,
+        baseline_pass REAL NOT NULL,
+        candidate_pass REAL NOT NULL,
+        cost_json TEXT NOT NULL,
+        report_json TEXT NOT NULL,
+        verdict TEXT NOT NULL CHECK (verdict IN ('candidate-wins', 'baseline-wins', 'tie')),
+        decided_at TEXT NOT NULL
+      );
+      CREATE INDEX idx_skill_evals_set ON skill_evals(eval_set);
+
+      CREATE TABLE eval_baselines (
+        id TEXT PRIMARY KEY,
+        eval_set TEXT NOT NULL,
+        model_spec TEXT NOT NULL,
+        repeats INTEGER NOT NULL,
+        arm_json TEXT NOT NULL,
+        recorded_at TEXT NOT NULL
+      );
+      CREATE INDEX idx_eval_baselines_set_model ON eval_baselines(eval_set, model_spec);
+    `,
+  },
 ];
 
 export function migrate(db: DatabaseSync): void {

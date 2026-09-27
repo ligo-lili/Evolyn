@@ -22,7 +22,15 @@ import { MemorySearchIndex } from "../memory/search.js";
 import { localEmbedder } from "../memory/embedding.js";
 import { minePatternsFromDb } from "../learning/miner.js";
 import { draftSkillFromPattern } from "../learning/candidate.js";
-import { defaultEvalRunner, loadTaskSet, renderEvalReport, runEvalComparison } from "../learning/eval.js";
+import {
+  defaultEvalRunner,
+  loadTaskSet,
+  renderEvalReport,
+  runEvalAgainstBaseline,
+  runEvalArm,
+  runEvalComparison,
+} from "../learning/eval.js";
+import { EvalBaselineRepo, SkillEvalRepo, skillEvalRowFromReport } from "../storage/repos/evals.js";
 import { promoteCandidate } from "../skills/promote.js";
 import { SkillIndex, toAssemblerEntries } from "../skills/retrieve.js";
 import { PatternRepo } from "../storage/repos/patterns.js";
@@ -88,8 +96,11 @@ Usage:
   agent-harness skill list                 list promoted skills
   agent-harness skill retrieve "<task>"    preview which skills a run would inject
   agent-harness skill rebuild              rebuild the skill index from the promoted SKILL.md files
-  agent-harness skill eval <taskset.json> --skill <name> [--model <spec>]
-                                           scripted A/B: no-skill baseline vs skill-injected
+  agent-harness skill eval <taskset.json> --skill <name> [--model <spec>] [--repeats <n>] [--against-baseline]
+                                           scripted A/B: no-skill baseline vs skill-injected (report persisted)
+  agent-harness skill baseline <taskset.json> [--model <spec>] [--repeats <n>]
+                                           record the no-skill regression baseline for a task set + model
+  agent-harness skill evals [limit]        list persisted eval reports (the iteration ledger)
   agent-harness models [provider]          list providers, or a provider's models
   agent-harness trace list                 list recorded runs
   agent-harness trace show <runId> [--all] render a run's execution timeline
@@ -403,7 +414,7 @@ async function main(): Promise<number> {
       const file = positional[1];
       const skillName = typeof flags.skill === "string" ? flags.skill : undefined;
       if (!file || !skillName) {
-        console.error("usage: agent-harness skill eval <taskset.json> --skill <name> [--model <spec>]");
+        console.error("usage: agent-harness skill eval <taskset.json> --skill <name> [--model <spec>] [--repeats <n>] [--against-baseline]");
         return 2;
       }
       const db = openDatabase(dbPath);
@@ -423,17 +434,109 @@ async function main(): Promise<number> {
         console.error("no model selected: pass --model provider/model-id or set HARNESS_MODEL");
         return 2;
       }
-      const runner = defaultEvalRunner(spec);
       const repeatsFlag = typeof flags.repeats === "string" ? Number(flags.repeats) : 1;
       const repeats = Number.isFinite(repeatsFlag) && repeatsFlag >= 1 ? Math.floor(repeatsFlag) : 1;
-      console.log(`running ${taskSet.tasks.length} task(s) × ${repeats} repeat(s) × 2 arms (baseline / +skill "${skillName}")…`);
-      const report = await runEvalComparison(taskSet, { runner, skillName, repeats });
+      const runner = defaultEvalRunner(spec);
+      let report;
+      if (flags["against-baseline"] === true) {
+        const db2 = openDatabase(dbPath);
+        let stored;
+        try {
+          stored = new EvalBaselineRepo(db2).latest(taskSet.name, spec);
+        } finally {
+          db2.close();
+        }
+        if (!stored) {
+          console.error(`no recorded baseline for "${taskSet.name}" + ${spec} — run: agent-harness skill baseline ${file} --model ${spec}`);
+          return 1;
+        }
+        if (stored.repeats !== repeats) {
+          console.warn(`warning: stored baseline used repeats=${stored.repeats}, this run repeats=${repeats}`);
+        }
+        console.log(
+          `running ${taskSet.tasks.length} task(s) × ${repeats} repeat(s) — treatment arm only, against the stored baseline (${stored.recordedAt})…`,
+        );
+        report = await runEvalAgainstBaseline(taskSet, {
+          runner,
+          skillName,
+          repeats,
+          stored: { arm: stored.arm, repeats: stored.repeats },
+        });
+      } else {
+        console.log(`running ${taskSet.tasks.length} task(s) × ${repeats} repeat(s) × 2 arms (baseline / +skill "${skillName}")…`);
+        report = await runEvalComparison(taskSet, { runner, skillName, repeats });
+      }
+      // 阶段 11: every report enters the ledger for cross-iteration comparison.
+      const db3 = openDatabase(dbPath);
+      try {
+        new SkillEvalRepo(db3).insert(skillEvalRowFromReport(report, registered.sourceCandidateId));
+      } finally {
+        db3.close();
+      }
       console.log(renderEvalReport(report));
+      console.log("report persisted (see: agent-harness skill evals)");
+      return 0;
+    }
+
+    if (sub === "baseline") {
+      const file = positional[1];
+      if (!file) {
+        console.error("usage: agent-harness skill baseline <taskset.json> [--model <spec>] [--repeats <n>]");
+        return 2;
+      }
+      const spec = typeof flags.model === "string" ? flags.model : defaultModelSpec();
+      if (!spec) {
+        console.error("no model selected: pass --model provider/model-id or set HARNESS_MODEL");
+        return 2;
+      }
+      const repeatsFlag = typeof flags.repeats === "string" ? Number(flags.repeats) : 1;
+      const repeats = Number.isFinite(repeatsFlag) && repeatsFlag >= 1 ? Math.floor(repeatsFlag) : 1;
+      const taskSet = loadTaskSet(file);
+      const runner = defaultEvalRunner(spec);
+      console.log(`recording no-skill baseline: ${taskSet.tasks.length} task(s) × ${repeats} repeat(s) with ${spec}…`);
+      const arm = await runEvalArm(taskSet, runner, false, { repeats });
+      const db = openDatabase(dbPath);
+      let recorded;
+      try {
+        recorded = new EvalBaselineRepo(db).record({ evalSet: taskSet.name, modelSpec: spec, repeats, arm });
+      } finally {
+        db.close();
+      }
+      const runs = arm.results.length;
+      console.log(
+        `baseline ${recorded.id} recorded: ${arm.results.filter((r) => r.pass).length}/${runs} pass (${Math.round(arm.passRate * 100)}%), verify-read-back ${arm.verifiedRuns}/${runs}, ~${runs ? Math.round(arm.totalTokens / runs) : 0} tok/run`,
+      );
+      console.log(`later evals can compare against it: skill eval <taskset.json> --skill <name> --against-baseline`);
+      return 0;
+    }
+
+    if (sub === "evals") {
+      const limit = typeof flags.limit === "string" ? Number(flags.limit) : 10;
+      const db = openDatabase(dbPath);
+      let rows;
+      try {
+        rows = new SkillEvalRepo(db).list(Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 10);
+      } finally {
+        db.close();
+      }
+      if (rows.length === 0) {
+        console.log("(no persisted eval reports yet — `skill eval` / `skill baseline` records them)");
+        return 0;
+      }
+      for (const r of rows) {
+        const pct = (v: number) => `${Math.round(v * 100)}%`;
+        console.log(
+          `${r.decidedAt.slice(0, 19)} ${r.verdict.padEnd(14)} ${r.skillName} @ ${r.evalSet} (×${r.repeats}) — baseline ${pct(r.baselinePass)} vs skill ${pct(r.candidatePass)}`,
+        );
+        console.log(
+          `    tokens: baseline ~${r.cost.baseline.avgTokens}/run vs skill ~${r.cost.treatment.avgTokens}/run; duration: ~${r.cost.baseline.avgDurationMs}ms vs ~${r.cost.treatment.avgDurationMs}ms`,
+        );
+      }
       return 0;
     }
 
     console.error(
-      "usage: agent-harness skill mine | patterns | draft <patternId> | candidates | show <id> | promote <id> | list | retrieve \"<task>\" | rebuild | eval <taskset.json> --skill <name>",
+      "usage: agent-harness skill mine | patterns | draft <patternId> | candidates | show <id> | promote <id> | list | retrieve \"<task>\" | rebuild | eval <taskset.json> --skill <name> | baseline <taskset.json> | evals",
     );
     return 2;
   }

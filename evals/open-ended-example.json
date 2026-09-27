@@ -1,0 +1,11 @@
+{
+  "name": "open-ended-example",
+  "description": "Demonstrates the 阶段 11 LLM judge for tasks with no deterministic check: the task text and judgeInstructions are the whole contract. Deterministic checks still take precedence — none are set here, so the judge decides.",
+  "tasks": [
+    {
+      "id": "explain-compaction",
+      "task": "In your final response (no files needed), explain in 2-4 sentences what context compaction does in this harness and why the transcript stays append-only while the model sees a compressed view.",
+      "judgeInstructions": "Pass if the response (1) explains that compaction replaces what the MODEL sees with a summary when the context nears the window limit, (2) states that the transcript/trace is never rewritten (append-only), and (3) is at most 4 sentences. Fail otherwise with the missing point in the reason."
+    }
+  ]
+}

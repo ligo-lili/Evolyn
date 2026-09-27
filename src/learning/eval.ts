@@ -38,6 +38,13 @@ export interface EvalTask {
   /** Every non-empty line must match this JS regex. */
   expectLineRegex?: string;
   /**
+   * LLM-judge instructions for tasks whose quality has no deterministic
+   * check (阶段 11: deterministic judging first, judge second). When set, the
+   * judge decides pass/fail AFTER deterministic checks pass; a deterministic
+   * failure short-circuits without calling the judge.
+   */
+  judgeInstructions?: string;
+  /**
    * Fixture files rewritten before EVERY run of this task — update-style
    * tasks start from the same state in both arms and every repeat.
    */
@@ -78,6 +85,8 @@ export interface EvalRawRun {
   toolCalls?: number;
   /** True when the run read back a file it had written (verification behavior). */
   verified?: boolean;
+  /** Last non-empty assistant text — the LLM judge sees this. */
+  finalText?: string;
 }
 
 /**
@@ -100,6 +109,64 @@ export function readBackVerified(messages: readonly AgentMessage[]): boolean {
     }
   }
   return false;
+}
+
+// ---------- LLM judge (阶段 11: deterministic first, judge second) ----------
+
+export interface JudgeInput {
+  task: string;
+  judgeInstructions: string;
+  finalText?: string;
+  status: string;
+}
+
+export interface JudgeVerdict {
+  pass: boolean;
+  reason: string;
+}
+
+export type JudgeFn = (input: JudgeInput) => Promise<JudgeVerdict>;
+
+const JUDGE_SYSTEM_PROMPT =
+  "You are a strict eval judge for a coding agent. " +
+  "You see a task, extra judging instructions, and the agent's final response. " +
+  "Decide ONLY whether the response satisfies the task's stated requirements per the judging instructions — " +
+  "never reward unstated extra quality. Output ONLY strict JSON with keys pass (boolean) and reason (one sentence).";
+
+export function parseJudgeVerdictStrict(raw: string): JudgeVerdict {
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start === -1 || end <= start) throw new Error("no JSON object found in judge response");
+  const parsed = JSON.parse(raw.slice(start, end + 1)) as Record<string, unknown>;
+  if (typeof parsed.pass !== "boolean") throw new Error("judge verdict missing boolean \"pass\"");
+  return { pass: parsed.pass, reason: String(parsed.reason ?? "").trim() || (parsed.pass ? "passed" : "failed") };
+}
+
+export function buildJudgePrompt(input: JudgeInput): string {
+  return [
+    "Judge this coding-agent run:",
+    `task: ${input.task}`,
+    `judging instructions: ${input.judgeInstructions}`,
+    `run status: ${input.status}`,
+    `agent final response:\n${(input.finalText ?? "(no text response)").slice(0, 2_000)}`,
+  ].join("\n");
+}
+
+/** Real judge via the pi-ai registry (same cheap model tier as the distiller). */
+export function defaultJudge(modelSpec?: string): JudgeFn {
+  const spec = modelSpec ?? process.env.HARNESS_DISTILL_MODEL ?? "deepseek/deepseek-flash";
+  return async (input) => {
+    const { completeStructured, defaultChat } = await import("../llm/structured.js");
+    const { resolveModel } = await import("../providers.js");
+    const complete = defaultChat(resolveModel(spec), { systemPrompt: JUDGE_SYSTEM_PROMPT });
+    const { value } = await completeStructured({
+      prompt: buildJudgePrompt(input),
+      parse: parseJudgeVerdictStrict,
+      complete,
+      maxReprompts: 1,
+    });
+    return value;
+  };
 }
 
 export interface EvalResult extends EvalRawRun {
@@ -209,19 +276,39 @@ function summarizeArm(arm: EvalArmResult["arm"], results: EvalResult[]): EvalArm
   };
 }
 
+export interface EvalArmOptions {
+  repeats?: number;
+  /** LLM judge — consulted only when deterministic checks passed and the task sets judgeInstructions. */
+  judge?: JudgeFn;
+}
+
 /** Run one arm of the task set, `repeats` times over, resetting fixtures per run. */
 export async function runEvalArm(
   taskSet: EvalTaskSet,
   runner: EvalRunner,
   skills: SkillInjection | false,
-  repeats = 1,
+  opts: EvalArmOptions = {},
 ): Promise<EvalArmResult> {
+  const repeats = Math.max(1, opts.repeats ?? 1);
   const results: EvalResult[] = [];
   for (let repeat = 1; repeat <= repeats; repeat++) {
     for (const task of taskSet.tasks) {
       prepareTaskWorkspace(task);
       const raw = await runner(task, skills);
-      results.push(judgeRun(task, raw, repeat));
+      const judged = judgeRun(task, raw, repeat);
+      if (judged.pass && task.judgeInstructions && opts.judge) {
+        // 阶段 11 ordering: deterministic checks already passed; the judge now
+        // decides. A deterministic failure never reaches the judge.
+        const verdict = await opts.judge({
+          task: task.task,
+          judgeInstructions: task.judgeInstructions,
+          finalText: raw.finalText,
+          status: raw.status,
+        });
+        results.push({ ...judged, pass: verdict.pass, reason: verdict.pass ? undefined : verdict.reason });
+      } else {
+        results.push(judged);
+      }
     }
   }
   return summarizeArm(skills === false ? "baseline" : "treatment", results);
@@ -234,23 +321,59 @@ export interface EvalReport {
   /** The injected skill ("none" for a pure baseline run). */
   skill: string;
   repeats: number;
+  /** "fresh" = baseline arm re-run now; "stored" = recorded regression baseline. */
+  baselineSource: "fresh" | "stored";
   baseline: EvalArmResult;
   treatment: EvalArmResult;
   verdict: EvalVerdict;
   decidedAt: string;
 }
 
-/** Full A/B: baseline (no skills) vs treatment (the named skill forced in). */
-export async function runEvalComparison(
+export interface EvalRunOptions {
+  runner: EvalRunner;
+  skillName: string;
+  repeats?: number;
+  judge?: JudgeFn;
+}
+
+function verdictOf(baseline: EvalArmResult, treatment: EvalArmResult): EvalVerdict {
+  return treatment.passRate > baseline.passRate ? "candidate-wins" : treatment.passRate < baseline.passRate ? "baseline-wins" : "tie";
+}
+
+/** Full A/B: baseline (no skills) vs treatment (the named skill forced in), both fresh. */
+export async function runEvalComparison(taskSet: EvalTaskSet, options: EvalRunOptions): Promise<EvalReport> {
+  const repeats = Math.max(1, options.repeats ?? 1);
+  const baseline = await runEvalArm(taskSet, options.runner, false, { repeats, judge: options.judge });
+  const treatment = await runEvalArm(taskSet, options.runner, { only: [options.skillName] }, { repeats, judge: options.judge });
+  return {
+    taskSet: taskSet.name,
+    skill: options.skillName,
+    repeats,
+    baselineSource: "fresh",
+    baseline,
+    treatment,
+    verdict: verdictOf(baseline, treatment),
+    decidedAt: new Date().toISOString(),
+  };
+}
+
+/** 阶段 11 regression mode: treatment arm only, compared against a recorded baseline. */
+export async function runEvalAgainstBaseline(
   taskSet: EvalTaskSet,
-  options: { runner: EvalRunner; skillName: string; repeats?: number },
+  options: EvalRunOptions & { stored: { arm: EvalArmResult; repeats: number } },
 ): Promise<EvalReport> {
   const repeats = Math.max(1, options.repeats ?? 1);
-  const baseline = await runEvalArm(taskSet, options.runner, false, repeats);
-  const treatment = await runEvalArm(taskSet, options.runner, { only: [options.skillName] }, repeats);
-  const verdict: EvalVerdict =
-    treatment.passRate > baseline.passRate ? "candidate-wins" : treatment.passRate < baseline.passRate ? "baseline-wins" : "tie";
-  return { taskSet: taskSet.name, skill: options.skillName, repeats, baseline, treatment, verdict, decidedAt: new Date().toISOString() };
+  const treatment = await runEvalArm(taskSet, options.runner, { only: [options.skillName] }, { repeats, judge: options.judge });
+  return {
+    taskSet: taskSet.name,
+    skill: options.skillName,
+    repeats,
+    baselineSource: "stored",
+    baseline: options.stored.arm,
+    treatment,
+    verdict: verdictOf(options.stored.arm, treatment),
+    decidedAt: new Date().toISOString(),
+  };
 }
 
 export function renderEvalReport(report: EvalReport): string {
@@ -266,7 +389,7 @@ export function renderEvalReport(report: EvalReport): string {
   };
   const lines = [
     `eval "${report.taskSet}" — skill: ${report.skill} — ${report.baseline.results.length / Math.max(1, report.repeats)} task(s) × ${report.repeats} repeat(s) × 2 arms`,
-    `  ${armLine(report.baseline, "no-skill baseline")}`,
+    `  ${armLine(report.baseline, report.baselineSource === "stored" ? "no-skill baseline (stored)" : "no-skill baseline")}`,
     `  ${armLine(report.treatment, `with skill "${report.skill}"`)}`,
     "  per task (baseline vs skill):",
     ...report.baseline.taskSummaries.map((b) => {
@@ -281,6 +404,19 @@ export function renderEvalReport(report: EvalReport): string {
 
 export interface DefaultRunnerOptions {
   database?: string;
+}
+
+function lastAssistantText(messages: readonly AgentMessage[]): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m || m.role !== "assistant") continue;
+    const text = m.content
+      .filter((b): b is { type: "text"; text: string } => b.type === "text")
+      .map((b) => b.text)
+      .join("");
+    if (text.trim()) return text;
+  }
+  return undefined;
 }
 
 /**
@@ -312,6 +448,7 @@ export function defaultEvalRunner(modelSpec: string, options: DefaultRunnerOptio
         durationMs: Date.now() - started,
         toolCalls,
         verified: readBackVerified(result.messages),
+        finalText: lastAssistantText(result.messages),
       };
     } finally {
       manager.close();

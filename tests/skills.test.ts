@@ -8,10 +8,12 @@ import { PatternRepo } from "../src/storage/repos/patterns.js";
 import { SkillCandidateRepo } from "../src/storage/repos/candidates.js";
 import { extractRunToolTrace, minePatterns, MIN_PATTERN_SUPPORT, minePatternsFromDb, patternId } from "../src/learning/miner.js";
 import { draftSkillFromPattern } from "../src/learning/candidate.js";
-import { judgeRun, loadTaskSet, readBackVerified, renderEvalReport, runEvalArm, runEvalComparison, type EvalRunner } from "../src/learning/eval.js";
+import { judgeRun, loadTaskSet, readBackVerified, renderEvalReport, runEvalAgainstBaseline, runEvalArm, runEvalComparison, type EvalRunner } from "../src/learning/eval.js";
 import { promoteCandidate } from "../src/skills/promote.js";
 import { SkillIndex } from "../src/skills/retrieve.js";
 import { parseSkillMd, serializeSkillMd, validateSkillName, SKILL_DESCRIPTION_MAX } from "../src/skills/format.js";
+import { EvalBaselineRepo, SkillEvalRepo, skillEvalRowFromReport } from "../src/storage/repos/evals.js";
+import { buildJudgePrompt, parseJudgeVerdictStrict, type JudgeFn } from "../src/learning/eval.js";
 import { RunManager, type SkillInjection } from "../src/runtime/run-manager.js";
 import { CollectingReporter } from "../src/runtime/reporter.js";
 import { assistantMessage, FAKE_MODEL, makeTempCwd, scriptedStreamFn } from "./helpers.js";
@@ -387,7 +389,7 @@ describe("scripted A/B eval (阶段 10)", () => {
       fs.writeFileSync(path.join(tmp.dir, "pantry.txt"), "flour\nsugar\nsalt\npepper\n", "utf8");
       return { taskId: task.id, status: "completed" };
     };
-    const arm = await runEvalArm(taskSet, mutatingRunner, false, 2);
+    const arm = await runEvalArm(taskSet, mutatingRunner, false, { repeats: 2 });
     // both repeats saw the pristine fixture — the second did not inherit run 1's rewrite
     expect(seen).toEqual(["flour\nsugar\n", "flour\nsugar\n"]);
     expect(arm.taskSummaries).toEqual([{ taskId: "update", passes: 2, repeats: 2, failures: [] }]);
@@ -398,8 +400,7 @@ describe("scripted A/B eval (阶段 10)", () => {
       existedDuringPrepare = fs.existsSync(path.join(tmp.dir, "art.txt"));
       return { taskId: task.id, status: "completed" };
     };
-    await runEvalArm({ name: "s", tasks: [{ id: "a", task: "x", expectFile: "art.txt" }] }, probingRunner, false);
-    expect(existedDuringPrepare).toBe(false);
+    await runEvalArm({ name: "s", tasks: [{ id: "a", task: "x", expectFile: "art.txt" }] }, probingRunner, false);    expect(existedDuringPrepare).toBe(false);
     tmp.leave();
   });
 
@@ -522,5 +523,134 @@ describe("全链路：3 条相似 trace → pattern → candidate → promote �
     expect(result.record.status).toBe("completed");
     expect(result.record.systemPrompt).toContain("<available_skills>");
     expect(result.record.systemPrompt).toContain(SKILL_JSON.name);
+  });
+});
+
+// ---------- 阶段 11: LLM judge, persistence, regression baseline ----------
+
+describe("LLM judge (deterministic first, judge second)", () => {
+  it("judge verdict parses strictly", () => {
+    expect(parseJudgeVerdictStrict('{"pass": true, "reason": "ok"}')).toEqual({ pass: true, reason: "ok" });
+    expect(() => parseJudgeVerdictStrict("no json")).toThrow();
+    expect(() => parseJudgeVerdictStrict('{"reason": "no pass field"}')).toThrow();
+  });
+
+  it("deterministic failure short-circuits — the judge is never called", async () => {
+    tmp.enter();
+    let judgeCalls = 0;
+    const judge: JudgeFn = async () => {
+      judgeCalls++;
+      return { pass: false, reason: "judge says no" };
+    };
+    const arm = await runEvalArm(
+      { name: "s", tasks: [{ id: "t", task: "x", expectFile: "missing.txt", judgeInstructions: "be good" }] },
+      async (task) => ({ taskId: task.id, status: "completed" }),
+      false,
+      { judge },
+    );
+    expect(judgeCalls).toBe(0);
+    expect(arm.results[0]?.pass).toBe(false);
+    expect(arm.results[0]?.reason).toContain("missing");
+    tmp.leave();
+  });
+
+  it("judge decides when deterministic checks pass, and is skipped without judgeInstructions", async () => {
+    tmp.enter();
+    fs.writeFileSync(path.join(tmp.dir, "ok.txt"), "content", "utf8");
+    let judgeCalls = 0;
+    const judge: JudgeFn = async (input) => {
+      judgeCalls++;
+      expect(input.judgeInstructions).toContain("mention the tradeoff");
+      expect(input.finalText).toContain("here is my answer");
+      return { pass: false, reason: "does not mention the tradeoff" };
+    };
+    const taskSet = {
+      name: "s",
+      tasks: [
+        { id: "judged", task: "answer", expectFile: "ok.txt", judgeInstructions: "must mention the tradeoff" },
+        { id: "plain", task: "answer", expectFile: "ok.txt" },
+      ],
+    };
+    const arm = await runEvalArm(
+      taskSet,
+      async (task) => {
+        // the "model" creates its artifact — prepareTaskWorkspace deleted it beforehand
+        fs.writeFileSync(path.join(tmp.dir, "ok.txt"), "content", "utf8");
+        return { taskId: task.id, status: "completed", finalText: "here is my answer" };
+      },
+      false,
+      { judge },
+    );
+    expect(judgeCalls).toBe(1); // only the task with judgeInstructions
+    const judged = arm.results.find((r) => r.taskId === "judged")!;
+    const plain = arm.results.find((r) => r.taskId === "plain")!;
+    expect(judged.pass).toBe(false);
+    expect(judged.reason).toContain("tradeoff");
+    expect(plain.pass).toBe(true);
+    tmp.leave();
+  });
+
+  it("judge prompt carries task, instructions and final text", () => {
+    const prompt = buildJudgePrompt({ task: "do x", judgeInstructions: "check y", finalText: "my answer", status: "completed" });
+    expect(prompt).toContain("do x");
+    expect(prompt).toContain("check y");
+    expect(prompt).toContain("my answer");
+  });
+});
+
+describe("eval persistence + regression baseline (阶段 11)", () => {
+  it("persists reports and baselines; against-baseline reuses the stored arm", async () => {
+    const dbPath = path.join(tmp.dir, "evaldb", "harness.db");
+    const db = openDatabase(dbPath);
+    try {
+      const taskSet = { name: "set-x", tasks: [{ id: "t1", task: "x" }] };
+      const runner: EvalRunner = async (task) => ({ taskId: task.id, status: "completed", tokens: 10, durationMs: 5 });
+
+      // record a baseline (2 repeats → 2 runs), latest() returns it
+      const baselineArm = await runEvalArm(taskSet, runner, false, { repeats: 2 });
+      const baseline = new EvalBaselineRepo(db).record({ evalSet: taskSet.name, modelSpec: "test/model", repeats: 2, arm: baselineArm });
+      expect(new EvalBaselineRepo(db).latest(taskSet.name, "test/model")?.id).toBe(baseline.id);
+      expect(new EvalBaselineRepo(db).latest("other", "test/model")).toBeUndefined();
+
+      // full A/B report → persist → list
+      const report = await runEvalComparison(taskSet, { runner, skillName: "some-skill", repeats: 2 });
+      const row = skillEvalRowFromReport(report, "candidate-1");
+      new SkillEvalRepo(db).insert(row);
+      const listed = new SkillEvalRepo(db).list();
+      expect(listed).toHaveLength(1);
+      expect(listed[0]).toMatchObject({
+        skillName: "some-skill",
+        sourceCandidateId: "candidate-1",
+        evalSet: "set-x",
+        repeats: 2,
+        verdict: "tie",
+        baselinePass: 1,
+        candidatePass: 1,
+      });
+      expect(listed[0]?.report.baselineSource).toBe("fresh");
+      expect(listed[0]?.cost.baseline.avgTokens).toBe(10);
+
+      // against-baseline: only the treatment arm runs; stored arm is compared
+      let runnerCalls = 0;
+      const countingRunner: EvalRunner = async (task, skills) => {
+        runnerCalls++;
+        expect(skills).toEqual({ only: ["some-skill"] }); // treatment arm only
+        return { taskId: task.id, status: "completed", tokens: 10 };
+      };
+      const regression = await runEvalAgainstBaseline(taskSet, {
+        runner: countingRunner,
+        skillName: "some-skill",
+        repeats: 2,
+        stored: { arm: baselineArm, repeats: 2 },
+      });
+      expect(regression.baselineSource).toBe("stored");
+      expect(regression.baseline).toEqual(baselineArm);
+      expect(regression.treatment.passRate).toBe(1);
+      expect(runnerCalls).toBe(2); // 1 task × 2 repeats — no baseline re-run
+      expect(regression.verdict).toBe("tie");
+      expect(renderEvalReport(regression)).toContain("stored");
+    } finally {
+      db.close();
+    }
   });
 });

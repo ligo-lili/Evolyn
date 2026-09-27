@@ -196,6 +196,40 @@ export const MIGRATIONS: Migration[] = [
       CREATE INDEX idx_eval_baselines_set_model ON eval_baselines(eval_set, model_spec);
     `,
   },
+  {
+    // 阶段 12: pattern-aware tool idempotency — whether a pattern's tool
+    // sequence contains replay:"never" tools (auto-retry/re-execution hazards).
+    // "unknown" when mined without a tool replay map.
+    id: 8,
+    name: "patterns-replay-safety",
+    sql: `ALTER TABLE patterns ADD COLUMN replay_safety TEXT;`,
+  },
+  {
+    // 阶段 12 lesson: skill_candidates.pattern_id carried an FK into the
+    // patterns table, but patterns is a REBUILDABLE projection — re-mining
+    // (DELETE FROM patterns) fails once any candidate references it. The
+    // candidate's provenance_json already snapshots the full pattern, so the
+    // FK is over-constrained; rebuild the table without it.
+    id: 9,
+    name: "candidates-drop-pattern-fk",
+    sql: `
+      CREATE TABLE skill_candidates_new (
+        id TEXT PRIMARY KEY,
+        pattern_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('draft', 'promoted', 'rejected')),
+        name TEXT NOT NULL,
+        description TEXT NOT NULL,
+        skill_md_path TEXT NOT NULL,
+        provenance_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      INSERT INTO skill_candidates_new (id, pattern_id, status, name, description, skill_md_path, provenance_json, created_at)
+        SELECT id, pattern_id, status, name, description, skill_md_path, provenance_json, created_at FROM skill_candidates;
+      DROP TABLE skill_candidates;
+      ALTER TABLE skill_candidates_new RENAME TO skill_candidates;
+      CREATE INDEX idx_candidates_pattern ON skill_candidates(pattern_id);
+    `,
+  },
 ];
 
 export function migrate(db: DatabaseSync): void {

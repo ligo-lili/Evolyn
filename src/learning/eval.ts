@@ -339,6 +339,8 @@ export interface EvalReport {
   taskSet: string;
   /** The injected skill ("none" for a pure baseline run). */
   skill: string;
+  /** Promoted-skill version at eval time (阶段 12) — makes v1/v2 ledger rows comparable. */
+  skillVersion?: number;
   repeats: number;
   /** "fresh" = baseline arm re-run now; "stored" = recorded regression baseline. */
   baselineSource: "fresh" | "stored";
@@ -354,6 +356,8 @@ export interface EvalReport {
 export interface EvalRunOptions {
   runner: EvalRunner;
   skillName: string;
+  /** Promoted-skill version, captured for ledger comparability (阶段 12). */
+  skillVersion?: number;
   repeats?: number;
   judge?: JudgeFn;
 }
@@ -379,6 +383,7 @@ export async function runEvalComparison(taskSet: EvalTaskSet, options: EvalRunOp
   return {
     taskSet: taskSet.name,
     skill: options.skillName,
+    skillVersion: options.skillVersion,
     repeats,
     baselineSource: "fresh",
     baseline,
@@ -399,6 +404,7 @@ export async function runEvalAgainstBaseline(
   return {
     taskSet: taskSet.name,
     skill: options.skillName,
+    skillVersion: options.skillVersion,
     repeats,
     baselineSource: "stored",
     baseline: options.stored.arm,

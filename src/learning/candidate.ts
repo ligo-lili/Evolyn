@@ -38,7 +38,9 @@ export const CANDIDATE_SYSTEM_PROMPT =
   "You distill recurring tool-use patterns from agent runs into a reusable skill draft. " +
   "You will see one pattern (a tool sequence or an error→repair habit) and the runs that support it. " +
   "Write the skill so a future agent facing a similar task can follow it: concrete steps, which tools in which order, and the pitfalls observed in the runs. " +
+  "The body MUST contain a short '## Verify' section with an explicit verification protocol: after any write, read the file back and CHECK every constraint the task stated (exact count, ordering, format, uniqueness, arithmetic); if any check fails, rewrite the file and read back again — report success only once the read-back satisfies the stated constraints. " +
   "Base the skill ONLY on what the runs show — do not invent capabilities. " +
+  "Keep the body under 40 lines: it is injected into future prompts, and every token costs. " +
   "Output ONLY strict JSON (no markdown fences, no commentary) with exactly these keys: " +
   'name (lowercase slug [a-z0-9-], <=64 chars), ' +
   "description (what the skill does and when to use it), " +

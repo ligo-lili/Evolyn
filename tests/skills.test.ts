@@ -11,6 +11,7 @@ import { draftSkillFromPattern } from "../src/learning/candidate.js";
 import { judgeRun, loadTaskSet, readBackVerified, renderEvalReport, runEvalAgainstBaseline, runEvalArm, runEvalComparison, type EvalRunner } from "../src/learning/eval.js";
 import { promoteCandidate } from "../src/skills/promote.js";
 import { SkillIndex } from "../src/skills/retrieve.js";
+import { verifyPromotedSkills } from "../src/skills/verify.js";
 import { parseSkillMd, serializeSkillMd, validateSkillName, SKILL_DESCRIPTION_MAX } from "../src/skills/format.js";
 import { EvalBaselineRepo, SkillEvalRepo, skillEvalRowFromReport } from "../src/storage/repos/evals.js";
 import { buildJudgePrompt, isInfraFailure, parseJudgeVerdictStrict, type EvalRawRun, type JudgeFn } from "../src/learning/eval.js";
@@ -92,6 +93,37 @@ describe("pattern miner (阶段 10)", () => {
         signature: "write_file>read_file",
         support: 3,
         traceRefs: ["r1", "r2", "r3"],
+        replaySafety: "unknown",
+      },
+    ]);
+  });
+
+  it("classifies patterns by tool replay safety (阶段 12 pattern-aware idempotency)", () => {
+    const calls = (a: string, b: string) => [{ toolName: a, isError: false }, { toolName: b, isError: false }];
+    const runs = ["r1", "r2", "r3"].map((runId) => ({ runId, task: "t", status: "completed", calls: calls("send_notification", "read_file") }));
+    const replay = { send_notification: "never", read_file: "safe", write_file: "safe" };
+    const mined = minePatterns(runs, { toolReplay: replay });
+    expect(mined.map((p) => [p.signature, p.replaySafety])).toEqual([["send_notification>read_file", "contains-never"]]);
+    // without a map the classification stays unknown
+    expect(minePatterns(runs)[0]?.replaySafety).toBe("unknown");
+    // error-repair patterns classify the repaired tool only
+    const repairRuns = ["a", "b", "c"].map((runId) => ({
+      runId,
+      task: "t",
+      status: "completed",
+      calls: [
+        { toolName: "send_notification", isError: true },
+        { toolName: "send_notification", isError: false },
+      ],
+    }));
+    expect(minePatterns(repairRuns, { toolReplay: replay })).toEqual([
+      {
+        id: patternId("error-repair", "repair:send_notification"),
+        kind: "error-repair",
+        signature: "repair:send_notification",
+        support: 3,
+        traceRefs: ["a", "b", "c"],
+        replaySafety: "contains-never",
       },
     ]);
   });
@@ -271,6 +303,78 @@ describe("promotion + retrieval (阶段 10)", () => {
     } finally {
       db2.close();
     }
+  });
+
+  it("verification: the promoted root loads through pi's own loadSkillsFromDir (consumer contract)", async () => {
+    const dbPath = path.join(tmp.dir, "verify", "harness.db");
+    const db = openDatabase(dbPath);
+    let patternIdValue = "";
+    try {
+      for (const i of [0, 1, 2]) {
+        seedRun(db, `v-${i}`, `note file task ${i}`, [toolResultMessage("write_file", false, "wrote"), toolResultMessage("read_file", false, "ok")]);
+      }
+      new PatternRepo(db).replaceAll(minePatternsFromDb(db));
+      patternIdValue = new PatternRepo(db).list()[0]!.id;
+    } finally {
+      db.close();
+    }
+    const skillsRoot = path.join(tmp.dir, "verify", "skills");
+    const draft = await draftSkillFromPattern(patternIdValue, {
+      database: dbPath,
+      complete: async () => JSON.stringify(SKILL_JSON),
+      skillsRoot,
+    });
+    promoteCandidate(draft.candidate.id, { database: dbPath, skillsRoot });
+    const verification = verifyPromotedSkills(path.join(skillsRoot, "promoted"));
+    expect(verification.ok).toBe(true);
+    expect(verification.skills.map((s) => s.name)).toContain(SKILL_JSON.name);
+  });
+
+  it("promote gate: refuses a skill whose latest valid report says baseline-wins (--force overrides)", async () => {
+    const dbPath = path.join(tmp.dir, "gate2", "harness.db");
+    const db = openDatabase(dbPath);
+    let patternIdValue = "";
+    try {
+      for (const i of [0, 1, 2]) {
+        seedRun(db, `g-${i}`, `note file task ${i}`, [toolResultMessage("write_file", false, "wrote"), toolResultMessage("read_file", false, "ok")]);
+      }
+      new PatternRepo(db).replaceAll(minePatternsFromDb(db));
+      patternIdValue = new PatternRepo(db).list()[0]!.id;
+    } finally {
+      db.close();
+    }
+    const skillsRoot = path.join(tmp.dir, "gate2", "skills");
+    const draft = await draftSkillFromPattern(patternIdValue, {
+      database: dbPath,
+      complete: async () => JSON.stringify(SKILL_JSON),
+      skillsRoot,
+    });
+
+    // a VALID report that lost to the baseline → promote refused
+    const db2 = openDatabase(dbPath);
+    try {
+      new SkillEvalRepo(db2).insert({
+        id: "report-loser",
+        skillName: SKILL_JSON.name,
+        evalSet: "file-creation-v1",
+        repeats: 3,
+        baselinePass: 1,
+        candidatePass: 0.5,
+        verdict: "baseline-wins",
+        cost: {
+          baseline: { totalTokens: 0, totalDurationMs: 0, avgTokens: 0, avgDurationMs: 0 },
+          treatment: { totalTokens: 0, totalDurationMs: 0, avgTokens: 0, avgDurationMs: 0 },
+        },
+        report: { taskSet: "file-creation-v1", skill: SKILL_JSON.name, repeats: 3, baselineSource: "fresh", valid: true, verdict: "baseline-wins", baseline: { arm: "baseline", results: [], taskSummaries: [], passRate: 1, verifiedRuns: 0, infraFailures: 0, totalTokens: 0, totalDurationMs: 0 }, treatment: { arm: "treatment", results: [], taskSummaries: [], passRate: 0.5, verifiedRuns: 0, infraFailures: 0, totalTokens: 0, totalDurationMs: 0 }, decidedAt: new Date().toISOString() } as never,
+        decidedAt: new Date().toISOString(),
+      });
+    } finally {
+      db2.close();
+    }
+    expect(() => promoteCandidate(draft.candidate.id, { database: dbPath, skillsRoot })).toThrow(/eval gate/);
+    // force overrides the gate
+    const forced = promoteCandidate(draft.candidate.id, { database: dbPath, skillsRoot, force: true });
+    expect(forced.skill.name).toBe(SKILL_JSON.name);
   });
 });
 

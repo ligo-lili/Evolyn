@@ -14,6 +14,7 @@ export interface EvalArmCost {
 export interface SkillEvalRow {
   id: string;
   skillName: string;
+  skillVersion?: number;
   sourceCandidateId?: string;
   evalSet: string;
   repeats: number;
@@ -37,9 +38,11 @@ function armCost(arm: EvalArmResult): EvalArmCost {
 }
 
 function rowToSkillEval(r: Row): SkillEvalRow {
+  const report = JSON.parse(String(r.report_json)) as EvalReport;
   return {
     id: String(r.id),
     skillName: String(r.skill_name),
+    skillVersion: report.skillVersion,
     sourceCandidateId: r.source_candidate_id == null ? undefined : String(r.source_candidate_id),
     evalSet: String(r.eval_set),
     repeats: Number(r.repeats),
@@ -47,7 +50,7 @@ function rowToSkillEval(r: Row): SkillEvalRow {
     candidatePass: Number(r.candidate_pass),
     verdict: String(r.verdict) as SkillEvalRow["verdict"],
     cost: JSON.parse(String(r.cost_json)),
-    report: JSON.parse(String(r.report_json)),
+    report,
     decidedAt: String(r.decided_at),
   };
 }
@@ -146,6 +149,7 @@ export function skillEvalRowFromReport(report: EvalReport, sourceCandidateId?: s
   return {
     id: randomUUID(),
     skillName: report.skill,
+    skillVersion: report.skillVersion,
     sourceCandidateId,
     evalSet: report.taskSet,
     repeats: report.repeats,

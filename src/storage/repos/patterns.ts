@@ -1,5 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
-import type { PatternDraft } from "../../learning/miner.js";
+import type { PatternDraft, ReplaySafety } from "../../learning/miner.js";
 
 type Row = Record<string, unknown>;
 
@@ -9,6 +9,7 @@ export interface PatternRow {
   signature: string;
   support: number;
   traceRefs: string[];
+  replaySafety: ReplaySafety;
   createdAt: string;
 }
 
@@ -19,6 +20,7 @@ function rowToPattern(r: Row): PatternRow {
     signature: String(r.signature),
     support: Number(r.support),
     traceRefs: JSON.parse(String(r.trace_refs_json)) as string[],
+    replaySafety: (r.replay_safety == null ? "unknown" : String(r.replay_safety)) as PatternRow["replaySafety"],
     createdAt: String(r.created_at),
   };
 }
@@ -35,10 +37,10 @@ export class PatternRepo {
   replaceAll(drafts: readonly PatternDraft[]): number {
     this.db.exec("DELETE FROM patterns");
     const insert = this.db.prepare(
-      "INSERT INTO patterns (id, kind, signature, support, trace_refs_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      "INSERT INTO patterns (id, kind, signature, support, trace_refs_json, replay_safety, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
     );
     const now = new Date().toISOString();
-    for (const d of drafts) insert.run(d.id, d.kind, d.signature, d.support, JSON.stringify(d.traceRefs), now);
+    for (const d of drafts) insert.run(d.id, d.kind, d.signature, d.support, JSON.stringify(d.traceRefs), d.replaySafety ?? "unknown", now);
     return drafts.length;
   }
 

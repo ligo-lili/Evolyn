@@ -33,6 +33,8 @@ export interface RunToolTrace {
   calls: MinedCall[];
 }
 
+export type ReplaySafety = "all-safe" | "contains-never" | "unknown";
+
 export interface PatternDraft {
   id: string;
   kind: PatternKind;
@@ -41,6 +43,13 @@ export interface PatternDraft {
   /** Distinct runs exhibiting the pattern. */
   support: number;
   traceRefs: string[];
+  /**
+   * Pattern-aware tool idempotency (阶段 12): does the sequence involve
+   * replay:"never" tools? Such patterns are hazardous to auto-retry or
+   * re-execute (crash recovery / retry tiering read the same marker).
+   * "unknown" when mined without a tool replay map.
+   */
+  replaySafety: ReplaySafety;
 }
 
 /** Deterministic pattern id: same signature → same id across re-mining. */
@@ -49,6 +58,15 @@ export function patternId(kind: PatternKind, signature: string): string {
 }
 
 const ERROR_TEXT_MAX = 200;
+
+function signatureTools(kind: PatternKind, signature: string): string[] {
+  return kind === "error-repair" ? [signature.slice("repair:".length)] : signature.split(">");
+}
+
+function replaySafetyOf(kind: PatternKind, signature: string, toolReplay?: Record<string, string>): ReplaySafety {
+  if (!toolReplay) return "unknown";
+  return signatureTools(kind, signature).some((t) => toolReplay[t] === "never") ? "contains-never" : "all-safe";
+}
 
 /**
  * Extract a run's ordered tool-call trace from its events. toolResult messages
@@ -76,6 +94,8 @@ export interface MineOptions {
   minSupport?: number;
   /** Longest n-gram (default 3). */
   maxN?: number;
+  /** Tool name → replay marker ("safe"|"never"); enables replaySafety classification. */
+  toolReplay?: Record<string, string>;
 }
 
 interface Accumulator {
@@ -83,10 +103,17 @@ interface Accumulator {
   runs: Set<string>;
 }
 
-function buildPatterns(kind: PatternKind, acc: Map<string, Accumulator>, minSupport: number): PatternDraft[] {
+function buildPatterns(kind: PatternKind, acc: Map<string, Accumulator>, minSupport: number, toolReplay?: Record<string, string>): PatternDraft[] {
   return [...acc.values()]
     .filter((a) => a.runs.size >= minSupport)
-    .map((a) => ({ id: patternId(kind, a.signature), kind, signature: a.signature, support: a.runs.size, traceRefs: [...a.runs].sort() }))
+    .map((a) => ({
+      id: patternId(kind, a.signature),
+      kind,
+      signature: a.signature,
+      support: a.runs.size,
+      traceRefs: [...a.runs].sort(),
+      replaySafety: replaySafetyOf(kind, a.signature, toolReplay),
+    }))
     .sort((a, b) => b.support - a.support || a.signature.localeCompare(b.signature));
 }
 
@@ -141,9 +168,9 @@ export function minePatterns(runs: readonly RunToolTrace[], options: MineOptions
 
   const mined: PatternDraft[] = [];
   for (const acc of [...sequences.values()]) {
-    mined.push(...buildPatterns("tool-sequence", acc, minSupport));
+    mined.push(...buildPatterns("tool-sequence", acc, minSupport, options.toolReplay));
   }
-  mined.push(...buildPatterns("error-repair", repairs, minSupport));
+  mined.push(...buildPatterns("error-repair", repairs, minSupport, options.toolReplay));
   return mined;
 }
 

@@ -33,9 +33,11 @@ import {
 import { EvalBaselineRepo, SkillEvalRepo, skillEvalRowFromReport } from "../storage/repos/evals.js";
 import { promoteCandidate } from "../skills/promote.js";
 import { SkillIndex, toAssemblerEntries } from "../skills/retrieve.js";
+import { verifyPromotedSkills } from "../skills/verify.js";
 import { PatternRepo } from "../storage/repos/patterns.js";
 import { SkillCandidateRepo } from "../storage/repos/candidates.js";
 import { promotedSkillsDir, skillsDir } from "../runtime/paths.js";
+import { DEMO_TOOLS } from "../runtime/tools/index.js";
 
 interface ParsedArgs {
   command: string;
@@ -101,6 +103,7 @@ Usage:
   agent-harness skill baseline <taskset.json> [--model <spec>] [--repeats <n>]
                                            record the no-skill regression baseline for a task set + model
   agent-harness skill evals [limit]        list persisted eval reports (the iteration ledger)
+  agent-harness skill verify               check the promoted root loads via pi loadSkillsFromDir
   agent-harness models [provider]          list providers, or a provider's models
   agent-harness trace list                 list recorded runs
   agent-harness trace show <runId> [--all] render a run's execution timeline
@@ -252,11 +255,16 @@ async function main(): Promise<number> {
           console.error("--min-support is floored at 3: single-run patterns are not minable");
           return 2;
         }
-        const drafts = minePatternsFromDb(db, minSupport !== undefined ? { minSupport } : {});
+        const drafts = minePatternsFromDb(db, {
+          ...(minSupport !== undefined ? { minSupport } : {}),
+          // 阶段 12 pattern-aware idempotency: classify patterns by the tools'
+          // replay markers (send_notification is "never").
+          toolReplay: Object.fromEntries(DEMO_TOOLS.map((t) => [t.name, String(t.replay ?? "safe")])),
+        });
         const count = new PatternRepo(db).replaceAll(drafts);
         console.log(`mined ${count} pattern(s) with support >= ${minSupport ?? 3} from finished runs`);
         for (const p of new PatternRepo(db).list()) {
-          console.log(`[${p.kind}] ${p.signature} — support ${p.support} (${p.traceRefs.length} trace(s)) id=${p.id}`);
+          console.log(`[${p.kind}] ${p.signature} — support ${p.support}, replay ${p.replaySafety} (${p.traceRefs.length} trace(s)) id=${p.id}`);
         }
         if (count === 0) console.log("(no pattern cleared the threshold — run a few similar tasks first)");
       } finally {
@@ -460,12 +468,13 @@ async function main(): Promise<number> {
         report = await runEvalAgainstBaseline(taskSet, {
           runner,
           skillName,
+          skillVersion: registered.version,
           repeats,
           stored: { arm: stored.arm, repeats: stored.repeats },
         });
       } else {
         console.log(`running ${taskSet.tasks.length} task(s) × ${repeats} repeat(s) × 2 arms (baseline / +skill "${skillName}")…`);
-        report = await runEvalComparison(taskSet, { runner, skillName, repeats });
+        report = await runEvalComparison(taskSet, { runner, skillName, skillVersion: registered.version, repeats });
       }
       // 阶段 11: every report enters the ledger for cross-iteration comparison.
       const db3 = openDatabase(dbPath);
@@ -528,7 +537,7 @@ async function main(): Promise<number> {
         const pct = (v: number) => `${Math.round(v * 100)}%`;
         const verdict = r.report.valid === false ? `${r.verdict} (INVALID)` : r.verdict;
         console.log(
-          `${r.decidedAt.slice(0, 19)} ${verdict.padEnd(23)} ${r.skillName} @ ${r.evalSet} (×${r.repeats}) — baseline ${pct(r.baselinePass)} vs skill ${pct(r.candidatePass)}`,
+          `${r.decidedAt.slice(0, 19)} ${verdict.padEnd(23)} ${r.skillName}${r.skillVersion ? `@v${r.skillVersion}` : ""} @ ${r.evalSet} (×${r.repeats}) — baseline ${pct(r.baselinePass)} vs skill ${pct(r.candidatePass)}`,
         );
         console.log(
           `    tokens: baseline ~${r.cost.baseline.avgTokens}/run vs skill ~${r.cost.treatment.avgTokens}/run; duration: ~${r.cost.baseline.avgDurationMs}ms vs ~${r.cost.treatment.avgDurationMs}ms`,
@@ -537,8 +546,20 @@ async function main(): Promise<number> {
       return 0;
     }
 
+    if (sub === "verify") {
+      const verification = verifyPromotedSkills(promotedSkillsDir());
+      if (verification.skills.length === 0 && verification.diagnostics.length === 0) {
+        console.log("(no promoted skills to verify)");
+        return 0;
+      }
+      for (const s of verification.skills) console.log(`loaded by pi loadSkillsFromDir: ${s.name} (${s.filePath})`);
+      for (const d of verification.diagnostics) console.error(`diagnostic [${d.type}] ${d.message}${d.path ? ` (${d.path})` : ""}`);
+      console.log(verification.ok ? "verification OK" : "verification FAILED");
+      return verification.ok ? 0 : 1;
+    }
+
     console.error(
-      "usage: agent-harness skill mine | patterns | draft <patternId> | candidates | show <id> | promote <id> | list | retrieve \"<task>\" | rebuild | eval <taskset.json> --skill <name> | baseline <taskset.json> | evals",
+      "usage: agent-harness skill mine | patterns | draft <patternId> | candidates | show <id> | promote <id> | list | retrieve \"<task>\" | rebuild | verify | eval <taskset.json> --skill <name> | baseline <taskset.json> | evals",
     );
     return 2;
   }

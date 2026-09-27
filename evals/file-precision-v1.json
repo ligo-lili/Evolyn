@@ -1,0 +1,55 @@
+{
+  "name": "file-precision-v1",
+  "description": "Hard process-constraint tasks where an unverified first-shot measurably fails: reverse alphabetical order, exclusion constraints, compound constraints, 20/30-item counting. Failure mass established on qwen/qwen-turbo (baseline 3/12 on the five hard tasks, 2026-09-27); the repair task is a control that must stay passing. Every requirement is stated in the task text; checks only verify what was stated.",
+  "tasks": [
+    {
+      "id": "descending-months",
+      "task": "Create a file months-desc.txt with exactly 12 month names (January through December), one per line, in REVERSE alphabetical order (Z to A), no duplicates.",
+      "expectFile": "months-desc.txt",
+      "expectLines": 12,
+      "expectSorted": "desc",
+      "expectUnique": true
+    },
+    {
+      "id": "vowel-exclusion",
+      "task": "Create a file animals-cons.txt with exactly 10 animal names, one per line, alphabetically sorted (A to Z), no duplicates — but EXCLUDE any animal whose English name starts with a vowel (a, e, i, o, u).",
+      "expectFile": "animals-cons.txt",
+      "expectLines": 10,
+      "expectSorted": true,
+      "expectUnique": true,
+      "expectLineRegex": "^(?![aeiouAEIOU])"
+    },
+    {
+      "id": "brands-20",
+      "task": "Create a file brands-20.txt with exactly 20 car brand names, one per line, alphabetically sorted (A to Z), no duplicates.",
+      "expectFile": "brands-20.txt",
+      "expectLines": 20,
+      "expectSorted": true,
+      "expectUnique": true
+    },
+    {
+      "id": "langs-compound",
+      "task": "Create a file langs-desc.txt with exactly 14 programming language names, one per line, in REVERSE alphabetical order (Z to A), no duplicates, and none of the names may contain the letter q (upper or lower case).",
+      "expectFile": "langs-desc.txt",
+      "expectLines": 14,
+      "expectSorted": "desc",
+      "expectUnique": true,
+      "expectLineRegex": "^[^Qq]*$"
+    },
+    {
+      "id": "trees-30",
+      "task": "Create a file trees-30.txt with exactly 30 tree species names, one per line, alphabetically sorted (A to Z), no duplicates.",
+      "expectFile": "trees-30.txt",
+      "expectLines": 30,
+      "expectSorted": true,
+      "expectUnique": true
+    },
+    {
+      "id": "repair-control",
+      "task": "The file pantry-fix.txt has problems: it contains duplicate lines and the lines are not alphabetically sorted. Fix it: remove duplicates (keep each distinct item exactly once), sort the lines A to Z, and do not add or remove any distinct items.",
+      "setupFiles": { "pantry-fix.txt": "mango\napple\npear\napple\nkiwi\nbanana\norange\nlemon\n" },
+      "expectFile": "pantry-fix.txt",
+      "expectLinesExact": ["apple", "banana", "kiwi", "lemon", "mango", "orange", "pear"]
+    }
+  ]
+}

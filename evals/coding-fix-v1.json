@@ -1,0 +1,30 @@
+{
+  "name": "coding-fix-v1",
+  "description": "Multi-file bug-fix tasks over deterministic fixture repos (zero-dep, node assert). Bugs span two files (stale re-export, config-key drift, serializer/store asymmetry) so the fix requires reading across files — the multi-file-consistency headroom that file-creation tasks cannot produce. Repos are reset from committed templates before EVERY run; the repo's own test suite is the judge (exit 0 passes). Each fixture is verified solvable: applying the intended one-line fix turns its suite green.",
+  "tasks": [
+    {
+      "id": "string-utils",
+      "task": "The project in repos/string-utils has a failing test suite. Run `npm test` inside that directory, find the failing assertion, fix the SOURCE files (never test.js), and re-run `npm test` until it passes. Do not git commit.",
+      "setupRepo": { "dir": "repos/string-utils", "template": "evals/fixtures/string-utils" },
+      "testCommand": "npm test",
+      "cwd": "repos/string-utils",
+      "testTimeoutMs": 60000
+    },
+    {
+      "id": "inventory-cli",
+      "task": "The project in repos/inventory-cli has a failing test suite. Run `npm test` inside that directory, find the failing assertion, fix the SOURCE files (never test.js), and re-run `npm test` until it passes. Do not git commit.",
+      "setupRepo": { "dir": "repos/inventory-cli", "template": "evals/fixtures/inventory-cli" },
+      "testCommand": "npm test",
+      "cwd": "repos/inventory-cli",
+      "testTimeoutMs": 60000
+    },
+    {
+      "id": "todo-store",
+      "task": "The project in repos/todo-store has a failing test suite. Run `npm test` inside that directory, find the failing assertion, fix the SOURCE files (never the test file), and re-run `npm test` until it passes. Do not git commit.",
+      "setupRepo": { "dir": "repos/todo-store", "template": "evals/fixtures/todo-store" },
+      "testCommand": "npm test",
+      "cwd": "repos/todo-store",
+      "testTimeoutMs": 60000
+    }
+  ]
+}

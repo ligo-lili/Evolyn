@@ -230,6 +230,14 @@ export const MIGRATIONS: Migration[] = [
       CREATE INDEX idx_candidates_pattern ON skill_candidates(pattern_id);
     `,
   },
+  {
+    // 阶段 14: the toolset is part of the eval protocol — a demo-toolset
+    // baseline and a coding-toolset eval are different protocols and must not
+    // be compared.
+    id: 10,
+    name: "baselines-toolset",
+    sql: `ALTER TABLE eval_baselines ADD COLUMN toolset TEXT;`,
+  },
 ];
 
 export function migrate(db: DatabaseSync): void {

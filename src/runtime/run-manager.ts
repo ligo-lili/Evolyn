@@ -58,6 +58,23 @@ function resolveTools(tools: ToolsetSpec | undefined): AnyAgentTool[] {
 }
 
 /**
+ * Coding runs legitimately repeat identical commands (npm test after every
+ * edit), so the same-tool+same-args guard default is relaxed for the coding
+ * toolset unless the caller set it explicitly. Degenerate-loop protection
+ * stays on at the higher cap.
+ */
+function defaultLimitsFor(tools: ToolsetSpec | undefined, overrides: RunLimits | undefined): Required<RunLimits> {
+  const coding = tools === "coding";
+  return {
+    maxTurns: overrides?.maxTurns ?? DEFAULT_RUN_LIMITS.maxTurns,
+    maxToolCalls: overrides?.maxToolCalls ?? DEFAULT_RUN_LIMITS.maxToolCalls,
+    maxRepeatedToolCalls: overrides?.maxRepeatedToolCalls ?? (coding ? 12 : DEFAULT_RUN_LIMITS.maxRepeatedToolCalls),
+    maxCostUsd: overrides?.maxCostUsd ?? DEFAULT_RUN_LIMITS.maxCostUsd,
+    toolTimeoutMs: overrides?.toolTimeoutMs ?? DEFAULT_RUN_LIMITS.toolTimeoutMs,
+  };
+}
+
+/**
  * 阶段 13 (P1-3): the ONE place where tools get wrapped (fault → evidence →
  * timeout → retry) and the beforeToolCall chain is composed (limits →
  * permission gate). run() and resume() MUST share this — a resume executing
@@ -262,15 +279,8 @@ export class RunManager {
     record.systemPrompt = systemPrompt;
     runRepo?.insert(record);
 
-    const limits: Required<RunLimits> = {
-      maxTurns: options.limits?.maxTurns ?? DEFAULT_RUN_LIMITS.maxTurns,
-      maxToolCalls: options.limits?.maxToolCalls ?? DEFAULT_RUN_LIMITS.maxToolCalls,
-      maxRepeatedToolCalls: options.limits?.maxRepeatedToolCalls ?? DEFAULT_RUN_LIMITS.maxRepeatedToolCalls,
-      maxCostUsd: options.limits?.maxCostUsd ?? DEFAULT_RUN_LIMITS.maxCostUsd,
-      toolTimeoutMs: options.limits?.toolTimeoutMs ?? DEFAULT_RUN_LIMITS.toolTimeoutMs,
-    };
+    const limits: Required<RunLimits> = defaultLimitsFor(options.tools, options.limits);
     let limitViolation: LimitViolation | undefined;
-
     const traceEnabled = options.trace !== false;
     let traceFile: string | undefined;
     let recorder: TraceRecorder | undefined;
@@ -427,13 +437,7 @@ export class RunManager {
     const model = options.model ?? resolveModel(crashed.record.modelSpec);
     const startedMs = Date.now();
 
-    const limits: Required<RunLimits> = {
-      maxTurns: options.limits?.maxTurns ?? DEFAULT_RUN_LIMITS.maxTurns,
-      maxToolCalls: options.limits?.maxToolCalls ?? DEFAULT_RUN_LIMITS.maxToolCalls,
-      maxRepeatedToolCalls: options.limits?.maxRepeatedToolCalls ?? DEFAULT_RUN_LIMITS.maxRepeatedToolCalls,
-      maxCostUsd: options.limits?.maxCostUsd ?? DEFAULT_RUN_LIMITS.maxCostUsd,
-      toolTimeoutMs: options.limits?.toolTimeoutMs ?? DEFAULT_RUN_LIMITS.toolTimeoutMs,
-    };
+    const limits: Required<RunLimits> = defaultLimitsFor(options.tools, options.limits);
     let limitViolation: LimitViolation | undefined;
     // 阶段 13 (P1-3): the resumed run shares run()'s runtime composition —
     // wrapped tools (fault/evidence/timeout/retry) and the composed

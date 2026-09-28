@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { execSync } from "node:child_process";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { openDatabase } from "../src/storage/db.js";
@@ -23,9 +24,14 @@ import { promoteCandidate } from "../src/skills/promote.js";
 import { PatternRepo } from "../src/storage/repos/patterns.js";
 import { minePatternsFromDb } from "../src/learning/miner.js";
 import { draftSkillFromPattern } from "../src/learning/candidate.js";
+import { judgeRun, prepareRepoFixture, runEvalArm, type EvalRunner } from "../src/learning/eval.js";
 import { assistantMessage, FAKE_MODEL, makeTempCwd, scriptedStreamFn } from "./helpers.js";
 
 const tmp = makeTempCwd();
+
+// Fixture templates live in the package tree — capture the absolute path
+// BEFORE makeTempCwd chdirs the process into the temp workspace.
+const PACKAGE_ROOT = process.cwd();
 
 beforeAll(() => tmp.enter());
 afterAll(() => tmp.leave());
@@ -432,6 +438,123 @@ describe("workspace tree (阶段 13)", () => {
     const tree = buildWorkspaceTree(tmp.dir);
     expect(tree.split("\n").length).toBeLessThanOrEqual(61); // 60 entries + ellipsis
     expect(tree.split("\n").at(-1)).toBe("…");
+    tmp.leave();
+  });
+});
+
+// ---------- 阶段 14: coding eval — setupRepo + testCommand ----------
+
+describe("阶段 14 coding eval mechanics", () => {
+  const FIXTURES: Record<string, { broken: string; fix: (dir: string) => void }> = {
+    "string-utils": {
+      broken: path.join(PACKAGE_ROOT, "evals", "fixtures", "string-utils"),
+      fix: (dir) =>
+        fs.writeFileSync(
+          path.join(dir, "index.js"),
+          "// Public API.\nmodule.exports = {\n  ...require(\"./lib/format\"),\n  ...require(\"./lib/parse\"),\n};\n",
+          "utf8",
+        ),
+    },
+    "inventory-cli": {
+      broken: path.join(PACKAGE_ROOT, "evals", "fixtures", "inventory-cli"),
+      fix: (dir) =>
+        fs.writeFileSync(
+          path.join(dir, "service.js"),
+          'const config = require("./config");\n\nfunction restockList(items) {\n  // Items at or below the restock threshold need ordering.\n  const threshold = config.lowStockThreshold ?? 2;\n  return items.filter((item) => item.stock <= threshold).map((item) => item.sku);\n}\n\nmodule.exports = { restockList };\n',
+          "utf8",
+        ),
+    },
+    "todo-store": {
+      broken: path.join(PACKAGE_ROOT, "evals", "fixtures", "todo-store"),
+      fix: (dir) =>
+        fs.writeFileSync(
+          path.join(dir, "store.js"),
+          'const fs = require("node:fs");\nconst { toJSON, fromJSON } = require("./serializer");\n\nfunction save(file, todos) {\n  fs.writeFileSync(file, JSON.stringify(todos.map(toJSON), null, 2));\n}\n\nfunction load(file) {\n  return JSON.parse(fs.readFileSync(file, "utf8")).map(fromJSON);\n}\n\nmodule.exports = { save, load };\n',
+          "utf8",
+        ),
+    },
+  };
+
+  function runIn(dir: string): { code: number } {
+    try {
+      execSync("node test.js", { cwd: dir, stdio: "pipe" });
+      return { code: 0 };
+    } catch (err) {
+      return { code: (err as { status?: number }).status ?? 1 };
+    }
+  }
+
+  for (const [name, fixture] of Object.entries(FIXTURES)) {
+    it(`fixture ${name}: broken at seed, green after the intended fix (solvability proof)`, () => {
+      tmp.enter();
+      const dir = path.join(tmp.dir, "repos", name);
+      prepareRepoFixture({ dir, template: fixture.broken });
+      expect(runIn(dir).code).not.toBe(0); // the bug is live
+      fixture.fix(dir);
+      expect(runIn(dir).code).toBe(0); // the intended fix turns it green
+      tmp.leave();
+    });
+
+    it(`fixture ${name}: prepareRepoFixture resets the repo before every run`, () => {
+      tmp.enter();
+      const dir = path.join(tmp.dir, "repos", name);
+      prepareRepoFixture({ dir, template: fixture.broken });
+      fixture.fix(dir); // simulate an agent's edit
+      expect(runIn(dir).code).toBe(0);
+      prepareRepoFixture({ dir, template: fixture.broken }); // next repeat/arm
+      expect(runIn(dir).code).not.toBe(0); // the edit is gone — state is per-run
+      tmp.leave();
+    });
+  }
+
+  it("judgeRun testCommand: the repo's own tests decide, regardless of the run status", () => {
+    tmp.enter();
+    const dir = path.join(tmp.dir, "judge");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "test.js"), "process.exit(1);\n", "utf8");
+    const task = { id: "t", task: "x", testCommand: "node test.js", cwd: "judge" };
+    const completed = { taskId: "t", status: "completed" };
+    const red = judgeRun(task, completed);
+    expect(red.pass).toBe(false);
+    expect(red.reason).toContain("test command failed");
+
+    fs.writeFileSync(path.join(dir, "test.js"), "console.log('ok');\n", "utf8");
+    expect(judgeRun(task, completed).pass).toBe(true);
+
+    // a run that claims success but leaves a red suite still fails
+    fs.writeFileSync(path.join(dir, "test.js"), "process.exit(3);\n", "utf8");
+    expect(judgeRun(task, { taskId: "t", status: "completed" }).pass).toBe(false);
+    tmp.leave();
+  });
+
+  it("an eval arm over a coding taskset judges via the repo tests end-to-end", async () => {
+    tmp.enter();
+    for (const [name, fixture] of Object.entries(FIXTURES)) {
+      fs.cpSync(fixture.broken, path.join(tmp.dir, "evals", "fixtures", name), { recursive: true });
+    }
+    const inline = {
+      name: "coding-fix-inline",
+      tasks: Object.entries(FIXTURES).map(([id, fixture]) => ({
+        id,
+        task: `fix ${id}`,
+        setupRepo: { dir: `repos/${id}`, template: path.join(tmp.dir, "evals", "fixtures", id) },
+        testCommand: "node test.js",
+        cwd: `repos/${id}`,
+      })),
+    };
+    // runner 1: never edits → all three repos stay red
+    const lazyRunner: EvalRunner = async (task) => ({ taskId: task.id, status: "completed" });
+    const lazy = await runEvalArm(inline, lazyRunner, false);
+    expect(lazy.passRate).toBe(0);
+    expect(lazy.results.every((r) => r.reason?.includes("test command failed"))).toBe(true);
+
+    // runner 2: applies the intended fix to each repo → all green
+    const fixingRunner: EvalRunner = async (task) => {
+      FIXTURES[task.id].fix(path.join(tmp.dir, "repos", task.id));
+      return { taskId: task.id, status: "completed" };
+    };
+    const fixed = await runEvalArm(inline, fixingRunner, false);
+    expect(fixed.passRate).toBe(1);
     tmp.leave();
   });
 });

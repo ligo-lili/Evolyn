@@ -467,18 +467,23 @@ async function main(): Promise<number> {
       }
       const repeatsFlag = typeof flags.repeats === "string" ? Number(flags.repeats) : 1;
       const repeats = Number.isFinite(repeatsFlag) && repeatsFlag >= 1 ? Math.floor(repeatsFlag) : 1;
-      const runner = defaultEvalRunner(spec);
+      const toolsFlag = typeof flags.tools === "string" ? flags.tools : undefined;
+      if (toolsFlag !== undefined && toolsFlag !== "demo" && toolsFlag !== "coding") {
+        console.error(`unknown --tools "${toolsFlag}" (expected demo | coding)`);
+        return 2;
+      }
+      const runner = defaultEvalRunner(spec, { toolset: toolsFlag as "demo" | "coding" | undefined });
       let report;
       if (flags["against-baseline"] === true) {
         const db2 = openDatabase(dbPath);
         let stored;
         try {
-          stored = new EvalBaselineRepo(db2).latest(taskSet.name, spec);
+          stored = new EvalBaselineRepo(db2).latest(taskSet.name, spec, toolsFlag);
         } finally {
           db2.close();
         }
         if (!stored) {
-          console.error(`no recorded baseline for "${taskSet.name}" + ${spec} — run: agent-harness skill baseline ${file} --model ${spec}`);
+          console.error(`no recorded baseline for "${taskSet.name}" + ${spec} (tools: ${toolsFlag ?? "demo"}) — run: agent-harness skill baseline ${file} --model ${spec}${toolsFlag ? ` --tools ${toolsFlag}` : ""}`);
           return 1;
         }
         if (stored.repeats !== repeats) {
@@ -491,12 +496,13 @@ async function main(): Promise<number> {
           runner,
           skillName,
           skillVersion: registered.version,
+          toolset: toolsFlag,
           repeats,
           stored: { arm: stored.arm, repeats: stored.repeats },
         });
       } else {
         console.log(`running ${taskSet.tasks.length} task(s) × ${repeats} repeat(s) × 2 arms (baseline / +skill "${skillName}")…`);
-        report = await runEvalComparison(taskSet, { runner, skillName, skillVersion: registered.version, repeats });
+        report = await runEvalComparison(taskSet, { runner, skillName, skillVersion: registered.version, toolset: toolsFlag, repeats });
       }
       // 阶段 11: every report enters the ledger for cross-iteration comparison.
       const db3 = openDatabase(dbPath);
@@ -523,14 +529,19 @@ async function main(): Promise<number> {
       }
       const repeatsFlag = typeof flags.repeats === "string" ? Number(flags.repeats) : 1;
       const repeats = Number.isFinite(repeatsFlag) && repeatsFlag >= 1 ? Math.floor(repeatsFlag) : 1;
+      const toolsFlag = typeof flags.tools === "string" ? flags.tools : undefined;
+      if (toolsFlag !== undefined && toolsFlag !== "demo" && toolsFlag !== "coding") {
+        console.error(`unknown --tools "${toolsFlag}" (expected demo | coding)`);
+        return 2;
+      }
       const taskSet = loadTaskSet(file);
-      const runner = defaultEvalRunner(spec);
-      console.log(`recording no-skill baseline: ${taskSet.tasks.length} task(s) × ${repeats} repeat(s) with ${spec}…`);
+      const runner = defaultEvalRunner(spec, { toolset: toolsFlag as "demo" | "coding" | undefined });
+      console.log(`recording no-skill baseline: ${taskSet.tasks.length} task(s) × ${repeats} repeat(s) with ${spec} (tools: ${toolsFlag ?? "demo"})…`);
       const arm = await runEvalArm(taskSet, runner, false, { repeats });
       const db = openDatabase(dbPath);
       let recorded;
       try {
-        recorded = new EvalBaselineRepo(db).record({ evalSet: taskSet.name, modelSpec: spec, repeats, arm });
+        recorded = new EvalBaselineRepo(db).record({ evalSet: taskSet.name, modelSpec: spec, toolset: toolsFlag, repeats, arm });
       } finally {
         db.close();
       }

@@ -91,6 +91,8 @@ export interface EvalBaselineRow {
   id: string;
   evalSet: string;
   modelSpec: string;
+  /** 阶段 14: the toolset is part of the eval protocol (demo/coding). */
+  toolset?: string;
   repeats: number;
   arm: EvalArmResult;
   recordedAt: string;
@@ -101,6 +103,7 @@ function rowToBaseline(r: Row): EvalBaselineRow {
     id: String(r.id),
     evalSet: String(r.eval_set),
     modelSpec: String(r.model_spec),
+    toolset: r.toolset == null ? undefined : String(r.toolset),
     repeats: Number(r.repeats),
     arm: JSON.parse(String(r.arm_json)) as EvalArmResult,
     recordedAt: String(r.recorded_at),
@@ -116,25 +119,30 @@ function rowToBaseline(r: Row): EvalBaselineRow {
 export class EvalBaselineRepo {
   constructor(private readonly db: DatabaseSync) {}
 
-  record(input: { evalSet: string; modelSpec: string; repeats: number; arm: EvalArmResult }): EvalBaselineRow {
+  record(input: { evalSet: string; modelSpec: string; toolset?: string; repeats: number; arm: EvalArmResult }): EvalBaselineRow {
     const row: EvalBaselineRow = {
       id: randomUUID(),
       evalSet: input.evalSet,
       modelSpec: input.modelSpec,
+      toolset: input.toolset,
       repeats: input.repeats,
       arm: input.arm,
       recordedAt: new Date().toISOString(),
     };
     this.db
-      .prepare("INSERT INTO eval_baselines (id, eval_set, model_spec, repeats, arm_json, recorded_at) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(row.id, row.evalSet, row.modelSpec, row.repeats, JSON.stringify(row.arm), row.recordedAt);
+      .prepare("INSERT INTO eval_baselines (id, eval_set, model_spec, toolset, repeats, arm_json, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(row.id, row.evalSet, row.modelSpec, row.toolset ?? null, row.repeats, JSON.stringify(row.arm), row.recordedAt);
     return row;
   }
 
-  latest(evalSet: string, modelSpec: string): EvalBaselineRow | undefined {
+  latest(evalSet: string, modelSpec: string, toolset?: string): EvalBaselineRow | undefined {
     const row = this.db
-      .prepare("SELECT * FROM eval_baselines WHERE eval_set = ? AND model_spec = ? ORDER BY recorded_at DESC LIMIT 1")
-      .get(evalSet, modelSpec) as Row | undefined;
+      .prepare(
+        toolset === undefined
+          ? "SELECT * FROM eval_baselines WHERE eval_set = ? AND model_spec = ? ORDER BY recorded_at DESC LIMIT 1"
+          : "SELECT * FROM eval_baselines WHERE eval_set = ? AND model_spec = ? AND toolset = ? ORDER BY recorded_at DESC LIMIT 1",
+      )
+      .get(...(toolset === undefined ? [evalSet, modelSpec] : [evalSet, modelSpec, toolset])) as Row | undefined;
     return row ? rowToBaseline(row) : undefined;
   }
 

@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { execSync } from "node:child_process";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { resolveModel } from "../providers.js";
 import { RunManager, type SkillInjection } from "../runtime/run-manager.js";
@@ -49,6 +50,25 @@ export interface EvalTask {
    * tasks start from the same state in both arms and every repeat.
    */
   setupFiles?: Record<string, string>;
+  /**
+   * 阶段 14 coding fixture: a repo directory reset to a known state before
+   * every run. `template` copies a committed fixture directory (offline,
+   * deterministic); `url`+`ref` clone/reset a git repo instead (OSS mode —
+   * ref = the bug-introducing parent commit; the fix commit's tests are
+   * already in the tree and fail). The dir is workspace-relative; the agent
+   * edits it with normal relative paths.
+   */
+  setupRepo?: { dir: string; template?: string; url?: string; ref?: string };
+  /**
+   * 阶段 14 deterministic test check: run this command (in `cwd`, default
+   * workspace root) after the run — exit 0 passes, anything else fails with
+   * the output tail. No LLM involved.
+   */
+  testCommand?: string;
+  /** Directory the testCommand runs in, workspace-relative (default: root). */
+  cwd?: string;
+  /** Wall-clock budget for the test command (ms, default 120_000). */
+  testTimeoutMs?: number;
 }
 
 export interface EvalTaskSet {
@@ -72,6 +92,39 @@ export function prepareTaskWorkspace(task: EvalTask): void {
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, content, "utf8");
   }
+  if (task.setupRepo) prepareRepoFixture(task.setupRepo);
+}
+
+/**
+ * 阶段 14: reset a repo fixture to its defined buggy state. Templates copy a
+ * committed fixture directory (rm + copy — deterministic, offline); git repos
+ * clone once (kept under the dir) and reset per run via checkout --force +
+ * clean -fd (ignored files like node_modules survive, the agent's tracked and
+ * untracked edits do not).
+ */
+export function prepareRepoFixture(spec: NonNullable<EvalTask["setupRepo"]>): void {
+  const dir = path.resolve(spec.dir);
+  if (spec.template) {
+    const template = path.resolve(spec.template);
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.cpSync(template, dir, { recursive: true });
+    return;
+  }
+  if (spec.url) {
+    const ref = spec.ref ?? "HEAD";
+    const git = (args: string): string =>
+      execSync(`git ${args}`, { cwd: dir, stdio: ["ignore", "pipe", "pipe"], timeout: 120_000, windowsHide: true }).toString();
+    if (!fs.existsSync(path.join(dir, ".git"))) {
+      fs.mkdirSync(path.dirname(dir), { recursive: true });
+      fs.rmSync(dir, { recursive: true, force: true });
+      execSync(`git clone ${spec.url} ${JSON.stringify(dir)}`, { stdio: ["ignore", "pipe", "pipe"], timeout: 300_000, windowsHide: true });
+    }
+    git(`fetch origin ${ref} --force`);
+    git(`checkout --force ${JSON.stringify(ref)}`);
+    git(`clean -fd`);
+    return;
+  }
+  throw new Error(`setupRepo.dir "${spec.dir}" needs a template or url`);
 }
 
 /** What one arm observed for one run, before judging. */
@@ -104,8 +157,8 @@ export function readBackVerified(messages: readonly AgentMessage[]): boolean {
       if (block.type !== "toolCall") continue;
       const p = (block.arguments as { path?: unknown } | undefined)?.path;
       if (typeof p !== "string") continue;
-      if (block.name === "write_file") written.add(p);
-      else if (block.name === "read_file" && written.has(p)) return true;
+      if (block.name === "write_file" || block.name === "write" || block.name === "edit") written.add(p);
+      else if ((block.name === "read_file" || block.name === "read") && written.has(p)) return true;
     }
   }
   return false;
@@ -250,6 +303,24 @@ export function judgeRun(task: EvalTask, run: EvalRawRun, repeat = 1): EvalResul
       }
     }
   }
+  // 阶段 14: the coding gate — the repo's own tests decide. Exit 0 passes;
+  // anything else fails with the output tail. Fully deterministic.
+  if (task.testCommand) {
+    const cwd = task.cwd ? path.resolve(task.cwd) : process.cwd();
+    try {
+      execSync(task.testCommand, {
+        cwd,
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: task.testTimeoutMs ?? 120_000,
+        windowsHide: true,
+        encoding: "utf8",
+      });
+    } catch (err) {
+      const e = err as { stdout?: string; stderr?: string; message?: string };
+      const tail = `${e.stderr ?? ""}\n${e.stdout ?? ""}\n${e.message ?? ""}`.trim().split("\n").slice(-8).join("\n");
+      return fail(`test command failed: ${task.testCommand}\n${tail.slice(0, 600)}`);
+    }
+  }
   return { ...run, repeat, pass: true };
 }
 
@@ -341,6 +412,8 @@ export interface EvalReport {
   skill: string;
   /** Promoted-skill version at eval time (阶段 12) — makes v1/v2 ledger rows comparable. */
   skillVersion?: number;
+  /** 阶段 14: toolset under test — part of the protocol identity. */
+  toolset?: string;
   repeats: number;
   /** "fresh" = baseline arm re-run now; "stored" = recorded regression baseline. */
   baselineSource: "fresh" | "stored";
@@ -358,6 +431,8 @@ export interface EvalRunOptions {
   skillName: string;
   /** Promoted-skill version, captured for ledger comparability (阶段 12). */
   skillVersion?: number;
+  /** 阶段 14: toolset under test, recorded on the report for protocol identity. */
+  toolset?: string;
   repeats?: number;
   judge?: JudgeFn;
 }
@@ -384,6 +459,7 @@ export async function runEvalComparison(taskSet: EvalTaskSet, options: EvalRunOp
     taskSet: taskSet.name,
     skill: options.skillName,
     skillVersion: options.skillVersion,
+    toolset: options.toolset,
     repeats,
     baselineSource: "fresh",
     baseline,
@@ -405,6 +481,7 @@ export async function runEvalAgainstBaseline(
     taskSet: taskSet.name,
     skill: options.skillName,
     skillVersion: options.skillVersion,
+    toolset: options.toolset,
     repeats,
     baselineSource: "stored",
     baseline: options.stored.arm,
@@ -446,6 +523,8 @@ export function renderEvalReport(report: EvalReport): string {
 
 export interface DefaultRunnerOptions {
   database?: string;
+  /** 阶段 14: toolset for the runs — "coding" exercises the pi coding tools. */
+  toolset?: "demo" | "coding";
 }
 
 function lastAssistantText(messages: readonly AgentMessage[]): string | undefined {
@@ -479,6 +558,7 @@ export function defaultEvalRunner(modelSpec: string, options: DefaultRunnerOptio
         database: options.database,
         reporter: { onEvent: () => {} },
         skills,
+        tools: options.toolset,
       });
       const toolCalls = result.messages.filter((m) => m.role === "toolResult").length;
       return {

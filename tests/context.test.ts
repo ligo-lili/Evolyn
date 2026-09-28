@@ -1,4 +1,3 @@
-import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { AssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
 import type { StreamFn, TranscriptContext } from "@earendil-works/pi-agent-core";
@@ -18,13 +17,21 @@ describe("context assembler (阶段 8)", () => {
   it("assembles deterministically: base → skills → experiences, byte-identical for equal inputs", () => {
     const sections = {
       base: "BASE",
-      skills: renderSkillBlock([{ name: "demo-skill", description: "does demo things", location: "/skills/demo/SKILL.md" }]),
-      experiences: renderExperienceBlock([{ summaryZh: "先读后写", approach: "read then write", pitfalls: "不要盲目覆盖" }]),
+      skills: renderSkillBlock([
+        { name: "demo-skill", description: "does demo things", location: "/skills/demo/SKILL.md" },
+      ]),
+      experiences: renderExperienceBlock([
+        { summaryZh: "先读后写", approach: "read then write", pitfalls: "不要盲目覆盖" },
+      ]),
     };
     expect(assembleSystemPrompt(sections)).toBe(assembleSystemPrompt({ ...sections }));
     expect(assembleSystemPrompt(sections)).toContain("BASE");
-    expect(assembleSystemPrompt(sections).indexOf("BASE")).toBeLessThan(assembleSystemPrompt(sections).indexOf("<available_skills>"));
-    expect(assembleSystemPrompt(sections).indexOf("<available_skills>")).toBeLessThan(assembleSystemPrompt(sections).indexOf("<relevant_experience>"));
+    expect(assembleSystemPrompt(sections).indexOf("BASE")).toBeLessThan(
+      assembleSystemPrompt(sections).indexOf("<available_skills>"),
+    );
+    expect(assembleSystemPrompt(sections).indexOf("<available_skills>")).toBeLessThan(
+      assembleSystemPrompt(sections).indexOf("<relevant_experience>"),
+    );
   });
 
   it("renders empty blocks as empty strings and falls back to the default base", () => {
@@ -52,8 +59,16 @@ describe("context compaction (阶段 8)", () => {
       const stream = new AssistantMessageEventStream();
       stream.push({ type: "start", partial: message });
       message.content.forEach((block, ci) => {
-        if (block.type === "text") stream.push({ type: "text_start", contentIndex: ci, partial: message }, { type: "text_end", contentIndex: ci, partial: message });
-        if (block.type === "toolCall") stream.push({ type: "toolcall_start", contentIndex: ci, partial: message }, { type: "toolcall_end", contentIndex: ci, toolCall: block, partial: message });
+        if (block.type === "text")
+          stream.push(
+            { type: "text_start", contentIndex: ci, partial: message },
+            { type: "text_end", contentIndex: ci, partial: message },
+          );
+        if (block.type === "toolCall")
+          stream.push(
+            { type: "toolcall_start", contentIndex: ci, partial: message },
+            { type: "toolcall_end", contentIndex: ci, toolCall: block, partial: message },
+          );
       });
       stream.push({ type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message });
       return stream;
@@ -113,7 +128,8 @@ describe("context compaction (阶段 8)", () => {
     });
 
     const big = "y".repeat(800);
-    const m = (role: string, content: unknown) => ({ role, content, timestamp: Date.now() }) as never as import("@earendil-works/pi-agent-core").AgentMessage;
+    const m = (role: string, content: unknown) =>
+      ({ role, content, timestamp: Date.now() }) as never as import("@earendil-works/pi-agent-core").AgentMessage;
     const msgs1 = [
       m("system", "sys"),
       m("user", "task"),
@@ -139,14 +155,29 @@ describe("context compaction (阶段 8)", () => {
   it("tidy condenses old tool results but keeps the current turn verbatim", async () => {
     const { tidyToolResults } = await import("../src/context/compaction.js");
     const big = "z".repeat(800);
-    const m = (role: string, content: unknown) => ({ role, content, timestamp: Date.now() }) as never as import("@earendil-works/pi-agent-core").AgentMessage;
+    const m = (role: string, content: unknown) =>
+      ({ role, content, timestamp: Date.now() }) as never as import("@earendil-works/pi-agent-core").AgentMessage;
     const messages = [
       m("system", "sys"),
       m("user", "turn1"),
       m("assistant", [{ type: "text", text: "x" }]),
-      { role: "toolResult", toolCallId: "old", toolName: "exec", content: [{ type: "text", text: big }], isError: false, timestamp: 1 } as never as import("@earendil-works/pi-agent-core").AgentMessage,
+      {
+        role: "toolResult",
+        toolCallId: "old",
+        toolName: "exec",
+        content: [{ type: "text", text: big }],
+        isError: false,
+        timestamp: 1,
+      } as never as import("@earendil-works/pi-agent-core").AgentMessage,
       m("user", "turn2"),
-      { role: "toolResult", toolCallId: "new", toolName: "exec", content: [{ type: "text", text: big }], isError: false, timestamp: 2 } as never as import("@earendil-works/pi-agent-core").AgentMessage,
+      {
+        role: "toolResult",
+        toolCallId: "new",
+        toolName: "exec",
+        content: [{ type: "text", text: big }],
+        isError: false,
+        timestamp: 2,
+      } as never as import("@earendil-works/pi-agent-core").AgentMessage,
     ];
     const tidied = tidyToolResults(messages, { keepChars: 100, evidenceBase: ".harness/evidence/run-1" });
     const oldText = JSON.stringify(tidied[3]);
@@ -158,7 +189,10 @@ describe("context compaction (阶段 8)", () => {
   });
 });
 
-function assistantMsg(content: AssistantMessage["content"], stopReason: "toolUse" | "stop" = "toolUse"): AssistantMessage {
+function assistantMsg(
+  content: AssistantMessage["content"],
+  stopReason: "toolUse" | "stop" = "toolUse",
+): AssistantMessage {
   return {
     role: "assistant",
     content,
@@ -166,7 +200,14 @@ function assistantMsg(content: AssistantMessage["content"], stopReason: "toolUse
     provider: FAKE_MODEL.provider,
     model: FAKE_MODEL.id,
     // Large usage so the compaction threshold triggers deterministically.
-    usage: { input: 300, output: 100, cacheRead: 0, cacheWrite: 0, totalTokens: 400, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    usage: {
+      input: 300,
+      output: 100,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 400,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
     stopReason,
     timestamp: Date.now(),
   };

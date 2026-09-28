@@ -43,7 +43,8 @@ export function promoteCandidate(candidateId: string, options: PromoteOptions = 
   try {
     const repo = new SkillCandidateRepo(db);
     const candidate = repo.get(candidateId);
-    if (!candidate) throw new HarnessError(`candidate "${candidateId}" not found — run \`skill draft <patternId>\` first`);
+    if (!candidate)
+      throw new HarnessError(`candidate "${candidateId}" not found — run \`skill draft <patternId>\` first`);
     if (candidate.status === "promoted") throw new HarnessError(`candidate "${candidateId}" is already promoted`);
     if (candidate.status === "rejected") throw new HarnessError(`candidate "${candidateId}" was rejected`);
 
@@ -65,7 +66,9 @@ export function promoteCandidate(candidateId: string, options: PromoteOptions = 
           );
         }
       } else {
-        process.stderr.write(`[skills] warning: no valid eval report for "${doc.name}" — promoting without eval evidence\n`);
+        process.stderr.write(
+          `[skills] warning: no valid eval report for "${doc.name}" — promoting without eval evidence\n`,
+        );
       }
     }
 
@@ -91,7 +94,8 @@ export function promoteCandidate(candidateId: string, options: PromoteOptions = 
     const ownPath = (p?: string) => !p || p.replace(/\\/g, "/").includes(doc.name);
     const ownErrors = verification.diagnostics.filter((d) => d.type === "error" && ownPath(d.path));
     if (ownErrors.length > 0 || !verification.skills.some((s) => s.name === doc.name)) {
-      const detail = ownErrors.map((d) => `${d.type}: ${d.message}`).join("; ") || "skill not discovered by loadSkillsFromDir";
+      const detail =
+        ownErrors.map((d) => `${d.type}: ${d.message}`).join("; ") || "skill not discovered by loadSkillsFromDir";
       try {
         if (previousRaw !== undefined) fs.writeFileSync(skillMdPath, previousRaw, "utf8");
         else fs.rmSync(dirPath, { recursive: true, force: true });

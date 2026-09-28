@@ -26,7 +26,10 @@ export interface SkillEntry {
 export function renderSkillBlock(skills: readonly SkillEntry[]): string {
   if (skills.length === 0) return "";
   const rows = skills
-    .map((s) => `  <skill><name>${s.name}</name><description>${s.description}</description><location>${s.location}</location></skill>`)
+    .map(
+      (s) =>
+        `  <skill><name>${s.name}</name><description>${s.description}</description><location>${s.location}</location></skill>`,
+    )
     .join("\n");
   return `<available_skills>\n${rows}\n</available_skills>\nWhen a task matches a skill above, read its SKILL.md (path in <location>) and follow it.`;
 }

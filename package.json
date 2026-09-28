@@ -13,7 +13,11 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
-    "harness": "node --disable-warning=ExperimentalWarning dist/cli/index.js"
+    "harness": "node --disable-warning=ExperimentalWarning dist/cli/index.js",
+    "lint": "eslint src tests",
+    "lint:fix": "eslint src tests --fix",
+    "format:check": "prettier --check src tests",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.87.1",
@@ -25,7 +29,15 @@
   },
   "devDependencies": {
     "@types/node": "^22.19.19",
+    "eslint": "^9.39.4",
+    "prettier": "^3.9.9",
     "typescript": "^5.7.0",
+    "typescript-eslint": "^8.70.1",
     "vitest": "^3.0.0"
-  }
+  },
+  "exports": {
+    "./dist/index.js": "./dist/index.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts"
 }

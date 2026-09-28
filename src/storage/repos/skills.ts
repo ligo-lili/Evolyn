@@ -60,7 +60,8 @@ export class SkillRegistry {
     const insert = this.db.prepare(
       "INSERT INTO skills (id, name, version, dir_path, source_candidate_id, status, promoted_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
     );
-    for (const r of rows) insert.run(r.id, r.name, r.version, r.dirPath, r.sourceCandidateId ?? null, r.status, r.promotedAt);
+    for (const r of rows)
+      insert.run(r.id, r.name, r.version, r.dirPath, r.sourceCandidateId ?? null, r.status, r.promotedAt);
   }
 
   getByName(name: string): SkillRow | undefined {

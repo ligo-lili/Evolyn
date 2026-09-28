@@ -1,7 +1,13 @@
 import { appendFileSync } from "node:fs";
 import type { AgentEvent } from "@earendil-works/pi-agent-core";
 import type { RunStatus } from "../runtime/run-manager.js";
-import { TRACE_SCHEMA_VERSION, type RunLifecycleEvent, type TraceEnvelope, type TraceEvent, type TraceEventPayload } from "./schema.js";
+import {
+  TRACE_SCHEMA_VERSION,
+  type RunLifecycleEvent,
+  type TraceEnvelope,
+  type TraceEvent,
+  type TraceEventPayload,
+} from "./schema.js";
 
 /** A destination for finalized trace events (envelope already attached). */
 export interface TraceSink {
@@ -52,7 +58,7 @@ export class TraceRecorder {
   /** seq of the last recorded event — checkpoint writers must lag this. */
   get lastSeq(): number {
     return this.seq;
-  };
+  }
 
   runEnd(status: RunStatus, error: string | undefined, durationMs: number): void {
     const payload: RunLifecycleEvent =

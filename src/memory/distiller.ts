@@ -5,7 +5,7 @@ import { Type } from "typebox";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import { HarnessError } from "../errors.js";
 import { completeStructured, defaultChat, type ChatFn } from "../llm/structured.js";
-import { resolveModel, getModelRegistry } from "../providers.js";
+import { resolveModel } from "../providers.js";
 import { defaultDbPath, openDatabase } from "../storage/db.js";
 import { RunRepo } from "../storage/repos/runs.js";
 import { TraceEventRepo } from "../storage/repos/trace-events.js";
@@ -97,11 +97,15 @@ export function buildDistillPrompt(digest: RunDigest, candidates: MemoryRecord[]
     finalAssistantText: digest.finalAssistantText?.slice(0, 1_000),
     toolCalls: digest.toolCalls.slice(0, 30).map((c) => ({ ...c, args: truncated(c.args) })),
   };
-  const candidateLines = candidates.map((c) => `- id: ${c.id} | taskType: ${c.taskType} | confirmations: ${c.confirmations} | ${c.summaryEn}`);
+  const candidateLines = candidates.map(
+    (c) => `- id: ${c.id} | taskType: ${c.taskType} | confirmations: ${c.confirmations} | ${c.summaryEn}`,
+  );
   return [
     "Distill this agent run into the experience JSON:",
     JSON.stringify(trimmed, null, 1),
-    candidateLines.length ? `\nEXISTING memory candidates (set updateOf if this run confirms one):\n${candidateLines.join("\n")}` : "",
+    candidateLines.length
+      ? `\nEXISTING memory candidates (set updateOf if this run confirms one):\n${candidateLines.join("\n")}`
+      : "",
   ]
     .filter(Boolean)
     .join("\n");
@@ -128,12 +132,22 @@ function normalizeOutcome(value: unknown, status: string): ExperienceDraft["outc
 }
 
 export function fallbackDraft(digest: RunDigest): ExperienceDraft {
-  const keywords = [...new Set(digest.task.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter((w) => w.length > 2))].slice(0, 8);
+  const keywords = [
+    ...new Set(
+      digest.task
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, " ")
+        .split(/\s+/)
+        .filter((w) => w.length > 2),
+    ),
+  ].slice(0, 8);
   return {
     taskType: "uncategorized",
     summaryEn: `Run ${digest.status} for task: ${digest.task}`,
     summaryZh: `任务「${digest.task}」${digest.status === "completed" ? "已完成" : "未成功完成"}。`,
-    approach: digest.toolCalls.length ? `Used tools: ${[...new Set(digest.toolCalls.map((c) => c.toolName))].join(", ")}.` : "No tool calls recorded.",
+    approach: digest.toolCalls.length
+      ? `Used tools: ${[...new Set(digest.toolCalls.map((c) => c.toolName))].join(", ")}.`
+      : "No tool calls recorded.",
     pitfalls: digest.error ? `Failed with: ${digest.error}` : "None recorded.",
     outcome: normalizeOutcome(undefined, digest.status),
     keywordsEn: keywords,
@@ -156,8 +170,14 @@ export function parseExperienceDraftStrict(raw: string, digest: RunDigest): Expe
   if (start === -1 || end <= start) throw new Error("no JSON object found in response");
   const parsed = JSON.parse(raw.slice(start, end + 1)) as Record<string, unknown>;
   const keywords = Array.isArray(parsed.keywordsEn)
-    ? parsed.keywordsEn.map((k) => String(k)).filter(Boolean).slice(0, 8)
-    : String(parsed.keywordsEn ?? "").split(/[,\s]+/).filter(Boolean).slice(0, 8);
+    ? parsed.keywordsEn
+        .map((k) => String(k))
+        .filter(Boolean)
+        .slice(0, 8)
+    : String(parsed.keywordsEn ?? "")
+        .split(/[,\s]+/)
+        .filter(Boolean)
+        .slice(0, 8);
   return {
     updateOf: typeof parsed.updateOf === "string" && parsed.updateOf.trim() ? parsed.updateOf.trim() : undefined,
     taskType: slugify(parsed.taskType, "uncategorized"),
@@ -256,7 +276,9 @@ export async function distillRunById(runId: string, options: DistillOptions = {}
     } catch (err) {
       // Last-resort fallback (阶段 9.8): even the structured pipeline failed —
       // store a naive record rather than losing the run's experience entirely.
-      process.stderr.write(`[memory] structured distillation failed (${err instanceof Error ? err.message : err}); using naive draft\n`);
+      process.stderr.write(
+        `[memory] structured distillation failed (${err instanceof Error ? err.message : err}); using naive draft\n`,
+      );
       draft = fallbackDraft(digest);
     }
 

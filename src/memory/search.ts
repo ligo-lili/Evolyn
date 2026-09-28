@@ -64,7 +64,9 @@ export class MemorySearchIndex {
       );
     this.db.prepare("DELETE FROM experiences_fts WHERE exp_id = ?").run(record.id);
     this.db
-      .prepare("INSERT INTO experiences_fts (exp_id, summary_en, approach, pitfalls, keywords_en) VALUES (?, ?, ?, ?, ?)")
+      .prepare(
+        "INSERT INTO experiences_fts (exp_id, summary_en, approach, pitfalls, keywords_en) VALUES (?, ?, ?, ?, ?)",
+      )
       .run(record.id, record.summaryEn, record.approach, record.pitfalls, record.keywordsEn.join(" "));
   }
 

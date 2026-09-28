@@ -40,7 +40,8 @@ export class PatternRepo {
       "INSERT INTO patterns (id, kind, signature, support, trace_refs_json, replay_safety, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
     );
     const now = new Date().toISOString();
-    for (const d of drafts) insert.run(d.id, d.kind, d.signature, d.support, JSON.stringify(d.traceRefs), d.replaySafety ?? "unknown", now);
+    for (const d of drafts)
+      insert.run(d.id, d.kind, d.signature, d.support, JSON.stringify(d.traceRefs), d.replaySafety ?? "unknown", now);
     return drafts.length;
   }
 

@@ -27,16 +27,13 @@ export class CheckpointRepo {
   }
 
   latest(runId: string): CheckpointRow | undefined {
-    const row = this.db
-      .prepare("SELECT * FROM checkpoints WHERE run_id = ? ORDER BY seq DESC LIMIT 1")
-      .get(runId) as Row | undefined;
+    const row = this.db.prepare("SELECT * FROM checkpoints WHERE run_id = ? ORDER BY seq DESC LIMIT 1").get(runId) as
+      Row | undefined;
     return row ? rowToCheckpoint(row) : undefined;
   }
 
   list(runId: string): CheckpointRow[] {
-    const rows = this.db
-      .prepare("SELECT * FROM checkpoints WHERE run_id = ? ORDER BY seq")
-      .all(runId) as Row[];
+    const rows = this.db.prepare("SELECT * FROM checkpoints WHERE run_id = ? ORDER BY seq").all(runId) as Row[];
     return rows.map(rowToCheckpoint);
   }
 }

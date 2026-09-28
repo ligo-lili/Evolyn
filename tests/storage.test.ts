@@ -20,7 +20,14 @@ afterAll(() => tmp.leave());
 function writeHelloSteps(): AssistantMessage[] {
   return [
     assistantMessage(
-      [{ type: "toolCall", id: "call_1", name: "write_file", arguments: { path: "out/hello.txt", content: "hello harness" } }],
+      [
+        {
+          type: "toolCall",
+          id: "call_1",
+          name: "write_file",
+          arguments: { path: "out/hello.txt", content: "hello harness" },
+        },
+      ],
       "toolUse",
     ),
     assistantMessage([{ type: "text", text: "done: wrote out/hello.txt" }], "stop"),

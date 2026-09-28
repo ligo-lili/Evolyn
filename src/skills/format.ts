@@ -31,7 +31,8 @@ export function validateSkillName(name: string, source = "skill"): string {
 export function validateSkillDescription(description: string, source = "skill"): string {
   const trimmed = description.trim();
   if (!trimmed) throw new Error(`${source}: description is required`);
-  if (trimmed.length > SKILL_DESCRIPTION_MAX) throw new Error(`${source}: description exceeds ${SKILL_DESCRIPTION_MAX} chars`);
+  if (trimmed.length > SKILL_DESCRIPTION_MAX)
+    throw new Error(`${source}: description exceeds ${SKILL_DESCRIPTION_MAX} chars`);
   return trimmed;
 }
 

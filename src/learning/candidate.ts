@@ -31,7 +31,9 @@ export interface SkillDraft {
 export const SKILL_DRAFT_SCHEMA = Type.Object({
   name: Type.String({ description: "skill name: lowercase slug [a-z0-9-], <=64 chars, e.g. note-file-workflow" }),
   description: Type.String({ description: `what the skill does and when to use it, <=${SKILL_DESCRIPTION_MAX} chars` }),
-  body: Type.String({ description: "markdown instructions: step-by-step approach, which tools in which order, pitfalls to avoid" }),
+  body: Type.String({
+    description: "markdown instructions: step-by-step approach, which tools in which order, pitfalls to avoid",
+  }),
 });
 
 export const CANDIDATE_SYSTEM_PROMPT =
@@ -43,7 +45,7 @@ export const CANDIDATE_SYSTEM_PROMPT =
   "Base the skill ONLY on what the runs show — do not invent capabilities. " +
   "Keep the body under 40 lines: it is injected into future prompts, and every token costs. " +
   "Output ONLY strict JSON (no markdown fences, no commentary) with exactly these keys: " +
-  'name (lowercase slug [a-z0-9-], <=64 chars), ' +
+  "name (lowercase slug [a-z0-9-], <=64 chars), " +
   "description (what the skill does and when to use it), " +
   "body (markdown instructions).";
 
@@ -57,14 +59,16 @@ function slugify(value: string, fallback: string): string {
 }
 
 /** Tolerant normalization: slug the name, trim/truncate the description; throw only on empty fields. */
-export function parseSkillDraftStrict(raw: string, source = "candidate draft"): SkillDraft {
+export function parseSkillDraftStrict(raw: string): SkillDraft {
   const start = raw.indexOf("{");
   const end = raw.lastIndexOf("}");
   if (start === -1 || end <= start) throw new Error("no JSON object found in response");
   const parsed = JSON.parse(raw.slice(start, end + 1)) as Record<string, unknown>;
   const name = slugify(String(parsed.name ?? ""), "");
   if (!name) throw new Error("name is missing or not sluggable");
-  const description = String(parsed.description ?? "").trim().slice(0, SKILL_DESCRIPTION_MAX);
+  const description = String(parsed.description ?? "")
+    .trim()
+    .slice(0, SKILL_DESCRIPTION_MAX);
   if (!description) throw new Error("description is missing");
   const body = String(parsed.body ?? "").trim();
   if (!body) throw new Error("body is missing");
@@ -191,7 +195,9 @@ export async function draftSkillFromPattern(patternKey: string, options: DraftOp
       patternSignature: pattern.signature,
       support: pattern.support,
       runIds: pattern.traceRefs,
-      model: options.complete ? "injected" : (options.modelSpec ?? process.env.HARNESS_DISTILL_MODEL ?? "deepseek/deepseek-flash"),
+      model: options.complete
+        ? "injected"
+        : (options.modelSpec ?? process.env.HARNESS_DISTILL_MODEL ?? "deepseek/deepseek-flash"),
       method,
       distilledAt: new Date().toISOString(),
     };

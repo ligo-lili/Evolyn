@@ -30,8 +30,20 @@ export type RunLifecycleEvent =
  */
 export type HarnessAuditEvent =
   | { type: "permission"; toolName: string; decision: "allow" | "deny"; risk: RiskClass; reason?: string }
-  | { type: "recovery_action"; toolCallId: string; toolName: string; action: "reexecute" | "rebuild_result" | "synthesize_error"; error?: string }
-  | { type: "compaction"; trigger: "threshold" | "rolling"; tokensBefore: number; summaryChars: number; cutIndex: number }
+  | {
+      type: "recovery_action";
+      toolCallId: string;
+      toolName: string;
+      action: "reexecute" | "rebuild_result" | "synthesize_error";
+      error?: string;
+    }
+  | {
+      type: "compaction";
+      trigger: "threshold" | "rolling";
+      tokensBefore: number;
+      summaryChars: number;
+      cutIndex: number;
+    }
   | { type: "tool_retry"; toolCallId: string; toolName: string; attempt: number; error: string }
   | { type: "limit_exceeded"; kind: "turns" | "tool_calls" | "repeat" | "cost" | "consecutive_errors"; reason: string };
 

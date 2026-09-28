@@ -13,7 +13,12 @@ import { TraceEventRepo } from "../storage/repos/trace-events.js";
 import { CheckpointRepo } from "../storage/repos/checkpoints.js";
 import { CheckpointWriter } from "../execution/checkpoint.js";
 import { loadCrashedRun, planRecovery, toolResultMessage } from "../execution/recovery.js";
-import { assembleSystemPrompt, renderExperienceBlock, renderSkillBlock, renderWorkspaceBlock } from "../context/assembler.js";
+import {
+  assembleSystemPrompt,
+  renderExperienceBlock,
+  renderSkillBlock,
+  renderWorkspaceBlock,
+} from "../context/assembler.js";
 import { buildWorkspaceTree } from "../context/workspace.js";
 import { SkillIndex, toAssemblerEntries } from "../skills/retrieve.js";
 import { createContextTransformer } from "../context/compaction.js";
@@ -26,7 +31,13 @@ import { MemoryStore } from "../memory/store.js";
 import { withEvidenceCapture } from "./tools/evidence.js";
 import { TraceRecorder, JsonlTraceSink, type TraceSink } from "../trace/recorder.js";
 import { reconcileJsonlTrace } from "../trace/reconcile.js";
-import { applyFaultToTools, FaultController, formatFaultSpec, parseFaultSpec, type FaultSpec } from "../execution/fault.js";
+import {
+  applyFaultToTools,
+  FaultController,
+  formatFaultSpec,
+  parseFaultSpec,
+  type FaultSpec,
+} from "../execution/fault.js";
 import { createPermissionGate, type ApprovalOptions } from "./approval.js";
 import { ALL_CAPABILITIES } from "./permissions.js";
 import { harnessDataDir } from "./paths.js";
@@ -90,9 +101,16 @@ function composeRuntime(input: {
   approval: ApprovalOptions | undefined;
   audit: (event: HarnessAuditEvent) => void;
   onLimitViolation: (violation: LimitViolation) => void;
-}): { tools: AnyAgentTool[]; beforeToolCall: NonNullable<AgentOptions["beforeToolCall"]>; limitEnforcer: LimitEnforcer } {
+}): {
+  tools: AnyAgentTool[];
+  beforeToolCall: NonNullable<AgentOptions["beforeToolCall"]>;
+  limitEnforcer: LimitEnforcer;
+} {
   const tools = withRetry(
-    withToolTimeout(withEvidenceCapture(applyFaultToTools(input.tools, input.faultSpec), input.evidenceDir), input.limits.toolTimeoutMs),
+    withToolTimeout(
+      withEvidenceCapture(applyFaultToTools(input.tools, input.faultSpec), input.evidenceDir),
+      input.limits.toolTimeoutMs,
+    ),
     { policy: input.retryPolicy, audit: input.audit },
   );
   const permissionGate = createPermissionGate(input.approval, input.audit);
@@ -233,7 +251,8 @@ export class RunManager {
 
   async run(options: RunOptions): Promise<RunResult> {
     const faultSpec = parseFaultSpec(options.fault); // validates before anything is written
-    const basePrompt = options.systemPrompt ?? (options.tools === "coding" ? CODING_SYSTEM_PROMPT : DEFAULT_SYSTEM_PROMPT);
+    const basePrompt =
+      options.systemPrompt ?? (options.tools === "coding" ? CODING_SYSTEM_PROMPT : DEFAULT_SYSTEM_PROMPT);
     const record: RunRecord = {
       id: randomUUID(),
       task: options.task,
@@ -265,7 +284,9 @@ export class RunManager {
     if (database && options.skills !== false) {
       const index = new SkillIndex(database);
       const only = options.skills?.only;
-      const hits = only?.length ? index.getByName(only) : index.search(options.task, options.skills?.limit ?? DEFAULT_SKILL_LIMIT);
+      const hits = only?.length
+        ? index.getByName(only)
+        : index.search(options.task, options.skills?.limit ?? DEFAULT_SKILL_LIMIT);
       if (hits.length > 0) skillBlock = renderSkillBlock(toAssemblerEntries(hits, process.cwd()));
     }
     const systemPrompt = assembleSystemPrompt({
@@ -292,7 +313,12 @@ export class RunManager {
       const sinks: TraceSink[] = [new JsonlTraceSink(traceFile)];
       if (database) sinks.push(new TraceEventRepo(database));
       recorder = new TraceRecorder(record.id, sinks);
-      recorder.runStart(record.task, record.modelSpec, faultSpec ? formatFaultSpec(faultSpec) : undefined, grantedCapabilities);
+      recorder.runStart(
+        record.task,
+        record.modelSpec,
+        faultSpec ? formatFaultSpec(faultSpec) : undefined,
+        grantedCapabilities,
+      );
     }
 
     const composed = composeRuntime({
@@ -331,7 +357,9 @@ export class RunManager {
     const faultController = faultSpec ? new FaultController(faultSpec) : undefined;
     // Checkpoint AFTER the trace sinks: a checkpoint may lag the log but never lead it.
     const checkpointWriter =
-      database && recorder ? new CheckpointWriter(new CheckpointRepo(database), record.id, () => recorder.lastSeq) : undefined;
+      database && recorder
+        ? new CheckpointWriter(new CheckpointRepo(database), record.id, () => recorder.lastSeq)
+        : undefined;
     const reporter = options.reporter ?? new ConsoleReporter();
     const dispatch = (event: AgentEvent): void => {
       reporter.onEvent(event);
@@ -461,8 +489,18 @@ export class RunManager {
     for (const call of crashed.unresolved) {
       const action = planRecovery(call);
       if (action.kind === "synthesize_error" || !call.tool) {
-        const reason = call.tool ? action.kind === "synthesize_error" ? action.reason : "" : `tool "${call.toolName}" is not registered in this session`;
-        recorder.record({ type: "recovery_action", toolCallId: call.toolCallId, toolName: call.toolName, action: "synthesize_error", error: reason || undefined });
+        const reason = call.tool
+          ? action.kind === "synthesize_error"
+            ? action.reason
+            : ""
+          : `tool "${call.toolName}" is not registered in this session`;
+        recorder.record({
+          type: "recovery_action",
+          toolCallId: call.toolCallId,
+          toolName: call.toolName,
+          action: "synthesize_error",
+          error: reason || undefined,
+        });
         synthetic.push(toolResultMessage(call.toolCallId, call.toolName, [{ type: "text", text: reason }], true));
         continue;
       }
@@ -481,11 +519,18 @@ export class RunManager {
       // reexecute: the execution genuinely happens now — record it as such, and
       // put it through the SAME gates as a live call (limits → permission).
       const limitResult = composed.limitEnforcer.beforeToolCall(call.toolName, call.args);
-      const gateDecision = limitResult ?? (await composed.beforeToolCall({
-            toolCall: { id: call.toolCallId, name: call.toolName },
-            args: call.args,
-          } as unknown as Parameters<typeof composed.beforeToolCall>[0]));
-      recorder.onEvent({ type: "tool_execution_start", toolCallId: call.toolCallId, toolName: call.toolName, args: call.args });
+      const gateDecision =
+        limitResult ??
+        (await composed.beforeToolCall({
+          toolCall: { id: call.toolCallId, name: call.toolName },
+          args: call.args,
+        } as unknown as Parameters<typeof composed.beforeToolCall>[0]));
+      recorder.onEvent({
+        type: "tool_execution_start",
+        toolCallId: call.toolCallId,
+        toolName: call.toolName,
+        args: call.args,
+      });
       if (gateDecision && gateDecision.block) {
         const reason = gateDecision.reason ?? "blocked before execution";
         recorder.onEvent({
@@ -595,7 +640,9 @@ export class RunManager {
       try {
         runRepo.updateStatus(record);
       } catch (err) {
-        process.stderr.write(`[harness] failed to persist resumed run status: ${err instanceof Error ? err.message : err}\n`);
+        process.stderr.write(
+          `[harness] failed to persist resumed run status: ${err instanceof Error ? err.message : err}\n`,
+        );
       }
     }
 

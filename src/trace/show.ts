@@ -75,13 +75,17 @@ export function renderTimeline(parsed: ParsedTrace, options: { all?: boolean } =
         lines.push(`  ${stamp(ev)}  exec_done ${ev.toolName}${ev.isError ? " (ERROR)" : ""}`);
         continue;
       case "permission":
-        lines.push(`  ${stamp(ev)}  permission ${ev.decision} ${ev.risk} ${ev.toolName}${ev.reason ? ` (${ev.reason})` : ""}`);
+        lines.push(
+          `  ${stamp(ev)}  permission ${ev.decision} ${ev.risk} ${ev.toolName}${ev.reason ? ` (${ev.reason})` : ""}`,
+        );
         continue;
       case "recovery_action":
         lines.push(`  ${stamp(ev)}  recovery ${ev.action} ${ev.toolName}${ev.error ? ` "${clip(ev.error, 80)}"` : ""}`);
         continue;
       case "compaction":
-        lines.push(`  ${stamp(ev)}  compaction (${ev.trigger}) tokens=${ev.tokensBefore} cut=@${ev.cutIndex} summary=${ev.summaryChars} chars`);
+        lines.push(
+          `  ${stamp(ev)}  compaction (${ev.trigger}) tokens=${ev.tokensBefore} cut=@${ev.cutIndex} summary=${ev.summaryChars} chars`,
+        );
         continue;
       default:
         if (options.all) lines.push(`  ${stamp(ev)}  ${ev.type}`);
@@ -103,8 +107,12 @@ export function renderSummary(s: TraceSummary): string {
     lines.push(`  tool ${t.toolName}: ${t.calls} call(s)${t.errors ? `, ${t.errors} error(s)` : ""}`);
   }
   if (s.toolCalls.length === 0) lines.push("  tools: (none)");
-  lines.push(`  tokens: in=${s.tokens.input} out=${s.tokens.output} total=${s.tokens.total} cost=$${s.tokens.cost.toFixed(4)}`);
-  lines.push(`  errors: ${s.errorCount}  permission denials: ${s.permissionDenials}  recovery actions: ${s.recoveryActions}`);
+  lines.push(
+    `  tokens: in=${s.tokens.input} out=${s.tokens.output} total=${s.tokens.total} cost=$${s.tokens.cost.toFixed(4)}`,
+  );
+  lines.push(
+    `  errors: ${s.errorCount}  permission denials: ${s.permissionDenials}  recovery actions: ${s.recoveryActions}`,
+  );
   return lines.join("\n");
 }
 
@@ -127,7 +135,8 @@ export function renderReplay(state: ReplayState, why: string[]): string {
     if (m.role === "assistant") {
       const calls = m.content.filter((b) => b.type === "toolCall");
       lines.push(`    #${seq} assistant: ${clip(text) || "(tool call only)"}`);
-      for (const c of calls) if (c.type === "toolCall") lines.push(`    #${seq}   → ${c.name} ${clip(JSON.stringify(c.arguments), 100)}`);
+      for (const c of calls)
+        if (c.type === "toolCall") lines.push(`    #${seq}   → ${c.name} ${clip(JSON.stringify(c.arguments), 100)}`);
     } else if (m.role === "toolResult") {
       lines.push(`    #${seq} toolResult [${m.toolName}]${m.isError ? " (ERROR)" : ""}: ${clip(text, 120)}`);
     } else if (m.role === "user") {

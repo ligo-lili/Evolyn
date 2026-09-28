@@ -11,7 +11,14 @@ import {
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 
 export const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-export const USAGE: Usage = { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { ...ZERO_COST } };
+export const USAGE: Usage = {
+  input: 10,
+  output: 5,
+  cacheRead: 0,
+  cacheWrite: 0,
+  totalTokens: 15,
+  cost: { ...ZERO_COST },
+};
 
 export const FAKE_MODEL: Model<"openai-completions"> = {
   id: "fake-model",

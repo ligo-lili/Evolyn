@@ -74,7 +74,10 @@ export class LimitEnforcer {
       return deny("tool_calls", `tool-call budget exhausted (${this.limits.maxToolCalls} calls)`);
     }
     if (this.costUsd > this.limits.maxCostUsd) {
-      return deny("cost", `cost budget exhausted ($${this.costUsd.toFixed(4)} > $${this.limits.maxCostUsd.toFixed(4)})`);
+      return deny(
+        "cost",
+        `cost budget exhausted ($${this.costUsd.toFixed(4)} > $${this.limits.maxCostUsd.toFixed(4)})`,
+      );
     }
     if (this.consecutiveErrors >= 5) {
       return deny("consecutive_errors", `${this.consecutiveErrors} consecutive tool failures — degrading`);
@@ -83,7 +86,10 @@ export class LimitEnforcer {
     const repeats = (this.callHashes.get(hash) ?? 0) + 1;
     this.callHashes.set(hash, repeats);
     if (repeats > this.limits.maxRepeatedToolCalls) {
-      return deny("repeat", `tool ${toolName} called with identical arguments ${repeats} times (limit ${this.limits.maxRepeatedToolCalls})`);
+      return deny(
+        "repeat",
+        `tool ${toolName} called with identical arguments ${repeats} times (limit ${this.limits.maxRepeatedToolCalls})`,
+      );
     }
     return undefined;
   }

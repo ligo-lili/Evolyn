@@ -1,4 +1,11 @@
-import { createProvider, envApiKeyAuth, type Api, type Model, type MutableModels, type Provider } from "@earendil-works/pi-ai";
+import {
+  createProvider,
+  envApiKeyAuth,
+  type Api,
+  type Model,
+  type MutableModels,
+  type Provider,
+} from "@earendil-works/pi-ai";
 import { builtinModels } from "@earendil-works/pi-ai/providers/all";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
 import { HarnessError } from "./errors.js";
@@ -85,11 +92,19 @@ export function resolveModel(spec: string): Model<Api> {
       .getModels(provider)
       .map((m) => `${provider}/${m.id}`)
       .join(", ");
-    throw new HarnessError(`unknown model "${spec}"${available ? ` (available: ${available})` : ` (unknown provider "${provider}")`}`);
+    throw new HarnessError(
+      `unknown model "${spec}"${available ? ` (available: ${available})` : ` (unknown provider "${provider}")`}`,
+    );
   }
   return model;
 }
 
 export function listProviderIds(): string[] {
-  return [...new Set(getModelRegistry().getModels().map((m) => m.provider))].sort();
+  return [
+    ...new Set(
+      getModelRegistry()
+        .getModels()
+        .map((m) => m.provider),
+    ),
+  ].sort();
 }

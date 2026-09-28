@@ -119,7 +119,13 @@ function rowToBaseline(r: Row): EvalBaselineRow {
 export class EvalBaselineRepo {
   constructor(private readonly db: DatabaseSync) {}
 
-  record(input: { evalSet: string; modelSpec: string; toolset?: string; repeats: number; arm: EvalArmResult }): EvalBaselineRow {
+  record(input: {
+    evalSet: string;
+    modelSpec: string;
+    toolset?: string;
+    repeats: number;
+    arm: EvalArmResult;
+  }): EvalBaselineRow {
     const row: EvalBaselineRow = {
       id: randomUUID(),
       evalSet: input.evalSet,
@@ -130,8 +136,18 @@ export class EvalBaselineRepo {
       recordedAt: new Date().toISOString(),
     };
     this.db
-      .prepare("INSERT INTO eval_baselines (id, eval_set, model_spec, toolset, repeats, arm_json, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .run(row.id, row.evalSet, row.modelSpec, row.toolset ?? null, row.repeats, JSON.stringify(row.arm), row.recordedAt);
+      .prepare(
+        "INSERT INTO eval_baselines (id, eval_set, model_spec, toolset, repeats, arm_json, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        row.id,
+        row.evalSet,
+        row.modelSpec,
+        row.toolset ?? null,
+        row.repeats,
+        JSON.stringify(row.arm),
+        row.recordedAt,
+      );
     return row;
   }
 

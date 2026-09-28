@@ -69,16 +69,37 @@ describe("hybrid memory recall (阶段 9.6)", () => {
     {
       const db = openDatabase(dbPath);
       try {
-        new RunRepo(db).insert({ id: "seed", task: "seed", modelSpec: "test/fake-model", status: "completed", startedAt: new Date().toISOString() });
+        new RunRepo(db).insert({
+          id: "seed",
+          task: "seed",
+          modelSpec: "test/fake-model",
+          status: "completed",
+          startedAt: new Date().toISOString(),
+        });
         const store = new MemoryStore(path.join(path.dirname(dbPath), "memory"));
         const index = new MemorySearchIndex(db);
 
         // "diamond" lives only in C's approach — lexically findable; the fake
         // embedder instead keys on exact passage text, so vectors are arbitrary
         // w.r.t. the words (worst case for lexical, fully controlled for us).
-        const a = mkRecord({ id: "apple-mem", summaryEn: "apple zebra notes", keywordsEn: ["apple", "zebra"], approach: "apple handling" });
-        const b = mkRecord({ id: "banana-mem", summaryEn: "banana zebra notes", keywordsEn: ["banana", "zebra"], approach: "banana handling" });
-        const c = mkRecord({ id: "cherry-mem", summaryEn: "citrus zebra notes", keywordsEn: ["citrus", "zebra"], approach: "polish the diamond" });
+        const a = mkRecord({
+          id: "apple-mem",
+          summaryEn: "apple zebra notes",
+          keywordsEn: ["apple", "zebra"],
+          approach: "apple handling",
+        });
+        const b = mkRecord({
+          id: "banana-mem",
+          summaryEn: "banana zebra notes",
+          keywordsEn: ["banana", "zebra"],
+          approach: "banana handling",
+        });
+        const c = mkRecord({
+          id: "cherry-mem",
+          summaryEn: "citrus zebra notes",
+          keywordsEn: ["citrus", "zebra"],
+          approach: "polish the diamond",
+        });
         for (const r of [a, b, c]) {
           store.save(r);
           index.syncRecord(r);
@@ -108,7 +129,10 @@ describe("hybrid memory recall (阶段 9.6)", () => {
         const lexical = "apple zebra";
         const ftsIds = index2.searchFts(lexical, 25).map((r) => r.id);
         const vecRanked = ["apple-mem", "banana-mem", "cherry-mem"]; // zero query vector → stable insertion order
-        const expected = rrfCombine([ftsIds.map((id, i) => ({ id, rank: i + 1 })), vecRanked.map((id, i) => ({ id, rank: i + 1 }))])
+        const expected = rrfCombine([
+          ftsIds.map((id, i) => ({ id, rank: i + 1 })),
+          vecRanked.map((id, i) => ({ id, rank: i + 1 })),
+        ])
           .slice(0, 3)
           .map((f) => f.id);
         const embedder = exactEmbedder({ "gem query": [0, 0, 1] });
@@ -132,7 +156,13 @@ describe("hybrid memory recall (阶段 9.6)", () => {
     const dbPath = path.join(tmp.dir, "fallback", "harness.db");
     const db = openDatabase(dbPath);
     try {
-      new RunRepo(db).insert({ id: "seed", task: "seed", modelSpec: "test/fake-model", status: "completed", startedAt: new Date().toISOString() });
+      new RunRepo(db).insert({
+        id: "seed",
+        task: "seed",
+        modelSpec: "test/fake-model",
+        status: "completed",
+        startedAt: new Date().toISOString(),
+      });
       const store = new MemoryStore(path.join(path.dirname(dbPath), "memory"));
       const index = new MemorySearchIndex(db);
       const a = mkRecord({ id: "only-mem" });

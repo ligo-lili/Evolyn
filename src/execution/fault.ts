@@ -32,7 +32,11 @@ export function formatFaultSpec(fault: FaultSpec): string {
  * and no end. This is the exact state the Crash Recovery demo must handle for
  * a replay:"never" tool.
  */
-export function applyFaultToTools(tools: readonly AnyAgentTool[], fault: FaultSpec | undefined, kill: () => void = killProcess): AnyAgentTool[] {
+export function applyFaultToTools(
+  tools: readonly AnyAgentTool[],
+  fault: FaultSpec | undefined,
+  kill: () => void = killProcess,
+): AnyAgentTool[] {
   if (!fault || fault.point !== "mid_tool_execution") return [...tools];
   return tools.map((tool) => {
     if (tool.name !== fault.toolName) return tool;
@@ -58,7 +62,11 @@ export class FaultController {
   ) {}
 
   onEvent(event: AgentEvent): void {
-    if (this.spec.point === "after_tool_call" && event.type === "tool_execution_end" && event.toolName === this.spec.toolName) {
+    if (
+      this.spec.point === "after_tool_call" &&
+      event.type === "tool_execution_end" &&
+      event.toolName === this.spec.toolName
+    ) {
       this.kill();
     }
   }

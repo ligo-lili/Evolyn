@@ -6,15 +6,36 @@ import { RunRepo } from "../src/storage/repos/runs.js";
 import { TraceEventRepo } from "../src/storage/repos/trace-events.js";
 import { PatternRepo } from "../src/storage/repos/patterns.js";
 import { SkillCandidateRepo } from "../src/storage/repos/candidates.js";
-import { extractRunToolTrace, minePatterns, MIN_PATTERN_SUPPORT, minePatternsFromDb, patternId } from "../src/learning/miner.js";
+import {
+  extractRunToolTrace,
+  minePatterns,
+  MIN_PATTERN_SUPPORT,
+  minePatternsFromDb,
+  patternId,
+} from "../src/learning/miner.js";
 import { draftSkillFromPattern } from "../src/learning/candidate.js";
-import { judgeRun, loadTaskSet, readBackVerified, renderEvalReport, runEvalAgainstBaseline, runEvalArm, runEvalComparison, type EvalRunner } from "../src/learning/eval.js";
+import {
+  judgeRun,
+  loadTaskSet,
+  readBackVerified,
+  renderEvalReport,
+  runEvalAgainstBaseline,
+  runEvalArm,
+  runEvalComparison,
+  type EvalRunner,
+} from "../src/learning/eval.js";
 import { promoteCandidate } from "../src/skills/promote.js";
 import { SkillIndex } from "../src/skills/retrieve.js";
 import { verifyPromotedSkills } from "../src/skills/verify.js";
 import { parseSkillMd, serializeSkillMd, validateSkillName, SKILL_DESCRIPTION_MAX } from "../src/skills/format.js";
 import { EvalBaselineRepo, SkillEvalRepo, skillEvalRowFromReport } from "../src/storage/repos/evals.js";
-import { buildJudgePrompt, isInfraFailure, parseJudgeVerdictStrict, type EvalRawRun, type JudgeFn } from "../src/learning/eval.js";
+import {
+  buildJudgePrompt,
+  isInfraFailure,
+  parseJudgeVerdictStrict,
+  type EvalRawRun,
+  type JudgeFn,
+} from "../src/learning/eval.js";
 import { RunManager, type SkillInjection } from "../src/runtime/run-manager.js";
 import { CollectingReporter } from "../src/runtime/reporter.js";
 import { assistantMessage, FAKE_MODEL, makeTempCwd, scriptedStreamFn } from "./helpers.js";
@@ -41,17 +62,39 @@ function toolResultMessage(toolName: string, isError: boolean, text: string) {
   };
 }
 
-function appendToolResults(db: ReturnType<typeof openDatabase>, runId: string, results: ReturnType<typeof toolResultMessage>[]) {
+function appendToolResults(
+  db: ReturnType<typeof openDatabase>,
+  runId: string,
+  results: ReturnType<typeof toolResultMessage>[],
+) {
   const repo = new TraceEventRepo(db);
   for (const message of results) {
     seqCounter += 1;
-    const event = { v: 1, seq: seqCounter, ts: new Date().toISOString(), runId, type: "message_end", message } as unknown as TraceEvent;
+    const event = {
+      v: 1,
+      seq: seqCounter,
+      ts: new Date().toISOString(),
+      runId,
+      type: "message_end",
+      message,
+    } as unknown as TraceEvent;
     repo.append(event);
   }
 }
 
-function seedRun(db: ReturnType<typeof openDatabase>, runId: string, task: string, results: ReturnType<typeof toolResultMessage>[]) {
-  new RunRepo(db).insert({ id: runId, task, modelSpec: "test/fake-model", status: "completed", startedAt: new Date().toISOString() });
+function seedRun(
+  db: ReturnType<typeof openDatabase>,
+  runId: string,
+  task: string,
+  results: ReturnType<typeof toolResultMessage>[],
+) {
+  new RunRepo(db).insert({
+    id: runId,
+    task,
+    modelSpec: "test/fake-model",
+    status: "completed",
+    startedAt: new Date().toISOString(),
+  });
   appendToolResults(db, runId, results);
 }
 
@@ -83,7 +126,10 @@ describe("skill format (pi-compatible SKILL.md)", () => {
 
 describe("pattern miner (阶段 10)", () => {
   it("requires ≥3 distinct runs before a pattern exists", () => {
-    const calls = [{ toolName: "write_file", isError: false }, { toolName: "read_file", isError: false }];
+    const calls = [
+      { toolName: "write_file", isError: false },
+      { toolName: "read_file", isError: false },
+    ];
     const runs = ["r1", "r2"].map((runId) => ({ runId, task: "t", status: "completed", calls }));
     expect(minePatterns(runs)).toEqual([]);
     expect(minePatterns([...runs, { runId: "r3", task: "t", status: "completed", calls }])).toEqual([
@@ -99,11 +145,21 @@ describe("pattern miner (阶段 10)", () => {
   });
 
   it("classifies patterns by tool replay safety (阶段 12 pattern-aware idempotency)", () => {
-    const calls = (a: string, b: string) => [{ toolName: a, isError: false }, { toolName: b, isError: false }];
-    const runs = ["r1", "r2", "r3"].map((runId) => ({ runId, task: "t", status: "completed", calls: calls("send_notification", "read_file") }));
+    const calls = (a: string, b: string) => [
+      { toolName: a, isError: false },
+      { toolName: b, isError: false },
+    ];
+    const runs = ["r1", "r2", "r3"].map((runId) => ({
+      runId,
+      task: "t",
+      status: "completed",
+      calls: calls("send_notification", "read_file"),
+    }));
     const replay = { send_notification: "never", read_file: "safe", write_file: "safe" };
     const mined = minePatterns(runs, { toolReplay: replay });
-    expect(mined.map((p) => [p.signature, p.replaySafety])).toEqual([["send_notification>read_file", "contains-never"]]);
+    expect(mined.map((p) => [p.signature, p.replaySafety])).toEqual([
+      ["send_notification>read_file", "contains-never"],
+    ]);
     // without a map the classification stays unknown
     expect(minePatterns(runs)[0]?.replaySafety).toBe("unknown");
     // error-repair patterns classify the repaired tool only
@@ -149,7 +205,16 @@ describe("pattern miner (阶段 10)", () => {
       toolResultMessage("write_file", true, "ENOENT: no such directory"),
       toolResultMessage("write_file", false, "wrote"),
     ];
-    const runs = ["a", "b", "c"].map((runId) => ({ runId, task: "t", status: "completed", calls: mk().map((m) => ({ toolName: m.toolName, isError: Boolean(m.isError), errorText: m.isError ? m.content[0].text : undefined })) }));
+    const runs = ["a", "b", "c"].map((runId) => ({
+      runId,
+      task: "t",
+      status: "completed",
+      calls: mk().map((m) => ({
+        toolName: m.toolName,
+        isError: Boolean(m.isError),
+        errorText: m.isError ? m.content[0].text : undefined,
+      })),
+    }));
     const mined = minePatterns(runs);
     const repair = mined.find((p) => p.kind === "error-repair");
     expect(repair).toMatchObject({ signature: "repair:write_file", support: 3 });
@@ -158,7 +223,10 @@ describe("pattern miner (阶段 10)", () => {
   it("extracts run tool traces from message_end events (errorText captured)", () => {
     const db = openDatabase(path.join(tmp.dir, "extract", "harness.db"));
     try {
-      seedRun(db, "rx", "task with error", [toolResultMessage("write_file", true, "boom"), toolResultMessage("read_file", false, "ok")]);
+      seedRun(db, "rx", "task with error", [
+        toolResultMessage("write_file", true, "boom"),
+        toolResultMessage("read_file", false, "ok"),
+      ]);
       const runRow = new RunRepo(db).get("rx")!;
       const trace = extractRunToolTrace(runRow, new TraceEventRepo(db).getByRun("rx"));
       expect(trace.calls).toEqual([
@@ -179,11 +247,17 @@ describe("skill candidate (hard support gate + distillation)", () => {
     const db = openDatabase(dbPath);
     try {
       new PatternRepo(db).replaceAll([
-        { id: "weak-pattern", kind: "tool-sequence", signature: "write_file>read_file", support: 2, traceRefs: ["r1", "r2"] },
+        {
+          id: "weak-pattern",
+          kind: "tool-sequence",
+          signature: "write_file>read_file",
+          support: 2,
+          traceRefs: ["r1", "r2"],
+        },
       ]);
-      await expect(draftSkillFromPattern("weak-pattern", { database: dbPath, complete: async () => JSON.stringify(SKILL_JSON) })).rejects.toThrow(
-        /support 2 < 3/,
-      );
+      await expect(
+        draftSkillFromPattern("weak-pattern", { database: dbPath, complete: async () => JSON.stringify(SKILL_JSON) }),
+      ).rejects.toThrow(/support 2 < 3/);
     } finally {
       db.close();
     }
@@ -230,7 +304,10 @@ describe("skill candidate (hard support gate + distillation)", () => {
     let patternIdValue = "";
     try {
       for (const i of [0, 1, 2]) {
-        seedRun(db, `fb-${i}`, `task ${i}`, [toolResultMessage("write_file", false, "wrote"), toolResultMessage("read_file", false, "ok")]);
+        seedRun(db, `fb-${i}`, `task ${i}`, [
+          toolResultMessage("write_file", false, "wrote"),
+          toolResultMessage("read_file", false, "ok"),
+        ]);
       }
       new PatternRepo(db).replaceAll(minePatternsFromDb(db));
       patternIdValue = new PatternRepo(db).list()[0]!.id;
@@ -256,7 +333,10 @@ describe("promotion + retrieval (阶段 10)", () => {
     let patternIdValue = "";
     try {
       for (const i of [0, 1, 2]) {
-        seedRun(db, `p-${i}`, `note file task ${i}`, [toolResultMessage("write_file", false, "wrote"), toolResultMessage("read_file", false, "ok")]);
+        seedRun(db, `p-${i}`, `note file task ${i}`, [
+          toolResultMessage("write_file", false, "wrote"),
+          toolResultMessage("read_file", false, "ok"),
+        ]);
       }
       new PatternRepo(db).replaceAll(minePatternsFromDb(db));
       patternIdValue = new PatternRepo(db).list()[0]!.id;
@@ -311,7 +391,10 @@ describe("promotion + retrieval (阶段 10)", () => {
     let patternIdValue = "";
     try {
       for (const i of [0, 1, 2]) {
-        seedRun(db, `v-${i}`, `note file task ${i}`, [toolResultMessage("write_file", false, "wrote"), toolResultMessage("read_file", false, "ok")]);
+        seedRun(db, `v-${i}`, `note file task ${i}`, [
+          toolResultMessage("write_file", false, "wrote"),
+          toolResultMessage("read_file", false, "ok"),
+        ]);
       }
       new PatternRepo(db).replaceAll(minePatternsFromDb(db));
       patternIdValue = new PatternRepo(db).list()[0]!.id;
@@ -336,7 +419,10 @@ describe("promotion + retrieval (阶段 10)", () => {
     let patternIdValue = "";
     try {
       for (const i of [0, 1, 2]) {
-        seedRun(db, `g-${i}`, `note file task ${i}`, [toolResultMessage("write_file", false, "wrote"), toolResultMessage("read_file", false, "ok")]);
+        seedRun(db, `g-${i}`, `note file task ${i}`, [
+          toolResultMessage("write_file", false, "wrote"),
+          toolResultMessage("read_file", false, "ok"),
+        ]);
       }
       new PatternRepo(db).replaceAll(minePatternsFromDb(db));
       patternIdValue = new PatternRepo(db).list()[0]!.id;
@@ -365,7 +451,35 @@ describe("promotion + retrieval (阶段 10)", () => {
           baseline: { totalTokens: 0, totalDurationMs: 0, avgTokens: 0, avgDurationMs: 0 },
           treatment: { totalTokens: 0, totalDurationMs: 0, avgTokens: 0, avgDurationMs: 0 },
         },
-        report: { taskSet: "file-creation-v1", skill: SKILL_JSON.name, repeats: 3, baselineSource: "fresh", valid: true, verdict: "baseline-wins", baseline: { arm: "baseline", results: [], taskSummaries: [], passRate: 1, verifiedRuns: 0, infraFailures: 0, totalTokens: 0, totalDurationMs: 0 }, treatment: { arm: "treatment", results: [], taskSummaries: [], passRate: 0.5, verifiedRuns: 0, infraFailures: 0, totalTokens: 0, totalDurationMs: 0 }, decidedAt: new Date().toISOString() } as never,
+        report: {
+          taskSet: "file-creation-v1",
+          skill: SKILL_JSON.name,
+          repeats: 3,
+          baselineSource: "fresh",
+          valid: true,
+          verdict: "baseline-wins",
+          baseline: {
+            arm: "baseline",
+            results: [],
+            taskSummaries: [],
+            passRate: 1,
+            verifiedRuns: 0,
+            infraFailures: 0,
+            totalTokens: 0,
+            totalDurationMs: 0,
+          },
+          treatment: {
+            arm: "treatment",
+            results: [],
+            taskSummaries: [],
+            passRate: 0.5,
+            verifiedRuns: 0,
+            infraFailures: 0,
+            totalTokens: 0,
+            totalDurationMs: 0,
+          },
+          decidedAt: new Date().toISOString(),
+        } as never,
         decidedAt: new Date().toISOString(),
       });
     } finally {
@@ -406,7 +520,12 @@ describe("skill injection into runs (阶段 10)", () => {
       const dirPath = path.join(skillsRoot, "promoted", SKILL_JSON.name);
       fs.mkdirSync(dirPath, { recursive: true });
       fs.writeFileSync(path.join(dirPath, "SKILL.md"), serializeSkillMd(SKILL_JSON), "utf8");
-      new SkillIndex(db).syncSkill({ name: SKILL_JSON.name, dirPath, description: SKILL_JSON.description, body: SKILL_JSON.body });
+      new SkillIndex(db).syncSkill({
+        name: SKILL_JSON.name,
+        dirPath,
+        description: SKILL_JSON.description,
+        body: SKILL_JSON.body,
+      });
     } finally {
       db.close();
     }
@@ -414,7 +533,9 @@ describe("skill injection into runs (阶段 10)", () => {
     const withSkill = await runWithSkills(dbPath, undefined);
     expect(withSkill.record.systemPrompt).toContain("<available_skills>");
     expect(withSkill.record.systemPrompt).toContain(SKILL_JSON.name);
-    expect(withSkill.record.systemPrompt).toContain(path.join("inject", "skills", "promoted", SKILL_JSON.name, "SKILL.md"));
+    expect(withSkill.record.systemPrompt).toContain(
+      path.join("inject", "skills", "promoted", SKILL_JSON.name, "SKILL.md"),
+    );
 
     const withoutSkill = await runWithSkills(dbPath, false);
     expect(withoutSkill.record.systemPrompt).not.toContain("<available_skills>");
@@ -435,7 +556,9 @@ describe("scripted A/B eval (阶段 10)", () => {
     expect(judgeRun({ id: "t1", task: "x" }, base).pass).toBe(true);
     expect(judgeRun({ id: "t1", task: "x" }, { ...base, status: "failed", error: "boom" }).reason).toContain("failed");
     expect(judgeRun({ id: "t1", task: "x", expectFile: "missing.md" }, base).reason).toContain("missing");
-    expect(judgeRun({ id: "t1", task: "x", expectFile: "out.md", expectContains: "banana" }, base).reason).toContain("banana");
+    expect(judgeRun({ id: "t1", task: "x", expectFile: "out.md", expectContains: "banana" }, base).reason).toContain(
+      "banana",
+    );
     expect(judgeRun({ id: "t1", task: "x", expectFile: "out.md", expectContains: "apples" }, base).pass).toBe(true);
     tmp.leave();
   });
@@ -450,26 +573,41 @@ describe("scripted A/B eval (阶段 10)", () => {
     expect(judgeRun({ id: "t", task: "x", expectFile: "five.txt", expectLines: 6 }, ok).reason).toContain("expected 6");
     // exact lines (order-sensitive)
     write("words.txt", "alpha\nbeta\ngamma\n");
-    expect(judgeRun({ id: "t", task: "x", expectFile: "words.txt", expectLinesExact: ["alpha", "beta", "gamma"] }, ok).pass).toBe(true);
-    expect(judgeRun({ id: "t", task: "x", expectFile: "words.txt", expectLinesExact: ["alpha", "gamma", "beta"] }, ok).reason).toContain("line 2");
+    expect(
+      judgeRun({ id: "t", task: "x", expectFile: "words.txt", expectLinesExact: ["alpha", "beta", "gamma"] }, ok).pass,
+    ).toBe(true);
+    expect(
+      judgeRun({ id: "t", task: "x", expectFile: "words.txt", expectLinesExact: ["alpha", "gamma", "beta"] }, ok)
+        .reason,
+    ).toContain("line 2");
     // uniqueness
     write("dup.txt", "a\nb\na\n");
-    expect(judgeRun({ id: "t", task: "x", expectFile: "dup.txt", expectUnique: true }, ok).reason).toContain("duplicate");
+    expect(judgeRun({ id: "t", task: "x", expectFile: "dup.txt", expectUnique: true }, ok).reason).toContain(
+      "duplicate",
+    );
     // sorting (case-insensitive)
     write("sorted.txt", "ant\nBee\ncow\n");
     expect(judgeRun({ id: "t", task: "x", expectFile: "sorted.txt", expectSorted: true }, ok).pass).toBe(true);
     write("unsorted.txt", "cow\nant\nbee\n");
-    expect(judgeRun({ id: "t", task: "x", expectFile: "unsorted.txt", expectSorted: true }, ok).reason).toContain("alphabetical");
+    expect(judgeRun({ id: "t", task: "x", expectFile: "unsorted.txt", expectSorted: true }, ok).reason).toContain(
+      "alphabetical",
+    );
     // descending order
     write("desc.txt", "cow\nBee\nant\n");
     expect(judgeRun({ id: "t", task: "x", expectFile: "desc.txt", expectSorted: "desc" }, ok).pass).toBe(true);
     write("asc.txt", "ant\nBee\ncow\n");
-    expect(judgeRun({ id: "t", task: "x", expectFile: "asc.txt", expectSorted: "desc" }, ok).reason).toContain("reverse");
+    expect(judgeRun({ id: "t", task: "x", expectFile: "asc.txt", expectSorted: "desc" }, ok).reason).toContain(
+      "reverse",
+    );
     // per-line regex
     write("nums.txt", "item-1\nitem-2\n");
-    expect(judgeRun({ id: "t", task: "x", expectFile: "nums.txt", expectLineRegex: "^item-\\d+$" }, ok).pass).toBe(true);
+    expect(judgeRun({ id: "t", task: "x", expectFile: "nums.txt", expectLineRegex: "^item-\\d+$" }, ok).pass).toBe(
+      true,
+    );
     write("bad.txt", "item-1\nitem two\n");
-    expect(judgeRun({ id: "t", task: "x", expectFile: "bad.txt", expectLineRegex: "^item-\\d+$" }, ok).reason).toContain("item two");
+    expect(
+      judgeRun({ id: "t", task: "x", expectFile: "bad.txt", expectLineRegex: "^item-\\d+$" }, ok).reason,
+    ).toContain("item two");
     tmp.leave();
   });
 
@@ -504,7 +642,8 @@ describe("scripted A/B eval (阶段 10)", () => {
       existedDuringPrepare = fs.existsSync(path.join(tmp.dir, "art.txt"));
       return { taskId: task.id, status: "completed" };
     };
-    await runEvalArm({ name: "s", tasks: [{ id: "a", task: "x", expectFile: "art.txt" }] }, probingRunner, false);    expect(existedDuringPrepare).toBe(false);
+    await runEvalArm({ name: "s", tasks: [{ id: "a", task: "x", expectFile: "art.txt" }] }, probingRunner, false);
+    expect(existedDuringPrepare).toBe(false);
     tmp.leave();
   });
 
@@ -534,27 +673,50 @@ describe("scripted A/B eval (阶段 10)", () => {
     expect(rendered).toContain("candidate-wins");
 
     const reversed = await runEvalComparison(taskSet, {
-      runner: async (task, skills) => ({ taskId: task.id, status: skills !== false && task.id === "t1" ? "failed" : "completed" }),
+      runner: async (task, skills) => ({
+        taskId: task.id,
+        status: skills !== false && task.id === "t1" ? "failed" : "completed",
+      }),
       skillName: "note-file-workflow",
     });
     expect(reversed.verdict).toBe("baseline-wins");
   });
 
   it("detects read-back verification from the transcript", () => {
-    const toolCall = (name: string, path: string) => ({ type: "toolCall" as const, id: name + path, name, arguments: { path } });
+    const toolCall = (name: string, path: string) => ({
+      type: "toolCall" as const,
+      id: name + path,
+      name,
+      arguments: { path },
+    });
     const assistant = (...calls: ReturnType<typeof toolCall>[]) =>
       ({ role: "assistant", content: calls, stopReason: "toolUse", timestamp: 1 }) as never;
     // write then read the same path → verified
-    expect(readBackVerified([assistant(toolCall("write_file", "a.txt")), assistant(toolCall("read_file", "a.txt"))])).toBe(true);
+    expect(
+      readBackVerified([assistant(toolCall("write_file", "a.txt")), assistant(toolCall("read_file", "a.txt"))]),
+    ).toBe(true);
     // read before any write → not verified
-    expect(readBackVerified([assistant(toolCall("read_file", "a.txt")), assistant(toolCall("write_file", "a.txt"))])).toBe(false);
+    expect(
+      readBackVerified([assistant(toolCall("read_file", "a.txt")), assistant(toolCall("write_file", "a.txt"))]),
+    ).toBe(false);
     // read of a different path → not verified
-    expect(readBackVerified([assistant(toolCall("write_file", "a.txt")), assistant(toolCall("read_file", "b.txt"))])).toBe(false);
+    expect(
+      readBackVerified([assistant(toolCall("write_file", "a.txt")), assistant(toolCall("read_file", "b.txt"))]),
+    ).toBe(false);
     // reading the injected skill file is not a read-back
-    expect(readBackVerified([assistant(toolCall("read_file", ".harness/skills/promoted/s/SKILL.md")), assistant(toolCall("write_file", "a.txt"))])).toBe(false);
+    expect(
+      readBackVerified([
+        assistant(toolCall("read_file", ".harness/skills/promoted/s/SKILL.md")),
+        assistant(toolCall("write_file", "a.txt")),
+      ]),
+    ).toBe(false);
     // multiple writes, read-back of the second → verified
     expect(
-      readBackVerified([assistant(toolCall("write_file", "a.txt")), assistant(toolCall("write_file", "b.txt")), assistant(toolCall("read_file", "b.txt"))]),
+      readBackVerified([
+        assistant(toolCall("write_file", "a.txt")),
+        assistant(toolCall("write_file", "b.txt")),
+        assistant(toolCall("read_file", "b.txt")),
+      ]),
     ).toBe(true);
     expect(readBackVerified([])).toBe(false);
   });
@@ -562,7 +724,11 @@ describe("scripted A/B eval (阶段 10)", () => {
   it("loads and validates task sets", () => {
     tmp.enter();
     const file = path.join(tmp.dir, "taskset.json");
-    fs.writeFileSync(file, JSON.stringify({ name: "set", tasks: [{ id: "a", task: "do", expectFile: "out.txt" }] }), "utf8");
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ name: "set", tasks: [{ id: "a", task: "do", expectFile: "out.txt" }] }),
+      "utf8",
+    );
     expect(loadTaskSet(file).tasks).toHaveLength(1);
     fs.writeFileSync(file, JSON.stringify({ name: "set", tasks: [] }), "utf8");
     expect(() => loadTaskSet(file)).toThrow();
@@ -695,7 +861,12 @@ describe("LLM judge (deterministic first, judge second)", () => {
   });
 
   it("judge prompt carries task, instructions and final text", () => {
-    const prompt = buildJudgePrompt({ task: "do x", judgeInstructions: "check y", finalText: "my answer", status: "completed" });
+    const prompt = buildJudgePrompt({
+      task: "do x",
+      judgeInstructions: "check y",
+      finalText: "my answer",
+      status: "completed",
+    });
     expect(prompt).toContain("do x");
     expect(prompt).toContain("check y");
     expect(prompt).toContain("my answer");
@@ -703,14 +874,19 @@ describe("LLM judge (deterministic first, judge second)", () => {
 
   it("marks infrastructure failures (rate limit/quota/auth) and invalidates the report", async () => {
     tmp.enter();
-    const rateLimited: EvalRawRun = { taskId: "t", status: "failed", error: '429: {"message":"Rate limit exceeded: free-models-per-day"}' };
+    const rateLimited: EvalRawRun = {
+      taskId: "t",
+      status: "failed",
+      error: '429: {"message":"Rate limit exceeded: free-models-per-day"}',
+    };
     expect(isInfraFailure(rateLimited)).toBe(true);
     // Aliyun wraps out-of-credit as HTTP 400 + Arrearage (阶段 14 live finding)
     expect(
       isInfraFailure({
         taskId: "t",
         status: "failed",
-        error: 'run failed: 400: {"message":"Access denied, please make sure your account is in good standing.","type":"Arrearage","code":"Arrearage"}',
+        error:
+          'run failed: 400: {"message":"Access denied, please make sure your account is in good standing.","type":"Arrearage","code":"Arrearage"}',
       }),
     ).toBe(true);
     // a bare 400 without business-code words is a normal bad request, not infra
@@ -728,10 +904,19 @@ describe("LLM judge (deterministic first, judge second)", () => {
       if (call === 1) return rateLimited;
       return { taskId: task.id, status: "completed", tokens: 5 };
     };
-    const report = await runEvalComparison({ name: "s", tasks: [{ id: "t1", task: "x" }, { id: "t2", task: "x" }] }, {
-      runner: flakyRunner,
-      skillName: "some-skill",
-    });
+    const report = await runEvalComparison(
+      {
+        name: "s",
+        tasks: [
+          { id: "t1", task: "x" },
+          { id: "t2", task: "x" },
+        ],
+      },
+      {
+        runner: flakyRunner,
+        skillName: "some-skill",
+      },
+    );
     expect(report.valid).toBe(false);
     expect(report.invalidReason).toContain("infrastructure");
     expect(report.baseline.infraFailures).toBe(1);
@@ -752,7 +937,12 @@ describe("eval persistence + regression baseline (阶段 11)", () => {
 
       // record a baseline (2 repeats → 2 runs), latest() returns it
       const baselineArm = await runEvalArm(taskSet, runner, false, { repeats: 2 });
-      const baseline = new EvalBaselineRepo(db).record({ evalSet: taskSet.name, modelSpec: "test/model", repeats: 2, arm: baselineArm });
+      const baseline = new EvalBaselineRepo(db).record({
+        evalSet: taskSet.name,
+        modelSpec: "test/model",
+        repeats: 2,
+        arm: baselineArm,
+      });
       expect(new EvalBaselineRepo(db).latest(taskSet.name, "test/model")?.id).toBe(baseline.id);
       expect(new EvalBaselineRepo(db).latest("other", "test/model")).toBeUndefined();
 

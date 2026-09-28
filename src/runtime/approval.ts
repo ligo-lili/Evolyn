@@ -77,11 +77,19 @@ export function createPermissionGate(
       reason = `mode=auto-deny risk=${assessment.risk}`;
     } else {
       allowed = await approver({ toolName, assessment });
-      reason = allowed ? `approved interactively (risk=${assessment.risk})` : `rejected interactively (risk=${assessment.risk})`;
+      reason = allowed
+        ? `approved interactively (risk=${assessment.risk})`
+        : `rejected interactively (risk=${assessment.risk})`;
     }
 
     const auditReason = [...assessment.reasons, reason].join("; ");
-    audit({ type: "permission", toolName, decision: allowed ? "allow" : "deny", risk: assessment.risk, reason: auditReason });
+    audit({
+      type: "permission",
+      toolName,
+      decision: allowed ? "allow" : "deny",
+      risk: assessment.risk,
+      reason: auditReason,
+    });
     if (!allowed) return { block: true, reason };
     return undefined;
   };

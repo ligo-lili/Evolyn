@@ -13,7 +13,7 @@ import { TraceEventRepo } from "../storage/repos/trace-events.js";
 import { tracesDir } from "../runtime/paths.js";
 import { ConsoleReporter } from "../runtime/reporter.js";
 import { RunManager } from "../runtime/run-manager.js";
-import { createPermissionGate, type ApprovalMode, type ApprovalOptions } from "../runtime/approval.js";
+import { type ApprovalMode } from "../runtime/approval.js";
 import { ALL_CAPABILITIES, type Capability } from "../runtime/permissions.js";
 import type { ToolsetSpec } from "../runtime/run-manager.js";
 import type { TraceEvent } from "../trace/schema.js";
@@ -125,10 +125,6 @@ Default model comes from HARNESS_MODEL. Traces land in .harness/traces/<runId>.j
 Approval: the CLI defaults to INTERACTIVE approval (non-interactive shells
 auto-deny mutating tools); --yolo opts in to full autonomy explicitly.`;
 
-function isTracePath(id: string): boolean {
-  return id.endsWith(".jsonl") || id.includes("/") || id.includes("\\");
-}
-
 /** Load a run's events from SQLite — works for finished AND interrupted runs. */
 function loadRunEvents(id: string): TraceEvent[] {
   const db = openDatabase(defaultDbPath());
@@ -146,14 +142,22 @@ async function main(): Promise<number> {
 
   // Shared flag parsing (run and resume both gate on these).
   const approvalFlag = typeof flags.approval === "string" ? flags.approval : undefined;
-  if (approvalFlag !== undefined && approvalFlag !== "auto-approve" && approvalFlag !== "auto-deny" && approvalFlag !== "interactive") {
+  if (
+    approvalFlag !== undefined &&
+    approvalFlag !== "auto-approve" &&
+    approvalFlag !== "auto-deny" &&
+    approvalFlag !== "interactive"
+  ) {
     console.error(`unknown --approval mode "${approvalFlag}" (expected auto-approve | auto-deny | interactive)`);
     return 2;
   }
   const capabilitiesFlag = typeof flags.capabilities === "string" ? flags.capabilities : undefined;
   let capabilities: readonly Capability[] | undefined;
   if (capabilitiesFlag) {
-    const requested = capabilitiesFlag.split(",").map((c) => c.trim()).filter(Boolean) as readonly Capability[];
+    const requested = capabilitiesFlag
+      .split(",")
+      .map((c) => c.trim())
+      .filter(Boolean) as readonly Capability[];
     const invalid = requested.filter((c) => !ALL_CAPABILITIES.includes(c as never));
     if (invalid.length > 0) {
       console.error(`unknown capabilities: ${invalid.join(", ")} (available: ${ALL_CAPABILITIES.join(", ")})`);
@@ -168,7 +172,9 @@ async function main(): Promise<number> {
       console.log(listProviderIds().join("\n"));
       return 0;
     }
-    const models = getModelRegistry().getModels(provider).map((m) => `${provider}/${m.id}`);
+    const models = getModelRegistry()
+      .getModels(provider)
+      .map((m) => `${provider}/${m.id}`);
     console.log(models.length ? models.join("\n") : `(no models registered for "${provider}")`);
     return 0;
   }
@@ -214,7 +220,10 @@ async function main(): Promise<number> {
         const index = new MemorySearchIndex(db);
         const limit = typeof flags.limit === "string" ? Number(flags.limit) : 3;
         const capped = Number.isFinite(limit) && limit > 0 ? limit : 3;
-        const hits = flags.hybrid === true ? await index.searchHybrid(query, capped, localEmbedder()) : index.searchFts(query, capped);
+        const hits =
+          flags.hybrid === true
+            ? await index.searchHybrid(query, capped, localEmbedder())
+            : index.searchFts(query, capped);
         if (hits.length === 0) {
           console.log("(no matching memory — try `memory rebuild` if you edited the .md files)");
           return 0;
@@ -240,7 +249,9 @@ async function main(): Promise<number> {
         if (flags.vector === true) {
           vectors = await index.rebuildVectors(store, localEmbedder());
         }
-        console.log(`index rebuilt from ${n} memory file(s)${flags.vector === true ? `, ${vectors} vector(s) embedded` : ""}`);
+        console.log(
+          `index rebuilt from ${n} memory file(s)${flags.vector === true ? `, ${vectors} vector(s) embedded` : ""}`,
+        );
       } finally {
         db.close();
       }
@@ -261,7 +272,9 @@ async function main(): Promise<number> {
       console.log(`    ${outcome.file}`);
       return 0;
     }
-    console.error("usage: agent-harness memory core | memory list | memory search <query> | memory rebuild | memory distill <runId>");
+    console.error(
+      "usage: agent-harness memory core | memory list | memory search <query> | memory rebuild | memory distill <runId>",
+    );
     return 2;
   }
 
@@ -286,7 +299,9 @@ async function main(): Promise<number> {
         const count = new PatternRepo(db).replaceAll(drafts);
         console.log(`mined ${count} pattern(s) with support >= ${minSupport ?? 3} from finished runs`);
         for (const p of new PatternRepo(db).list()) {
-          console.log(`[${p.kind}] ${p.signature} — support ${p.support}, replay ${p.replaySafety} (${p.traceRefs.length} trace(s)) id=${p.id}`);
+          console.log(
+            `[${p.kind}] ${p.signature} — support ${p.support}, replay ${p.replaySafety} (${p.traceRefs.length} trace(s)) id=${p.id}`,
+          );
         }
         if (count === 0) console.log("(no pattern cleared the threshold — run a few similar tasks first)");
       } finally {
@@ -445,7 +460,9 @@ async function main(): Promise<number> {
       const file = positional[1];
       const skillName = typeof flags.skill === "string" ? flags.skill : undefined;
       if (!file || !skillName) {
-        console.error("usage: agent-harness skill eval <taskset.json> --skill <name> [--model <spec>] [--repeats <n>] [--against-baseline]");
+        console.error(
+          "usage: agent-harness skill eval <taskset.json> --skill <name> [--model <spec>] [--repeats <n>] [--against-baseline]",
+        );
         return 2;
       }
       const db = openDatabase(dbPath);
@@ -483,7 +500,9 @@ async function main(): Promise<number> {
           db2.close();
         }
         if (!stored) {
-          console.error(`no recorded baseline for "${taskSet.name}" + ${spec} (tools: ${toolsFlag ?? "demo"}) — run: agent-harness skill baseline ${file} --model ${spec}${toolsFlag ? ` --tools ${toolsFlag}` : ""}`);
+          console.error(
+            `no recorded baseline for "${taskSet.name}" + ${spec} (tools: ${toolsFlag ?? "demo"}) — run: agent-harness skill baseline ${file} --model ${spec}${toolsFlag ? ` --tools ${toolsFlag}` : ""}`,
+          );
           return 1;
         }
         if (stored.repeats !== repeats) {
@@ -501,8 +520,16 @@ async function main(): Promise<number> {
           stored: { arm: stored.arm, repeats: stored.repeats },
         });
       } else {
-        console.log(`running ${taskSet.tasks.length} task(s) × ${repeats} repeat(s) × 2 arms (baseline / +skill "${skillName}")…`);
-        report = await runEvalComparison(taskSet, { runner, skillName, skillVersion: registered.version, toolset: toolsFlag, repeats });
+        console.log(
+          `running ${taskSet.tasks.length} task(s) × ${repeats} repeat(s) × 2 arms (baseline / +skill "${skillName}")…`,
+        );
+        report = await runEvalComparison(taskSet, {
+          runner,
+          skillName,
+          skillVersion: registered.version,
+          toolset: toolsFlag,
+          repeats,
+        });
       }
       // 阶段 11: every report enters the ledger for cross-iteration comparison.
       const db3 = openDatabase(dbPath);
@@ -536,12 +563,20 @@ async function main(): Promise<number> {
       }
       const taskSet = loadTaskSet(file);
       const runner = defaultEvalRunner(spec, { toolset: toolsFlag as "demo" | "coding" | undefined });
-      console.log(`recording no-skill baseline: ${taskSet.tasks.length} task(s) × ${repeats} repeat(s) with ${spec} (tools: ${toolsFlag ?? "demo"})…`);
+      console.log(
+        `recording no-skill baseline: ${taskSet.tasks.length} task(s) × ${repeats} repeat(s) with ${spec} (tools: ${toolsFlag ?? "demo"})…`,
+      );
       const arm = await runEvalArm(taskSet, runner, false, { repeats });
       const db = openDatabase(dbPath);
       let recorded;
       try {
-        recorded = new EvalBaselineRepo(db).record({ evalSet: taskSet.name, modelSpec: spec, toolset: toolsFlag, repeats, arm });
+        recorded = new EvalBaselineRepo(db).record({
+          evalSet: taskSet.name,
+          modelSpec: spec,
+          toolset: toolsFlag,
+          repeats,
+          arm,
+        });
       } finally {
         db.close();
       }
@@ -553,9 +588,13 @@ async function main(): Promise<number> {
       // deaths) should be self-explaining, not a mystery for the operator.
       const failures = arm.results.filter((r) => !r.pass);
       if (failures.length > 0) {
-        console.warn(`⚠ ${failures.length}/${runs} run(s) failed (infra: ${arm.infraFailures}) — first reason: ${failures[0]?.reason}`);
+        console.warn(
+          `⚠ ${failures.length}/${runs} run(s) failed (infra: ${arm.infraFailures}) — first reason: ${failures[0]?.reason}`,
+        );
         if (arm.infraFailures === failures.length && failures.length === runs) {
-          console.warn("  every run died to infrastructure — check the API key env var for this shell before trusting this baseline");
+          console.warn(
+            "  every run died to infrastructure — check the API key env var for this shell before trusting this baseline",
+          );
         }
       }
       console.log(`later evals can compare against it: skill eval <taskset.json> --skill <name> --against-baseline`);
@@ -595,13 +634,14 @@ async function main(): Promise<number> {
         return 0;
       }
       for (const s of verification.skills) console.log(`loaded by pi loadSkillsFromDir: ${s.name} (${s.filePath})`);
-      for (const d of verification.diagnostics) console.error(`diagnostic [${d.type}] ${d.message}${d.path ? ` (${d.path})` : ""}`);
+      for (const d of verification.diagnostics)
+        console.error(`diagnostic [${d.type}] ${d.message}${d.path ? ` (${d.path})` : ""}`);
       console.log(verification.ok ? "verification OK" : "verification FAILED");
       return verification.ok ? 0 : 1;
     }
 
     console.error(
-      "usage: agent-harness skill mine | patterns | draft <patternId> | candidates | show <id> | promote <id> | list | retrieve \"<task>\" | rebuild | verify | eval <taskset.json> --skill <name> | baseline <taskset.json> | evals",
+      'usage: agent-harness skill mine | patterns | draft <patternId> | candidates | show <id> | promote <id> | list | retrieve "<task>" | rebuild | verify | eval <taskset.json> --skill <name> | baseline <taskset.json> | evals',
     );
     return 2;
   }
@@ -664,11 +704,7 @@ async function main(): Promise<number> {
       try {
         const repo = new TraceEventRepo(db);
         const tool = typeof flags.tool === "string" ? flags.tool : undefined;
-        const events = tool
-          ? repo.queryToolCalls(tool, id)
-          : flags.errors
-            ? repo.queryErrors(id)
-            : repo.getByRun(id);
+        const events = tool ? repo.queryToolCalls(tool, id) : flags.errors ? repo.queryErrors(id) : repo.getByRun(id);
         if (events.length === 0) console.log("(no matching events)");
         for (const e of events) {
           const toolName = "toolName" in e && typeof e.toolName === "string" ? ` ${e.toolName}` : "";
@@ -709,7 +745,10 @@ async function main(): Promise<number> {
       // the same toolset — resume with --tools coding when the crashed run used it.
       tools: toolsFlag as ToolsetSpec | undefined,
       approval: {
-        mode: flags.yolo === true ? "auto-approve" : ((typeof flags.approval === "string" ? (flags.approval as ApprovalMode) : undefined) ?? "interactive"),
+        mode:
+          flags.yolo === true
+            ? "auto-approve"
+            : ((typeof flags.approval === "string" ? (flags.approval as ApprovalMode) : undefined) ?? "interactive"),
         capabilities: capabilities as readonly Capability[] | undefined,
       },
     });
@@ -771,9 +810,12 @@ async function main(): Promise<number> {
   // approval (non-TTY auto-denies everything mutating) and --yolo is the
   // explicit opt-in to full autonomy. The LIBRARY default (auto-approve all)
   // is unchanged for backwards compatibility; scripts must opt in explicitly.
-  const approvalMode: ApprovalMode = flags.yolo === true ? "auto-approve" : ((approvalFlag as ApprovalMode | undefined) ?? "interactive");
+  const approvalMode: ApprovalMode =
+    flags.yolo === true ? "auto-approve" : ((approvalFlag as ApprovalMode | undefined) ?? "interactive");
   if (approvalMode === "interactive" && !process.stdin.isTTY) {
-    console.warn("[approval] interactive mode in a non-interactive shell: mutating tools will be auto-denied (use --yolo to override)");
+    console.warn(
+      "[approval] interactive mode in a non-interactive shell: mutating tools will be auto-denied (use --yolo to override)",
+    );
   }
   const result = await manager.run({
     task,

@@ -42,8 +42,18 @@ export class SkillIndex {
   }
 
   /** Upsert the row and the FTS entry for one promoted skill. */
-  syncSkill(input: { name: string; dirPath: string; sourceCandidateId?: string; description: string; body: string }): SkillRow {
-    const row = this.registry.upsert({ name: input.name, dirPath: input.dirPath, sourceCandidateId: input.sourceCandidateId });
+  syncSkill(input: {
+    name: string;
+    dirPath: string;
+    sourceCandidateId?: string;
+    description: string;
+    body: string;
+  }): SkillRow {
+    const row = this.registry.upsert({
+      name: input.name,
+      dirPath: input.dirPath,
+      sourceCandidateId: input.sourceCandidateId,
+    });
     this.db.prepare("DELETE FROM skills_fts WHERE skill_id = ?").run(row.id);
     this.db
       .prepare("INSERT INTO skills_fts (skill_id, name, description, body) VALUES (?, ?, ?, ?)")
@@ -55,7 +65,9 @@ export class SkillIndex {
     const hits: SkillHit[] = [];
     for (const id of ids) {
       const row = this.db
-        .prepare("SELECT s.*, f.description AS description, f.body AS body FROM skills s JOIN skills_fts f ON f.skill_id = s.id WHERE s.id = ?")
+        .prepare(
+          "SELECT s.*, f.description AS description, f.body AS body FROM skills s JOIN skills_fts f ON f.skill_id = s.id WHERE s.id = ?",
+        )
         .get(id) as Row | undefined;
       if (row) hits.push(rowToHit(row));
     }
@@ -81,12 +93,16 @@ export class SkillIndex {
 
   /** Skills by exact name, in the order given — eval A/B and demo forcing. */
   getByName(names: readonly string[]): SkillHit[] {
-    return this.fetchByIds(names.map((n) => this.registry.getByName(n)?.id).filter((id): id is string => id !== undefined));
+    return this.fetchByIds(
+      names.map((n) => this.registry.getByName(n)?.id).filter((id): id is string => id !== undefined),
+    );
   }
 
   list(): SkillHit[] {
     const rows = this.db
-      .prepare("SELECT s.*, f.description AS description, f.body AS body FROM skills s JOIN skills_fts f ON f.skill_id = s.id ORDER BY s.name")
+      .prepare(
+        "SELECT s.*, f.description AS description, f.body AS body FROM skills s JOIN skills_fts f ON f.skill_id = s.id ORDER BY s.name",
+      )
       .all() as Row[];
     return rows.map(rowToHit);
   }

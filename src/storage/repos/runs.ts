@@ -22,8 +22,18 @@ export class RunRepo {
 
   insert(record: RunRecord): void {
     this.db
-      .prepare("INSERT INTO runs (id, task, model_spec, status, started_at, system_prompt, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .run(record.id, record.task, record.modelSpec, record.status, record.startedAt, record.systemPrompt ?? null, new Date().toISOString());
+      .prepare(
+        "INSERT INTO runs (id, task, model_spec, status, started_at, system_prompt, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        record.id,
+        record.task,
+        record.modelSpec,
+        record.status,
+        record.startedAt,
+        record.systemPrompt ?? null,
+        new Date().toISOString(),
+      );
   }
 
   /** Full status sync from the in-memory record (status/finished_at/error). */

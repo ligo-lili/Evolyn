@@ -48,14 +48,22 @@ function textOf(content: readonly { type: string; text?: string }[]): string {
 
 function serializePrefix(messages: readonly AgentMessage[]): string {
   return messages
-    .map((m) => JSON.stringify(m, (_, v) => (typeof v === "string" && v.length > 2_000 ? v.slice(0, 2_000) + "…(truncated)" : v)))
+    .map((m) =>
+      JSON.stringify(m, (_, v) => (typeof v === "string" && v.length > 2_000 ? v.slice(0, 2_000) + "…(truncated)" : v)),
+    )
     .join("\n");
 }
 
-async function defaultSummary(options: CompactionOptions, prefix: readonly AgentMessage[], previousSummary?: string): Promise<string> {
+async function defaultSummary(
+  options: CompactionOptions,
+  prefix: readonly AgentMessage[],
+  previousSummary?: string,
+): Promise<string> {
   const models = options.models ?? getModelRegistry();
   const material = [
-    previousSummary ? `<previous_summary>\n${previousSummary}\n</previous_summary>\nFold the material below into it, keeping every section current.` : "",
+    previousSummary
+      ? `<previous_summary>\n${previousSummary}\n</previous_summary>\nFold the material below into it, keeping every section current.`
+      : "",
     `Summarize this conversation material (JSON lines, one per message):\n${serializePrefix(prefix)}`,
   ]
     .filter(Boolean)
@@ -146,7 +154,9 @@ function splice(messages: readonly AgentMessage[], cutIndex: number, summary: st
  * transcript and the trace are never rewritten — this only shapes what the
  * model sees, and every summary generation emits a compaction audit event.
  */
-export function createContextTransformer(options: CompactionOptions): (messages: AgentMessage[]) => Promise<AgentMessage[]> {
+export function createContextTransformer(
+  options: CompactionOptions,
+): (messages: AgentMessage[]) => Promise<AgentMessage[]> {
   const settings: CompactionSettings = { ...DEFAULT_COMPACTION_SETTINGS, ...options.settings };
   let cache: { forLength: number; summary: string; cutIndex: number } | undefined;
   const summarize: (prefix: readonly AgentMessage[], previous?: string) => Promise<string> = options.summaryFn
@@ -170,7 +180,13 @@ export function createContextTransformer(options: CompactionOptions): (messages:
       const material = view.slice(cache.cutIndex, newCut);
       const summary = await summarize(material, cache.summary);
       cache = { forLength: view.length, summary, cutIndex: newCut };
-      options.onEvent?.({ type: "compaction", trigger: "rolling", tokensBefore: after.tokens, summaryChars: summary.length, cutIndex: newCut });
+      options.onEvent?.({
+        type: "compaction",
+        trigger: "rolling",
+        tokensBefore: after.tokens,
+        summaryChars: summary.length,
+        cutIndex: newCut,
+      });
       return splice(view, newCut, summary);
     }
 
@@ -179,7 +195,13 @@ export function createContextTransformer(options: CompactionOptions): (messages:
     const prefix = view.slice(1, cutIndex); // exclude the system message
     const summary = await summarize(prefix);
     cache = { forLength: view.length, summary, cutIndex };
-    options.onEvent?.({ type: "compaction", trigger: "threshold", tokensBefore: estimate.tokens, summaryChars: summary.length, cutIndex });
+    options.onEvent?.({
+      type: "compaction",
+      trigger: "threshold",
+      tokensBefore: estimate.tokens,
+      summaryChars: summary.length,
+      cutIndex,
+    });
     return splice(view, cutIndex, summary);
   };
 }

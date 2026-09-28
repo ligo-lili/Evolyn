@@ -20,7 +20,14 @@ const TOOLS = [sendNotificationTool];
 function steps(): AssistantMessage[] {
   return [
     assistantMessage(
-      [{ type: "toolCall", id: "call_1", name: "send_notification", arguments: { channel: "email", message: "deploy done" } }],
+      [
+        {
+          type: "toolCall",
+          id: "call_1",
+          name: "send_notification",
+          arguments: { channel: "email", message: "deploy done" },
+        },
+      ],
       "toolUse",
     ),
     assistantMessage([{ type: "text", text: "notification sent" }], "stop"),
@@ -68,7 +75,13 @@ describe("trace replay (阶段 7)", () => {
 
     const calls = [...s.calls.values()];
     expect(calls).toHaveLength(1);
-    expect(calls[0]).toMatchObject({ toolCallId: "call_1", toolName: "send_notification", state: "executed", resolved: true, isError: false });
+    expect(calls[0]).toMatchObject({
+      toolCallId: "call_1",
+      toolName: "send_notification",
+      state: "executed",
+      resolved: true,
+      isError: false,
+    });
     expect(machine.pendingCalls()).toEqual([]);
   });
 
@@ -110,7 +123,14 @@ describe("trace replay (阶段 7)", () => {
   it("errors surface in the summary and in collectErrors", async () => {
     const errorSteps = () => [
       assistantMessage(
-        [{ type: "toolCall", id: "call_bad", name: "send_notification", arguments: { channel: "email", message: "x" } }],
+        [
+          {
+            type: "toolCall",
+            id: "call_bad",
+            name: "send_notification",
+            arguments: { channel: "email", message: "x" },
+          },
+        ],
         "toolUse",
       ),
       assistantMessage([{ type: "text", text: "gave up" }], "stop"),

@@ -47,7 +47,12 @@ export function readTraceFile(filePath: string): ParsedTrace {
     if (ev.v !== TRACE_SCHEMA_VERSION) {
       throw new HarnessError(`${at}: schema version ${String(ev.v)}, expected ${TRACE_SCHEMA_VERSION}`);
     }
-    if (typeof ev.seq !== "number" || typeof ev.ts !== "string" || typeof ev.runId !== "string" || typeof ev.type !== "string") {
+    if (
+      typeof ev.seq !== "number" ||
+      typeof ev.ts !== "string" ||
+      typeof ev.runId !== "string" ||
+      typeof ev.type !== "string"
+    ) {
       throw new HarnessError(`${at}: missing envelope fields (v/seq/ts/runId/type)`);
     }
     events.push(ev);

@@ -142,10 +142,7 @@ export class ReplayMachine {
  * in flight and what recovery would do with them, the last assistant
  * stopReason/error, and the recent audit decisions.
  */
-export function explain(
-  events: readonly TraceEvent[],
-  untilSeq?: number,
-): { state: ReplayState; why: string[] } {
+export function explain(events: readonly TraceEvent[], untilSeq?: number): { state: ReplayState; why: string[] } {
   const machine = untilSeq === undefined ? ReplayMachine.replay(events) : ReplayMachine.at(events, untilSeq);
   const st = machine.state;
   const why: string[] = [];
@@ -182,9 +179,11 @@ export function explain(
   }
 
   for (const audit of st.audits.slice(-3)) {
-    if (audit.type === "permission") why.push(`权限：${audit.decision} ${audit.toolName}（${audit.risk}）${audit.reason ? ` ${audit.reason}` : ""}`);
+    if (audit.type === "permission")
+      why.push(`权限：${audit.decision} ${audit.toolName}（${audit.risk}）${audit.reason ? ` ${audit.reason}` : ""}`);
     else if (audit.type === "recovery_action") why.push(`恢复动作：${audit.action} ${audit.toolName}`);
-    else if (audit.type === "compaction") why.push(`上下文已压缩（seq ${audit.seq}，压缩前 ${audit.tokensBefore} tokens）——模型看到的是摘要 + 近期消息`);
+    else if (audit.type === "compaction")
+      why.push(`上下文已压缩（seq ${audit.seq}，压缩前 ${audit.tokensBefore} tokens）——模型看到的是摘要 + 近期消息`);
   }
 
   return { state: st, why };

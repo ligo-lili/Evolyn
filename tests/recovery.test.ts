@@ -22,7 +22,14 @@ const TOOLS = [sendNotificationTool];
 function steps(): AssistantMessage[] {
   return [
     assistantMessage(
-      [{ type: "toolCall", id: "call_1", name: "send_notification", arguments: { channel: "email", message: "deploy done" } }],
+      [
+        {
+          type: "toolCall",
+          id: "call_1",
+          name: "send_notification",
+          arguments: { channel: "email", message: "deploy done" },
+        },
+      ],
       "toolUse",
     ),
     assistantMessage([{ type: "text", text: "notification sent" }], "stop"),
@@ -104,7 +111,11 @@ describe("crash recovery (阶段 5/6)", () => {
     });
     expect(crashed.lastSeq).toBe(cutSeq);
     expect(crashed.checkpoint?.kind).toBe("message_boundary");
-    const state = crashed.checkpoint?.state as { lastSeq: number; messages: number; toolCalls: Array<{ state: string }> };
+    const state = crashed.checkpoint?.state as {
+      lastSeq: number;
+      messages: number;
+      toolCalls: Array<{ state: string }>;
+    };
     expect(state.lastSeq).toBeLessThanOrEqual(cutSeq);
     expect(state.messages).toBe(2);
     expect(state.toolCalls).toEqual([{ toolCallId: "call_1", toolName: "send_notification", state: "planned" }]);

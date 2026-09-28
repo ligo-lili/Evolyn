@@ -2,7 +2,14 @@ export { HarnessError } from "./errors.js";
 export { DEFAULT_SYSTEM_PROMPT, defaultModelSpec } from "./config.js";
 export { getModelRegistry, listProviderIds, resolveModel } from "./providers.js";
 export { createAgent, harnessStreamFn, type CreateAgentOptions } from "./runtime/agent-factory.js";
-export { RunManager, type RunOptions, type ResumeOptions, type RunRecord, type RunResult, type RunStatus } from "./runtime/run-manager.js";
+export {
+  RunManager,
+  type RunOptions,
+  type ResumeOptions,
+  type RunRecord,
+  type RunResult,
+  type RunStatus,
+} from "./runtime/run-manager.js";
 export { ConsoleReporter, CollectingReporter, type RunReporter } from "./runtime/reporter.js";
 export {
   createPermissionGate,
@@ -22,8 +29,20 @@ export {
   type RiskClass,
   type ToolPermissions,
 } from "./runtime/permissions.js";
-export { applyFaultToTools, FaultController, formatFaultSpec, parseFaultSpec, type FaultPoint, type FaultSpec } from "./execution/fault.js";
-export { CheckpointWriter, type CheckpointState, type ToolCallState, type TrackedToolCall } from "./execution/checkpoint.js";
+export {
+  applyFaultToTools,
+  FaultController,
+  formatFaultSpec,
+  parseFaultSpec,
+  type FaultPoint,
+  type FaultSpec,
+} from "./execution/fault.js";
+export {
+  CheckpointWriter,
+  type CheckpointState,
+  type ToolCallState,
+  type TrackedToolCall,
+} from "./execution/checkpoint.js";
 export { withEvidenceCapture } from "./runtime/tools/evidence.js";
 export {
   assembleSystemPrompt,

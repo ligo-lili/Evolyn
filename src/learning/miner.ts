@@ -73,7 +73,10 @@ function replaySafetyOf(kind: PatternKind, signature: string, toolReplay?: Recor
  * are the authoritative per-call record (阶段 7 口径): every call — real or
  * recovery-synthesized — ends with exactly one toolResult.
  */
-export function extractRunToolTrace(run: { id: string; task: string; status: string }, events: readonly TraceEvent[]): RunToolTrace {
+export function extractRunToolTrace(
+  run: { id: string; task: string; status: string },
+  events: readonly TraceEvent[],
+): RunToolTrace {
   const calls: MinedCall[] = [];
   for (const event of events) {
     if (event.type !== "message_end") continue;
@@ -103,7 +106,12 @@ interface Accumulator {
   runs: Set<string>;
 }
 
-function buildPatterns(kind: PatternKind, acc: Map<string, Accumulator>, minSupport: number, toolReplay?: Record<string, string>): PatternDraft[] {
+function buildPatterns(
+  kind: PatternKind,
+  acc: Map<string, Accumulator>,
+  minSupport: number,
+  toolReplay?: Record<string, string>,
+): PatternDraft[] {
   return [...acc.values()]
     .filter((a) => a.runs.size >= minSupport)
     .map((a) => ({
@@ -125,7 +133,9 @@ function buildPatterns(kind: PatternKind, acc: Map<string, Accumulator>, minSupp
 export function minePatterns(runs: readonly RunToolTrace[], options: MineOptions = {}): PatternDraft[] {
   const minSupport = options.minSupport ?? MIN_PATTERN_SUPPORT;
   if (minSupport < MIN_PATTERN_SUPPORT) {
-    throw new Error(`minSupport ${minSupport} is below the hard floor (${MIN_PATTERN_SUPPORT}) — single-run patterns are not minable`);
+    throw new Error(
+      `minSupport ${minSupport} is below the hard floor (${MIN_PATTERN_SUPPORT}) — single-run patterns are not minable`,
+    );
   }
   const maxN = options.maxN ?? 3;
 

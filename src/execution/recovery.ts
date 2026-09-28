@@ -95,9 +95,7 @@ export function loadCrashedRun(db: DatabaseSync, runId: string, tools: readonly 
 }
 
 export type RecoveryAction =
-  | { kind: "rebuild_result" }
-  | { kind: "reexecute" }
-  | { kind: "synthesize_error"; reason: string };
+  { kind: "rebuild_result" } | { kind: "reexecute" } | { kind: "synthesize_error"; reason: string };
 
 /**
  * Recovery decision per unresolved call:
@@ -115,7 +113,10 @@ export function planRecovery(u: UnresolvedToolCall): RecoveryAction {
   if (u.state === "executing") {
     return u.tool?.replay === "safe"
       ? { kind: "reexecute" }
-      : { kind: "synthesize_error", reason: `tool "${u.toolName}" was interrupted by a crash mid-execution; its outcome is unknown` };
+      : {
+          kind: "synthesize_error",
+          reason: `tool "${u.toolName}" was interrupted by a crash mid-execution; its outcome is unknown`,
+        };
   }
   return { kind: "reexecute" };
 }

@@ -25,10 +25,7 @@ export interface SchemaTool {
   parameters: TSchema;
 }
 
-export type ChatFn = (
-  messages: readonly ChatTurn[],
-  opts?: { schemaTool?: SchemaTool },
-) => Promise<string>;
+export type ChatFn = (messages: readonly ChatTurn[], opts?: { schemaTool?: SchemaTool }) => Promise<string>;
 
 export interface StructuredOptions<T> {
   prompt: string;
@@ -46,10 +43,7 @@ export interface StructuredResult<T> {
   method: "direct" | "reprompt" | "constrained";
 }
 
-export function defaultChat(
-  model: Model<Api>,
-  opts: { models?: Models; systemPrompt?: string } = {},
-): ChatFn {
+export function defaultChat(model: Model<Api>, opts: { models?: Models; systemPrompt?: string } = {}): ChatFn {
   const registry = opts.models ?? getModelRegistry();
   return async (messages, chatOpts) => {
     const context: Context = {

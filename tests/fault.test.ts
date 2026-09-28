@@ -12,7 +12,10 @@ afterEach(() => tmp.leave());
 describe("fault injection (阶段 5)", () => {
   it("parses fault specs", () => {
     expect(parseFaultSpec(undefined)).toBeUndefined();
-    expect(parseFaultSpec("after_tool_call:send_notification")).toEqual({ point: "after_tool_call", toolName: "send_notification" });
+    expect(parseFaultSpec("after_tool_call:send_notification")).toEqual({
+      point: "after_tool_call",
+      toolName: "send_notification",
+    });
     expect(() => parseFaultSpec("nope:tool")).toThrow(/unknown fault point/);
     expect(() => parseFaultSpec("after_tool_call:")).toThrow(/tool name/);
   });
@@ -36,18 +39,36 @@ describe("fault injection (阶段 5)", () => {
   });
 
   it("leaves non-matching tools untouched", () => {
-    const wrapped = applyFaultToTools([sendNotificationTool], { point: "mid_tool_execution", toolName: "read_file" }, () => {});
+    const wrapped = applyFaultToTools(
+      [sendNotificationTool],
+      { point: "mid_tool_execution", toolName: "read_file" },
+      () => {},
+    );
     expect(wrapped[0]).toBe(sendNotificationTool);
   });
 
   it("FaultController fires only on the matching tool_execution_end", () => {
     const kills: string[] = [];
-    const controller = new FaultController({ point: "after_tool_call", toolName: "send_notification" }, () => kills.push("k"));
+    const controller = new FaultController({ point: "after_tool_call", toolName: "send_notification" }, () =>
+      kills.push("k"),
+    );
 
-    controller.onEvent({ type: "tool_execution_end", toolCallId: "1", toolName: "read_file", result: { content: [], details: undefined }, isError: false });
+    controller.onEvent({
+      type: "tool_execution_end",
+      toolCallId: "1",
+      toolName: "read_file",
+      result: { content: [], details: undefined },
+      isError: false,
+    });
     expect(kills).toEqual([]);
 
-    controller.onEvent({ type: "tool_execution_end", toolCallId: "2", toolName: "send_notification", result: { content: [], details: undefined }, isError: false });
+    controller.onEvent({
+      type: "tool_execution_end",
+      toolCallId: "2",
+      toolName: "send_notification",
+      result: { content: [], details: undefined },
+      isError: false,
+    });
     expect(kills).toEqual(["k"]);
   });
 });

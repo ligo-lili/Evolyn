@@ -2,7 +2,6 @@ import fs from "node:fs";
 import path from "node:path";
 import { execSync } from "node:child_process";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { openDatabase } from "../src/storage/db.js";
 import { RunRepo } from "../src/storage/repos/runs.js";
 import { TraceEventRepo } from "../src/storage/repos/trace-events.js";
@@ -152,7 +151,14 @@ describe("P1-3 resume gating (阶段 13)", () => {
       model: FAKE_MODEL,
       streamFn: scriptedStreamFn([
         assistantMessage(
-          [{ type: "toolCall", id: "call_1", name: "write_file", arguments: { path: "gated.txt", content: "payload" } }],
+          [
+            {
+              type: "toolCall",
+              id: "call_1",
+              name: "write_file",
+              arguments: { path: "gated.txt", content: "payload" },
+            },
+          ],
           "toolUse",
         ),
         assistantMessage([{ type: "text", text: "written" }], "stop"),
@@ -178,7 +184,8 @@ describe("P1-3 resume gating (阶段 13)", () => {
       db.prepare("UPDATE runs SET status = 'running', finished_at = NULL, error = NULL WHERE id = ?").run(runId);
       for (const cp of new CheckpointRepo(db).list(runId)) {
         const state = cp.state as { lastSeq: number };
-        if (state.lastSeq > cutSeq) db.prepare("DELETE FROM checkpoints WHERE run_id = ? AND seq = ?").run(runId, cp.seq);
+        if (state.lastSeq > cutSeq)
+          db.prepare("DELETE FROM checkpoints WHERE run_id = ? AND seq = ?").run(runId, cp.seq);
       }
       const surviving = new TraceEventRepo(db).getByRun(runId);
       const tracePath = path.join(tmp.dir, ".harness", "traces", `${runId}.jsonl`);
@@ -211,7 +218,9 @@ describe("P1-3 resume gating (阶段 13)", () => {
       expect(toolResults[0].content.some((b) => b.type === "text" && b.text.includes("auto-deny"))).toBe(true);
     }
     const trace = readTraceFile(result.tracePath as string);
-    expect(trace.events.some((e) => e.type === "permission" && e.decision === "deny" && e.toolName === "write_file")).toBe(true);
+    expect(
+      trace.events.some((e) => e.type === "permission" && e.decision === "deny" && e.toolName === "write_file"),
+    ).toBe(true);
     expect(trace.events.some((e) => e.type === "recovery_action" && e.action === "reexecute")).toBe(true);
     expect(trace.events.at(-1)).toMatchObject({ type: "run_end", status: "completed" });
   });
@@ -244,7 +253,13 @@ describe("P1-2 trace reconciliation (阶段 13)", () => {
   function seedDb(dbPath: string, count: number): Array<Record<string, unknown> & { seq: number }> {
     const db = openDatabase(dbPath);
     try {
-      new RunRepo(db).insert({ id: "r1", task: "t", modelSpec: "m", status: "completed", startedAt: new Date().toISOString() });
+      new RunRepo(db).insert({
+        id: "r1",
+        task: "t",
+        modelSpec: "m",
+        status: "completed",
+        startedAt: new Date().toISOString(),
+      });
       const repo = new TraceEventRepo(db);
       const events: Array<Record<string, unknown> & { seq: number }> = [];
       // a bracketed trace: run_start … message_end … run_end (readTraceFile requires both)
@@ -263,7 +278,15 @@ describe("P1-2 trace reconciliation (阶段 13)", () => {
           message: { role: "user", content: "x", timestamp: seq },
         });
       }
-      push({ v: 1, seq: count, ts: new Date().toISOString(), runId: "r1", type: "run_end", status: "completed", durationMs: 1 });
+      push({
+        v: 1,
+        seq: count,
+        ts: new Date().toISOString(),
+        runId: "r1",
+        type: "run_end",
+        status: "completed",
+        durationMs: 1,
+      });
       return events;
     } finally {
       db.close();
@@ -290,7 +313,14 @@ describe("P1-2 trace reconciliation (阶段 13)", () => {
     const dbPath = path.join(tmp.dir, "recon2", "harness.db");
     const events = seedDb(dbPath, 3);
     const file = path.join(tmp.dir, "recon2", "trace.jsonl");
-    fs.writeFileSync(file, events.slice(0, 2).map((e) => JSON.stringify(e)).join("\n") + "\n", "utf8");
+    fs.writeFileSync(
+      file,
+      events
+        .slice(0, 2)
+        .map((e) => JSON.stringify(e))
+        .join("\n") + "\n",
+      "utf8",
+    );
 
     const result = reconcileJsonlTrace(file, events as never);
     expect(result.rebuilt).toBe(true);
@@ -316,7 +346,14 @@ describe("P1-2 trace reconciliation (阶段 13)", () => {
 
 describe("P1-5 compaction cut points (阶段 13)", () => {
   const toolResult = (id: string, text: string) =>
-    ({ role: "toolResult", toolCallId: id, toolName: "write_file", content: [{ type: "text", text }], isError: false, timestamp: 1 }) as never;
+    ({
+      role: "toolResult",
+      toolCallId: id,
+      toolName: "write_file",
+      content: [{ type: "text", text }],
+      isError: false,
+      timestamp: 1,
+    }) as never;
 
   it("cut boundary inside a multi-result block: slice never starts with an orphaned toolResult", () => {
     // assistant with TWO calls, then trA (large) and trB (small); a budget that
@@ -451,7 +488,7 @@ describe("阶段 14 coding eval mechanics", () => {
       fix: (dir) =>
         fs.writeFileSync(
           path.join(dir, "index.js"),
-          "// Public API.\nmodule.exports = {\n  ...require(\"./lib/format\"),\n  ...require(\"./lib/parse\"),\n};\n",
+          '// Public API.\nmodule.exports = {\n  ...require("./lib/format"),\n  ...require("./lib/parse"),\n};\n',
           "utf8",
         ),
     },
@@ -534,7 +571,7 @@ describe("阶段 14 coding eval mechanics", () => {
     }
     const inline = {
       name: "coding-fix-inline",
-      tasks: Object.entries(FIXTURES).map(([id, fixture]) => ({
+      tasks: Object.entries(FIXTURES).map(([id]) => ({
         id,
         task: `fix ${id}`,
         setupRepo: { dir: `repos/${id}`, template: path.join(tmp.dir, "evals", "fixtures", id) },
@@ -569,7 +606,13 @@ describe("P1-4 promotion cleanup (阶段 13)", () => {
     let patternIdValue = "";
     try {
       for (const i of [0, 1, 2]) {
-        new RunRepo(db).insert({ id: `rb-${i}`, task: `note file task ${i}`, modelSpec: "m", status: "completed", startedAt: new Date().toISOString() });
+        new RunRepo(db).insert({
+          id: `rb-${i}`,
+          task: `note file task ${i}`,
+          modelSpec: "m",
+          status: "completed",
+          startedAt: new Date().toISOString(),
+        });
         const repo = new TraceEventRepo(db);
         // two calls per run — single-call traces mine no 2-grams
         const calls: Array<[string, number]> = [
@@ -585,7 +628,14 @@ describe("P1-4 promotion cleanup (阶段 13)", () => {
             isError: false,
             timestamp: Date.now(),
           };
-          repo.append({ v: 1, seq, ts: new Date().toISOString(), runId: `rb-${i}`, type: "message_end", message } as never);
+          repo.append({
+            v: 1,
+            seq,
+            ts: new Date().toISOString(),
+            runId: `rb-${i}`,
+            type: "message_end",
+            message,
+          } as never);
         }
       }
       new PatternRepo(db).replaceAll(minePatternsFromDb(db));

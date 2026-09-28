@@ -10,7 +10,6 @@ import { readTraceFile } from "../src/trace/read.js";
 import type { AnyAgentTool } from "../src/index.js";
 import { RunManager } from "../src/runtime/run-manager.js";
 import { CollectingReporter } from "../src/runtime/reporter.js";
-import { sendNotificationTool } from "../src/runtime/tools/send-notification.js";
 import { assistantMessage, FAKE_MODEL, makeTempCwd, scriptedStreamFn } from "./helpers.js";
 
 const tmp = makeTempCwd();
@@ -96,7 +95,11 @@ describe("completeStructured (阶段 9.8)", () => {
         return "still garbage";
       },
       maxReprompts: 1,
-      schemaTool: { name: "answer", description: "structured answer", parameters: Type.Object({ answer: Type.String() }) },
+      schemaTool: {
+        name: "answer",
+        description: "structured answer",
+        parameters: Type.Object({ answer: Type.String() }),
+      },
     });
     expect(forced).toBe(true);
     expect(method).toBe("constrained");
@@ -116,7 +119,10 @@ describe("completeStructured (阶段 9.8)", () => {
 });
 
 describe("tiered retry (阶段 9.8)", () => {
-  function flakyTool(replay: "safe" | "never" | undefined, failures: number): { tool: AnyAgentTool; calls: () => number } {
+  function flakyTool(
+    replay: "safe" | "never" | undefined,
+    failures: number,
+  ): { tool: AnyAgentTool; calls: () => number } {
     let calls = 0;
     const tool: AnyAgentTool = {
       name: "flaky",
@@ -216,7 +222,14 @@ describe("runaway guards (阶段 9.8)", () => {
     tmp.enter();
     const steps: AssistantMessage[] = [1, 2, 3, 4].map((i) =>
       assistantMessage(
-        [{ type: "toolCall", id: `c${i}`, name: "send_notification", arguments: { channel: "email", message: "same" } }],
+        [
+          {
+            type: "toolCall",
+            id: `c${i}`,
+            name: "send_notification",
+            arguments: { channel: "email", message: "same" },
+          },
+        ],
         "toolUse",
       ),
     );
@@ -245,11 +258,20 @@ describe("runaway guards (阶段 9.8)", () => {
     const costly = (i: number): AssistantMessage =>
       ({
         role: "assistant",
-        content: [{ type: "toolCall", id: `c${i}`, name: "write_file", arguments: { path: `f${i}.txt`, content: "x" } }],
+        content: [
+          { type: "toolCall", id: `c${i}`, name: "write_file", arguments: { path: `f${i}.txt`, content: "x" } },
+        ],
         api: FAKE_MODEL.api,
         provider: FAKE_MODEL.provider,
         model: FAKE_MODEL.id,
-        usage: { input: 10, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 20, cost: { input: 0.005, output: 0.005, cacheRead: 0, cacheWrite: 0, total: 0.01 } },
+        usage: {
+          input: 10,
+          output: 10,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 20,
+          cost: { input: 0.005, output: 0.005, cacheRead: 0, cacheWrite: 0, total: 0.01 },
+        },
         stopReason: "toolUse",
         timestamp: Date.now(),
       }) as AssistantMessage;
@@ -276,7 +298,10 @@ describe("runaway guards (阶段 9.8)", () => {
   it("enforces the tool-call budget", async () => {
     tmp.enter();
     const steps: AssistantMessage[] = [1, 2, 3].map((i) =>
-      assistantMessage([{ type: "toolCall", id: `c${i}`, name: "write_file", arguments: { path: `g${i}.txt`, content: `x${i}` } }], "toolUse"),
+      assistantMessage(
+        [{ type: "toolCall", id: `c${i}`, name: "write_file", arguments: { path: `g${i}.txt`, content: `x${i}` } }],
+        "toolUse",
+      ),
     );
     steps.push(assistantMessage([{ type: "text", text: "end" }], "stop"));
     const manager = new RunManager();
@@ -302,7 +327,10 @@ describe("runaway guards (阶段 9.8)", () => {
       task: "write evidence",
       model: FAKE_MODEL,
       streamFn: scriptedStreamFn([
-        assistantMessage([{ type: "toolCall", id: "c1", name: "write_file", arguments: { path: "ev.txt", content: "evidence body" } }], "toolUse"),
+        assistantMessage(
+          [{ type: "toolCall", id: "c1", name: "write_file", arguments: { path: "ev.txt", content: "evidence body" } }],
+          "toolUse",
+        ),
         assistantMessage([{ type: "text", text: "done" }], "stop"),
       ]),
       reporter: new CollectingReporter(),

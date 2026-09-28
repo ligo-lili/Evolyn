@@ -5,12 +5,7 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { readTraceFile } from "../src/trace/read.js";
 import { RunManager } from "../src/runtime/run-manager.js";
 import { CollectingReporter } from "../src/runtime/reporter.js";
-import {
-  assessRisk,
-  hasAllCapabilities,
-  permissionsFor,
-  type ApprovalRequest,
-} from "../src/runtime/permissions.js";
+import { assessRisk, hasAllCapabilities, permissionsFor, type ApprovalRequest } from "../src/runtime/permissions.js";
 import { assistantMessage, FAKE_MODEL, makeTempCwd, scriptedStreamFn } from "./helpers.js";
 
 const tmp = makeTempCwd();
@@ -20,7 +15,14 @@ afterEach(() => tmp.leave());
 function notificationSteps(): AssistantMessage[] {
   return [
     assistantMessage(
-      [{ type: "toolCall", id: "call_n1", name: "send_notification", arguments: { channel: "email", message: "deploy done" } }],
+      [
+        {
+          type: "toolCall",
+          id: "call_n1",
+          name: "send_notification",
+          arguments: { channel: "email", message: "deploy done" },
+        },
+      ],
       "toolUse",
     ),
     assistantMessage([{ type: "text", text: "notification handled" }], "stop"),
@@ -74,12 +76,19 @@ describe("permission gate on runs (阶段 9.7)", () => {
     const toolResult = result.messages.find((m) => m.role === "toolResult");
     if (toolResult?.role === "toolResult") {
       expect(toolResult.isError).toBe(true);
-      expect(toolResult.content.some((b) => b.type === "text" && b.text.includes("capabilities not granted"))).toBe(true);
+      expect(toolResult.content.some((b) => b.type === "text" && b.text.includes("capabilities not granted"))).toBe(
+        true,
+      );
     }
 
     const events = permissionEvents(result.tracePath as string);
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({ type: "permission", toolName: "send_notification", decision: "deny", risk: "external" });
+    expect(events[0]).toMatchObject({
+      type: "permission",
+      toolName: "send_notification",
+      decision: "deny",
+      risk: "external",
+    });
 
     // run_start records the effective capability set (audit requirement)
     const runStart = readTraceFile(result.tracePath as string).events[0]!;
@@ -90,7 +99,10 @@ describe("permission gate on runs (阶段 9.7)", () => {
     tmp.enter();
     fs.writeFileSync(path.join(tmp.dir, "plain.txt"), "contents", "utf8");
     const steps: AssistantMessage[] = [
-      assistantMessage([{ type: "toolCall", id: "c_r", name: "read_file", arguments: { path: "plain.txt" } }], "toolUse"),
+      assistantMessage(
+        [{ type: "toolCall", id: "c_r", name: "read_file", arguments: { path: "plain.txt" } }],
+        "toolUse",
+      ),
       assistantMessage([{ type: "toolCall", id: "c_e", name: "exec", arguments: { command: "echo nope" } }], "toolUse"),
       assistantMessage([{ type: "text", text: "done" }], "stop"),
     ];
@@ -122,7 +134,10 @@ describe("permission gate on runs (阶段 9.7)", () => {
     fs.writeFileSync(path.join(tmp.dir, "plain.txt"), "contents", "utf8");
     const prompts: ApprovalRequest[] = [];
     const steps: AssistantMessage[] = [
-      assistantMessage([{ type: "toolCall", id: "c1", name: "read_file", arguments: { path: "plain.txt" } }], "toolUse"),
+      assistantMessage(
+        [{ type: "toolCall", id: "c1", name: "read_file", arguments: { path: "plain.txt" } }],
+        "toolUse",
+      ),
       assistantMessage([{ type: "toolCall", id: "c2", name: "exec", arguments: { command: "echo hi" } }], "toolUse"),
       assistantMessage([{ type: "text", text: "done" }], "stop"),
     ];

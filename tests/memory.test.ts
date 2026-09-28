@@ -57,7 +57,12 @@ describe("memory model + markdown store (阶段 9.5)", () => {
     store.save(b);
     expect(fs.existsSync(fileA)).toBe(true);
     expect(store.get("mem-a")?.summaryEn).toContain("dedupe");
-    expect(store.list().map((m) => m.id).sort()).toEqual(["mem-a", "mem-b"]);
+    expect(
+      store
+        .list()
+        .map((m) => m.id)
+        .sort(),
+    ).toEqual(["mem-a", "mem-b"]);
     expect(fs.readFileSync(fileA, "utf8")).toContain("## 中文摘要");
     tmp.leave();
   });
@@ -69,12 +74,25 @@ describe("memory search index (derived, rebuildable)", () => {
     const dbPath = path.join(tmp.dir, "idx", "harness.db");
     const db = openDatabase(dbPath);
     try {
-      new RunRepo(db).insert({ id: "seed", task: "seed", modelSpec: "test/fake-model", status: "completed", startedAt: new Date().toISOString() });
+      new RunRepo(db).insert({
+        id: "seed",
+        task: "seed",
+        modelSpec: "test/fake-model",
+        status: "completed",
+        startedAt: new Date().toISOString(),
+      });
       const store = new MemoryStore(path.join(path.dirname(dbPath), "memory"));
       const index = new MemorySearchIndex(db);
 
       store.save(mkRecord({ id: "csv-mem" }));
-      store.save(mkRecord({ id: "notify-mem", taskType: "notification", summaryEn: "Sent deployment notification to ops.", keywordsEn: ["notification", "deploy", "ops"] }));
+      store.save(
+        mkRecord({
+          id: "notify-mem",
+          taskType: "notification",
+          summaryEn: "Sent deployment notification to ops.",
+          keywordsEn: ["notification", "deploy", "ops"],
+        }),
+      );
       index.rebuild(store);
       expect(index.count()).toBe(2);
 
@@ -101,9 +119,7 @@ describe("write-time reflection (阶段 9.5)", () => {
     const result = await manager.run({
       task: "organize quarterly reports",
       model: FAKE_MODEL,
-      streamFn: scriptedStreamFn([
-        assistantMessage([{ type: "text", text: "done" }], "stop"),
-      ]),
+      streamFn: scriptedStreamFn([assistantMessage([{ type: "text", text: "done" }], "stop")]),
       reporter: new CollectingReporter(),
       database: dbPath,
       tools: [],
@@ -113,7 +129,15 @@ describe("write-time reflection (阶段 9.5)", () => {
     const first = await distillRunById(result.record.id, {
       database: dbPath,
       complete: async () =>
-        JSON.stringify({ taskType: "file-organization", summaryEn: "Organized reports.", summaryZh: "整理报告。", approach: "manual", pitfalls: "none", outcome: "success", keywordsEn: ["reports"] }),
+        JSON.stringify({
+          taskType: "file-organization",
+          summaryEn: "Organized reports.",
+          summaryZh: "整理报告。",
+          approach: "manual",
+          pitfalls: "none",
+          outcome: "success",
+          keywordsEn: ["reports"],
+        }),
     });
     expect(first.merged).toBe(false);
     expect(fs.existsSync(first.file)).toBe(true);
@@ -161,8 +185,19 @@ describe("write-time reflection (阶段 9.5)", () => {
   it("digest captures tool calls, error flags and final text", () => {
     const messages = [
       { role: "user", content: "go", timestamp: 1 },
-      { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "write_file", arguments: { path: "x" } }], timestamp: 2 },
-      { role: "toolResult", toolCallId: "c1", toolName: "write_file", content: [{ type: "text", text: "wrote" }], isError: false, timestamp: 3 },
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "c1", name: "write_file", arguments: { path: "x" } }],
+        timestamp: 2,
+      },
+      {
+        role: "toolResult",
+        toolCallId: "c1",
+        toolName: "write_file",
+        content: [{ type: "text", text: "wrote" }],
+        isError: false,
+        timestamp: 3,
+      },
     ] as never[];
     const digest = buildRunDigest({ id: "r", task: "go", modelSpec: "m", status: "completed" }, messages);
     expect(digest.toolCalls[0]).toMatchObject({ toolName: "write_file", isError: false });
@@ -179,7 +214,13 @@ describe("memory injection into runs (阶段 9.5)", () => {
     store.save(mkRecord({ id: "inject-mem", summaryZh: "整理报告前先去重。" }));
 
     const db = openDatabase(dbPath);
-    new RunRepo(db).insert({ id: "seed", task: "seed", modelSpec: "test/fake-model", status: "completed", startedAt: new Date().toISOString() });
+    new RunRepo(db).insert({
+      id: "seed",
+      task: "seed",
+      modelSpec: "test/fake-model",
+      status: "completed",
+      startedAt: new Date().toISOString(),
+    });
     new MemorySearchIndex(db).rebuild(store);
     db.close();
 

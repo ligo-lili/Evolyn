@@ -113,11 +113,20 @@ export function prepareRepoFixture(spec: NonNullable<EvalTask["setupRepo"]>): vo
   if (spec.url) {
     const ref = spec.ref ?? "HEAD";
     const git = (args: string): string =>
-      execSync(`git ${args}`, { cwd: dir, stdio: ["ignore", "pipe", "pipe"], timeout: 120_000, windowsHide: true }).toString();
+      execSync(`git ${args}`, {
+        cwd: dir,
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 120_000,
+        windowsHide: true,
+      }).toString();
     if (!fs.existsSync(path.join(dir, ".git"))) {
       fs.mkdirSync(path.dirname(dir), { recursive: true });
       fs.rmSync(dir, { recursive: true, force: true });
-      execSync(`git clone ${spec.url} ${JSON.stringify(dir)}`, { stdio: ["ignore", "pipe", "pipe"], timeout: 300_000, windowsHide: true });
+      execSync(`git clone ${spec.url} ${JSON.stringify(dir)}`, {
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 300_000,
+        windowsHide: true,
+      });
     }
     git(`fetch origin ${ref} --force`);
     git(`checkout --force ${JSON.stringify(ref)}`);
@@ -191,7 +200,7 @@ export function parseJudgeVerdictStrict(raw: string): JudgeVerdict {
   const end = raw.lastIndexOf("}");
   if (start === -1 || end <= start) throw new Error("no JSON object found in judge response");
   const parsed = JSON.parse(raw.slice(start, end + 1)) as Record<string, unknown>;
-  if (typeof parsed.pass !== "boolean") throw new Error("judge verdict missing boolean \"pass\"");
+  if (typeof parsed.pass !== "boolean") throw new Error('judge verdict missing boolean "pass"');
   return { pass: parsed.pass, reason: String(parsed.reason ?? "").trim() || (parsed.pass ? "passed" : "failed") };
 }
 
@@ -256,7 +265,13 @@ export type EvalRunner = (task: EvalTask, skills: SkillInjection | false) => Pro
  */
 export function judgeRun(task: EvalTask, run: EvalRawRun, repeat = 1): EvalResult {
   const infra = isInfraFailure(run);
-  const fail = (reason: string): EvalResult => ({ ...run, repeat, pass: false, reason, ...(infra ? { infra: true } : {}) });
+  const fail = (reason: string): EvalResult => ({
+    ...run,
+    repeat,
+    pass: false,
+    reason,
+    ...(infra ? { infra: true } : {}),
+  });
   if (run.status !== "completed") {
     return fail(`run ${run.status}${run.error ? `: ${run.error}` : ""}`);
   }
@@ -296,7 +311,9 @@ export function judgeRun(task: EvalTask, run: EvalRawRun, repeat = 1): EvalResul
       );
       const unsorted = lines.findIndex((l, i) => l.toLowerCase() !== sorted[i]?.toLowerCase());
       if (unsorted !== -1) {
-        return fail(`line ${unsorted + 1} ("${lines[unsorted]}") breaks ${descending ? "reverse" : "alphabetical"} order`);
+        return fail(
+          `line ${unsorted + 1} ("${lines[unsorted]}") breaks ${descending ? "reverse" : "alphabetical"} order`,
+        );
       }
     }
     if (task.expectLineRegex) {
@@ -442,7 +459,11 @@ export interface EvalRunOptions {
 }
 
 function verdictOf(baseline: EvalArmResult, treatment: EvalArmResult): EvalVerdict {
-  return treatment.passRate > baseline.passRate ? "candidate-wins" : treatment.passRate < baseline.passRate ? "baseline-wins" : "tie";
+  return treatment.passRate > baseline.passRate
+    ? "candidate-wins"
+    : treatment.passRate < baseline.passRate
+      ? "baseline-wins"
+      : "tie";
 }
 
 function validityOf(baseline: EvalArmResult, treatment: EvalArmResult): { valid: boolean; invalidReason?: string } {
@@ -458,7 +479,12 @@ function validityOf(baseline: EvalArmResult, treatment: EvalArmResult): { valid:
 export async function runEvalComparison(taskSet: EvalTaskSet, options: EvalRunOptions): Promise<EvalReport> {
   const repeats = Math.max(1, options.repeats ?? 1);
   const baseline = await runEvalArm(taskSet, options.runner, false, { repeats, judge: options.judge });
-  const treatment = await runEvalArm(taskSet, options.runner, { only: [options.skillName] }, { repeats, judge: options.judge });
+  const treatment = await runEvalArm(
+    taskSet,
+    options.runner,
+    { only: [options.skillName] },
+    { repeats, judge: options.judge },
+  );
   return {
     taskSet: taskSet.name,
     skill: options.skillName,
@@ -480,7 +506,12 @@ export async function runEvalAgainstBaseline(
   options: EvalRunOptions & { stored: { arm: EvalArmResult; repeats: number } },
 ): Promise<EvalReport> {
   const repeats = Math.max(1, options.repeats ?? 1);
-  const treatment = await runEvalArm(taskSet, options.runner, { only: [options.skillName] }, { repeats, judge: options.judge });
+  const treatment = await runEvalArm(
+    taskSet,
+    options.runner,
+    { only: [options.skillName] },
+    { repeats, judge: options.judge },
+  );
   return {
     taskSet: taskSet.name,
     skill: options.skillName,

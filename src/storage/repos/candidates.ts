@@ -52,7 +52,16 @@ export class SkillCandidateRepo {
       .prepare(
         "INSERT INTO skill_candidates (id, pattern_id, status, name, description, skill_md_path, provenance_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       )
-      .run(row.id, row.patternId, row.status, row.name, row.description, row.skillMdPath, JSON.stringify(row.provenance), row.createdAt);
+      .run(
+        row.id,
+        row.patternId,
+        row.status,
+        row.name,
+        row.description,
+        row.skillMdPath,
+        JSON.stringify(row.provenance),
+        row.createdAt,
+      );
   }
 
   get(id: string): SkillCandidateRow | undefined {

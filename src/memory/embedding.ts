@@ -29,7 +29,9 @@ export interface LocalEmbedderOptions {
 
 export function localEmbedder(options: LocalEmbedderOptions = {}): PassageEmbedder {
   const model = options.model ?? "Xenova/multilingual-e5-small";
-  let extractor: Promise<{ (texts: string[], opts: Record<string, unknown>): Promise<{ data: Float32Array; dims: number[] }> }> | undefined;
+  let extractor:
+    | Promise<{ (texts: string[], opts: Record<string, unknown>): Promise<{ data: Float32Array; dims: number[] }> }>
+    | undefined;
 
   const load = () => {
     extractor ??= (async () => {

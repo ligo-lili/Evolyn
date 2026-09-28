@@ -17,7 +17,14 @@ describe("RunManager (fake StreamFn, no API key)", () => {
   it("runs a scripted task end to end: prompt → tool call → tool result → final answer", async () => {
     const steps = [
       assistantMessage(
-        [{ type: "toolCall", id: "call_1", name: "write_file", arguments: { path: "out/hello.txt", content: "hello harness" } }],
+        [
+          {
+            type: "toolCall",
+            id: "call_1",
+            name: "write_file",
+            arguments: { path: "out/hello.txt", content: "hello harness" },
+          },
+        ],
         "toolUse",
       ),
       assistantMessage([{ type: "text", text: "done: wrote out/hello.txt" }], "stop"),

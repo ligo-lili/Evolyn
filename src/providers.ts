@@ -44,7 +44,7 @@ const QWEN_MODELS: Model<"openai-completions">[] = [
   // calls without enable_thinking=false — eval runs only stream, distill/judge
   // calls on these ids would need HARNESS_DISTILL_MODEL pointed elsewhere.
   qwenModel("qwen3-14b", 131_072, 16_384),
-  qwenModel("qwen3-8b", 131_072, 16_384),
+  qwenModel("qwen3-8b", 131_072, 8_192), // 8b caps max_tokens at 8192 (verified live)
   qwenModel("qwen3.5-35b-a3b", 131_072, 16_384),
   qwenModel("qwen3.6-27b", 131_072, 16_384),
   qwenModel("qwen3.5-flash", 131_072, 16_384),

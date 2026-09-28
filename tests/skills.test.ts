@@ -705,6 +705,16 @@ describe("LLM judge (deterministic first, judge second)", () => {
     tmp.enter();
     const rateLimited: EvalRawRun = { taskId: "t", status: "failed", error: '429: {"message":"Rate limit exceeded: free-models-per-day"}' };
     expect(isInfraFailure(rateLimited)).toBe(true);
+    // Aliyun wraps out-of-credit as HTTP 400 + Arrearage (阶段 14 live finding)
+    expect(
+      isInfraFailure({
+        taskId: "t",
+        status: "failed",
+        error: 'run failed: 400: {"message":"Access denied, please make sure your account is in good standing.","type":"Arrearage","code":"Arrearage"}',
+      }),
+    ).toBe(true);
+    // a bare 400 without business-code words is a normal bad request, not infra
+    expect(isInfraFailure({ taskId: "t", status: "failed", error: '400: {"error":"invalid arguments"}' })).toBe(false);
     expect(isInfraFailure({ taskId: "t", status: "failed", error: "ENOSPC: no space left" })).toBe(false);
     expect(isInfraFailure({ taskId: "t", status: "completed" })).toBe(false);
     const judged = judgeRun({ id: "t", task: "x" }, rateLimited);

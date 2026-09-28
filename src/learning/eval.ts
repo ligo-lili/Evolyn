@@ -236,9 +236,13 @@ export interface EvalResult extends EvalRawRun {
  * error says nothing about the model's ability, and counting them as task
  * failures corrupts the comparison (阶段 12 lesson — the first weak-model
  * treatment arm was wiped out by OpenRouter's free-tier daily quota).
- * Vocabulary matches the retry.ts transient-error style.
+ * Vocabulary matches the retry.ts transient-error style. 阶段 14 addition:
+ * Aliyun wraps out-of-credit as HTTP 400 + "Arrearage"/"overdue-payment"
+ * ("Access denied") — a bare 400 is a normal bad request, so the business
+ * words carry that match.
  */
-const INFRA_ERROR_PATTERN = /\b429\b|rate.?limit|quota|insufficient credits|unauthorized|\b401\b|\b403\b|invalid api key|provider is not configured|not configured/i;
+const INFRA_ERROR_PATTERN =
+  /\b429\b|\b401\b|\b403\b|\b400\b[\s\S]{0,200}(arrearage|overdue|insufficient)|arrearage|overdue[- ]?payment|access denied|rate.?limit|quota|insufficient credits|unauthorized|invalid api key|provider is not configured|not configured/i;
 
 export function isInfraFailure(run: EvalRawRun): boolean {
   return run.status !== "completed" && run.error !== undefined && INFRA_ERROR_PATTERN.test(run.error);

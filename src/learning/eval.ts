@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { resolveModel } from "../providers.js";
 import { RunManager, type SkillInjection } from "../runtime/run-manager.js";
@@ -19,6 +20,14 @@ import { RunManager, type SkillInjection } from "../runtime/run-manager.js";
  * the requirement but a first-shot model may still miss it; (b) `repeats` so
  * one fluky pass doesn't hide a real gap; (c) `setupFiles` fixtures rewritten
  * before EVERY run so neither arm nor repeat inherits another's workspace.
+ *
+ * 阶段 14 hardening (borrowed from pi's own evals package, §27):
+ * (d) arms alternate per repeat (odd/even) — a fixed baseline-first order
+ * confounds arm with drift/quota-depletion order; (e) every comparison writes
+ * a session.jsonl (one line per run, with the run's trace path) + a pinned
+ * protocol.json — failed tasks are replayable and protocols are comparable
+ * by sha256; (f) "low scores are data": only infrastructure failures
+ * invalidate a report — a weak model IS the finding.
  */
 
 export interface EvalTask {
@@ -149,6 +158,8 @@ export interface EvalRawRun {
   verified?: boolean;
   /** Last non-empty assistant text — the LLM judge sees this. */
   finalText?: string;
+  /** JSONL trace of this run — session.jsonl links here for replay/attribution. */
+  tracePath?: string;
 }
 
 /**
@@ -435,6 +446,10 @@ export interface EvalReport {
   skillVersion?: number;
   /** 阶段 14: toolset under test — part of the protocol identity. */
   toolset?: string;
+  /** 阶段 14: sha256 of the pinned protocol — equal sha means equal protocol. */
+  protocolSha256?: string;
+  /** 阶段 14: session.jsonl with one line per run (replay/attribution index). */
+  session?: string;
   repeats: number;
   /** "fresh" = baseline arm re-run now; "stored" = recorded regression baseline. */
   baselineSource: "fresh" | "stored";
@@ -454,6 +469,10 @@ export interface EvalRunOptions {
   skillVersion?: number;
   /** 阶段 14: toolset under test, recorded on the report for protocol identity. */
   toolset?: string;
+  /** 阶段 14: the evaluated model — part of the protocol sha. */
+  modelSpec?: string;
+  /** 阶段 14: directory for session.jsonl + protocol.json artifacts. */
+  artifactsDir?: string;
   repeats?: number;
   judge?: JudgeFn;
 }
@@ -475,21 +494,155 @@ function validityOf(baseline: EvalArmResult, treatment: EvalArmResult): { valid:
   };
 }
 
-/** Full A/B: baseline (no skills) vs treatment (the named skill forced in), both fresh. */
+// ---------- 阶段 14: pinned protocol + session artifacts (pi evals §27 borrow) ----------
+
+/** Bump when judging SEMANTICS change — the sha pins protocol + judge era. */
+export const EVAL_JUDGE_VERSION = 2;
+
+/** Key-sorted JSON — the canonical form the protocol sha is computed over. */
+export function stableStringify(value: unknown): string {
+  const sort = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.map(sort);
+    if (v !== null && typeof v === "object") {
+      return Object.fromEntries(
+        Object.entries(v as Record<string, unknown>)
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([k, vv]) => [k, sort(vv)]),
+      );
+    }
+    return v;
+  };
+  return JSON.stringify(sort(value));
+}
+
+export interface EvalProtocol {
+  taskSet: string;
+  tasks: unknown[];
+  model: string;
+  toolset?: string;
+  repeats: number;
+  judgeVersion: number;
+}
+
+/** The protocol pins everything the comparison depends on — except the arm
+ * itself (skill vs no-skill), which is the variable under test. Equal
+ * sha256 ⇒ the two reports are comparable. */
+export function buildProtocol(
+  taskSet: EvalTaskSet,
+  opts: { model: string; toolset?: string; repeats: number },
+): { protocol: EvalProtocol; sha256: string } {
+  const protocol: EvalProtocol = {
+    taskSet: taskSet.name,
+    tasks: [...taskSet.tasks].sort((a, b) => a.id.localeCompare(b.id)),
+    model: opts.model,
+    toolset: opts.toolset,
+    repeats: opts.repeats,
+    judgeVersion: EVAL_JUDGE_VERSION,
+  };
+  const sha256 = createHash("sha256").update(stableStringify(protocol)).digest("hex");
+  return { protocol, sha256 };
+}
+
+/** One line of session.jsonl — the replay/attribution index for one run. */
+export interface EvalSessionLine {
+  seq: number;
+  repeat: number;
+  arm: "baseline" | "treatment";
+  taskId: string;
+  runId?: string;
+  tracePath?: string;
+  status: string;
+  pass: boolean;
+  reason?: string;
+  verified?: boolean;
+  tokens?: number;
+  durationMs?: number;
+}
+
+function writeSessionArtifacts(
+  dir: string,
+  protocol: EvalProtocol,
+  sha256: string,
+  session: readonly EvalSessionLine[],
+): string {
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "protocol.json"), JSON.stringify({ ...protocol, sha256 }, null, 2), "utf8");
+  const sessionFile = path.join(dir, "session.jsonl");
+  fs.writeFileSync(sessionFile, session.map((l) => JSON.stringify(l)).join("\n") + "\n", "utf8");
+  return sessionFile;
+}
+
+/** Full A/B: arms INTERLEAVE per repeat (odd repeat → baseline first, even →
+ * treatment first) so arm is never confounded with drift or quota-depletion
+ * order. Writes protocol.json + session.jsonl when an artifactsDir is given. */
 export async function runEvalComparison(taskSet: EvalTaskSet, options: EvalRunOptions): Promise<EvalReport> {
   const repeats = Math.max(1, options.repeats ?? 1);
-  const baseline = await runEvalArm(taskSet, options.runner, false, { repeats, judge: options.judge });
-  const treatment = await runEvalArm(
-    taskSet,
-    options.runner,
-    { only: [options.skillName] },
-    { repeats, judge: options.judge },
-  );
+  const { protocol, sha256 } = buildProtocol(taskSet, {
+    model: options.modelSpec ?? "",
+    toolset: options.toolset,
+    repeats,
+  });
+  const baselineResults: EvalResult[] = [];
+  const treatmentResults: EvalResult[] = [];
+  const session: EvalSessionLine[] = [];
+  let seq = 0;
+  for (let repeat = 1; repeat <= repeats; repeat++) {
+    const arms: Array<["baseline" | "treatment", SkillInjection | false]> =
+      repeat % 2 === 1
+        ? [
+            ["baseline", false],
+            ["treatment", { only: [options.skillName] }],
+          ]
+        : [
+            ["treatment", { only: [options.skillName] }],
+            ["baseline", false],
+          ];
+    for (const [arm, skills] of arms) {
+      for (const task of taskSet.tasks) {
+        prepareTaskWorkspace(task);
+        const raw = await options.runner(task, skills);
+        let judged = judgeRun(task, raw, repeat);
+        if (judged.pass && task.judgeInstructions && options.judge) {
+          const verdict = await options.judge({
+            task: task.task,
+            judgeInstructions: task.judgeInstructions,
+            finalText: raw.finalText,
+            status: raw.status,
+          });
+          judged = { ...judged, pass: verdict.pass, reason: verdict.pass ? undefined : verdict.reason };
+        }
+        seq += 1;
+        session.push({
+          seq,
+          repeat,
+          arm,
+          taskId: task.id,
+          runId: raw.runId,
+          tracePath: raw.tracePath,
+          status: raw.status,
+          pass: judged.pass,
+          reason: judged.reason,
+          verified: raw.verified,
+          tokens: raw.tokens,
+          durationMs: raw.durationMs,
+        });
+        (arm === "baseline" ? baselineResults : treatmentResults).push(judged);
+      }
+    }
+  }
+  const baseline = summarizeArm("baseline", baselineResults);
+  const treatment = summarizeArm("treatment", treatmentResults);
+  let sessionFile: string | undefined;
+  if (options.artifactsDir) {
+    sessionFile = writeSessionArtifacts(options.artifactsDir, protocol, sha256, session);
+  }
   return {
     taskSet: taskSet.name,
     skill: options.skillName,
     skillVersion: options.skillVersion,
     toolset: options.toolset,
+    protocolSha256: sha256,
+    session: sessionFile,
     repeats,
     baselineSource: "fresh",
     baseline,
@@ -512,11 +665,39 @@ export async function runEvalAgainstBaseline(
     { only: [options.skillName] },
     { repeats, judge: options.judge },
   );
+  let sessionFile: string | undefined;
+  const protocolSha = options.modelSpec
+    ? buildProtocol(taskSet, { model: options.modelSpec, toolset: options.toolset, repeats }).sha256
+    : undefined;
+  if (options.artifactsDir && options.modelSpec) {
+    const { protocol } = buildProtocol(taskSet, { model: options.modelSpec, toolset: options.toolset, repeats });
+    sessionFile = writeSessionArtifacts(
+      options.artifactsDir,
+      protocol,
+      protocolSha ?? "",
+      treatment.results.map((r, i) => ({
+        seq: i + 1,
+        repeat: r.repeat,
+        arm: "treatment" as const,
+        taskId: r.taskId,
+        runId: r.runId,
+        tracePath: r.tracePath,
+        status: r.status,
+        pass: r.pass,
+        reason: r.reason,
+        verified: r.verified,
+        tokens: r.tokens,
+        durationMs: r.durationMs,
+      })),
+    );
+  }
   return {
     taskSet: taskSet.name,
     skill: options.skillName,
     skillVersion: options.skillVersion,
     toolset: options.toolset,
+    protocolSha256: protocolSha,
+    session: sessionFile,
     repeats,
     baselineSource: "stored",
     baseline: options.stored.arm,
@@ -606,6 +787,7 @@ export function defaultEvalRunner(modelSpec: string, options: DefaultRunnerOptio
         toolCalls,
         verified: readBackVerified(result.messages),
         finalText: lastAssistantText(result.messages),
+        tracePath: result.tracePath,
       };
     } finally {
       manager.close();

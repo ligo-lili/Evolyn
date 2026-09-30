@@ -23,7 +23,15 @@ import { promoteCandidate } from "../src/skills/promote.js";
 import { PatternRepo } from "../src/storage/repos/patterns.js";
 import { minePatternsFromDb } from "../src/learning/miner.js";
 import { draftSkillFromPattern } from "../src/learning/candidate.js";
-import { judgeRun, prepareRepoFixture, runEvalArm, type EvalRunner } from "../src/learning/eval.js";
+import {
+  buildProtocol,
+  judgeRun,
+  prepareRepoFixture,
+  runEvalArm,
+  runEvalComparison,
+  stableStringify,
+  type EvalRunner,
+} from "../src/learning/eval.js";
 import { assistantMessage, FAKE_MODEL, makeTempCwd, scriptedStreamFn } from "./helpers.js";
 
 const tmp = makeTempCwd();
@@ -592,6 +600,86 @@ describe("阶段 14 coding eval mechanics", () => {
     };
     const fixed = await runEvalArm(inline, fixingRunner, false);
     expect(fixed.passRate).toBe(1);
+    tmp.leave();
+  });
+});
+
+// ---------- 阶段 14 hardening: pinned protocol, interleaved arms, session artifacts ----------
+
+describe("阶段 14 protocol + session artifacts", () => {
+  it("stableStringify is key-order independent", () => {
+    expect(stableStringify({ b: 1, a: { d: 2, c: 3 } })).toBe(stableStringify({ a: { c: 3, d: 2 }, b: 1 }));
+  });
+
+  it("buildProtocol: deterministic sha, sensitive to task/model changes", () => {
+    tmp.enter();
+    const ts = {
+      name: "p",
+      tasks: [
+        { id: "a", task: "one" },
+        { id: "b", task: "two" },
+      ],
+    };
+    const base = buildProtocol(ts, { model: "m", repeats: 2 });
+    const again = buildProtocol(ts, { model: "m", repeats: 2 });
+    expect(again.sha256).toBe(base.sha256);
+    const reordered = {
+      name: "p",
+      tasks: [
+        { id: "b", task: "two" },
+        { id: "a", task: "one" },
+      ],
+    } as typeof ts;
+    expect(buildProtocol(reordered, { model: "m", repeats: 2 }).sha256).toBe(base.sha256); // order-insensitive
+    expect(buildProtocol(ts, { model: "OTHER", repeats: 2 }).sha256).not.toBe(base.sha256);
+    expect(
+      buildProtocol({ name: "p", tasks: [{ id: "a", task: "CHANGED" }] }, { model: "m", repeats: 2 }).sha256,
+    ).not.toBe(base.sha256);
+    tmp.leave();
+  });
+
+  it("comparison arms interleave per repeat and session.jsonl indexes every run", async () => {
+    tmp.enter();
+    const calls: Array<{ arm: string; taskId: string }> = [];
+    const taskSet = {
+      name: "interleave",
+      tasks: [
+        { id: "t1", task: "x" },
+        { id: "t2", task: "x" },
+      ],
+    };
+    const runner: EvalRunner = async (task, skills) => {
+      const arm = skills === false ? "baseline" : "treatment";
+      calls.push({ arm, taskId: task.id });
+      return { taskId: task.id, status: "completed", tracePath: path.join(tmp.dir, task.id + ".jsonl"), tokens: 1 };
+    };
+    const artifactsDir = path.join(tmp.dir, "artifacts");
+    const report = await runEvalComparison(taskSet, { runner, skillName: "s", modelSpec: "m", artifactsDir, repeats: 2 });
+    // odd repeat → baseline first; even repeat → treatment first
+    expect(calls[0]).toEqual({ arm: "baseline", taskId: "t1" });
+    expect(calls[2]).toEqual({ arm: "treatment", taskId: "t1" });
+    expect(calls[4]).toEqual({ arm: "treatment", taskId: "t1" });
+    expect(calls[6]).toEqual({ arm: "baseline", taskId: "t1" });
+    expect(calls).toHaveLength(8);
+    expect(report.protocolSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(report.session).toContain("session.jsonl");
+
+    const sessionLines = fs
+      .readFileSync(report.session!, "utf8")
+      .trim()
+      .split("\n")
+      .map((l) => JSON.parse(l));
+    expect(sessionLines).toHaveLength(8);
+    expect(sessionLines[0]).toMatchObject({
+      seq: 1,
+      arm: "baseline",
+      taskId: "t1",
+      tracePath: expect.stringContaining("t1.jsonl"),
+    });
+    expect(sessionLines[2]).toMatchObject({ arm: "treatment" });
+    const protocol = JSON.parse(fs.readFileSync(path.join(artifactsDir, "protocol.json"), "utf8"));
+    expect(protocol.model).toBe("m");
+    expect(protocol.sha256).toBe(report.protocolSha256);
     tmp.leave();
   });
 });

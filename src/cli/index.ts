@@ -10,7 +10,7 @@ import { summarize } from "../trace/query.js";
 import { renderReplay, renderSummary, renderTimeline } from "../trace/show.js";
 import { defaultDbPath, openDatabase } from "../storage/db.js";
 import { TraceEventRepo } from "../storage/repos/trace-events.js";
-import { tracesDir } from "../runtime/paths.js";
+import { harnessDataDir, tracesDir } from "../runtime/paths.js";
 import { ConsoleReporter } from "../runtime/reporter.js";
 import { RunManager } from "../runtime/run-manager.js";
 import { type ApprovalMode } from "../runtime/approval.js";
@@ -24,6 +24,7 @@ import { localEmbedder } from "../memory/embedding.js";
 import { minePatternsFromDb } from "../learning/miner.js";
 import { draftSkillFromPattern } from "../learning/candidate.js";
 import {
+  buildProtocol,
   defaultEvalRunner,
   loadTaskSet,
   renderEvalReport,
@@ -490,6 +491,8 @@ async function main(): Promise<number> {
         return 2;
       }
       const runner = defaultEvalRunner(spec, { toolset: toolsFlag as "demo" | "coding" | undefined });
+      const artifactsDir = path.join(harnessDataDir(process.cwd()), "evals", taskSet.name, `run-${new Date().toISOString().replace(/[:.]/g, "-")}`);
+      const currentSha = buildProtocol(taskSet, { model: spec, toolset: toolsFlag, repeats }).sha256;
       let report;
       if (flags["against-baseline"] === true) {
         const db2 = openDatabase(dbPath);
@@ -505,6 +508,11 @@ async function main(): Promise<number> {
           );
           return 1;
         }
+        if (stored.protocolSha256 && stored.protocolSha256 !== currentSha) {
+          console.warn(
+            `⚠ protocol sha mismatch: stored baseline ${stored.protocolSha256.slice(0, 12)} vs current ${currentSha.slice(0, 12)} — the comparison spans different protocols`,
+          );
+        }
         if (stored.repeats !== repeats) {
           console.warn(`warning: stored baseline used repeats=${stored.repeats}, this run repeats=${repeats}`);
         }
@@ -516,6 +524,8 @@ async function main(): Promise<number> {
           skillName,
           skillVersion: registered.version,
           toolset: toolsFlag,
+          modelSpec: spec,
+          artifactsDir,
           repeats,
           stored: { arm: stored.arm, repeats: stored.repeats },
         });
@@ -528,6 +538,8 @@ async function main(): Promise<number> {
           skillName,
           skillVersion: registered.version,
           toolset: toolsFlag,
+          modelSpec: spec,
+          artifactsDir,
           repeats,
         });
       }
@@ -563,8 +575,9 @@ async function main(): Promise<number> {
       }
       const taskSet = loadTaskSet(file);
       const runner = defaultEvalRunner(spec, { toolset: toolsFlag as "demo" | "coding" | undefined });
+      const protocolSha = buildProtocol(taskSet, { model: spec, toolset: toolsFlag, repeats }).sha256;
       console.log(
-        `recording no-skill baseline: ${taskSet.tasks.length} task(s) × ${repeats} repeat(s) with ${spec} (tools: ${toolsFlag ?? "demo"})…`,
+        `recording no-skill baseline: ${taskSet.tasks.length} task(s) × ${repeats} repeat(s) with ${spec} (tools: ${toolsFlag ?? "demo"}, protocol ${protocolSha.slice(0, 12)})…`,
       );
       const arm = await runEvalArm(taskSet, runner, false, { repeats });
       const db = openDatabase(dbPath);
@@ -574,6 +587,7 @@ async function main(): Promise<number> {
           evalSet: taskSet.name,
           modelSpec: spec,
           toolset: toolsFlag,
+          protocolSha256: protocolSha,
           repeats,
           arm,
         });

@@ -238,6 +238,13 @@ export const MIGRATIONS: Migration[] = [
     name: "baselines-toolset",
     sql: `ALTER TABLE eval_baselines ADD COLUMN toolset TEXT;`,
   },
+  {
+    // 阶段 14: the pinned protocol sha (protocol.json) — baselines are only
+    // comparable to evals sharing the same sha.
+    id: 11,
+    name: "baselines-protocol-sha",
+    sql: `ALTER TABLE eval_baselines ADD COLUMN protocol_sha256 TEXT;`,
+  },
 ];
 
 export function migrate(db: DatabaseSync): void {

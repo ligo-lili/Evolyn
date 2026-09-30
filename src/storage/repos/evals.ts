@@ -93,6 +93,8 @@ export interface EvalBaselineRow {
   modelSpec: string;
   /** 阶段 14: the toolset is part of the eval protocol (demo/coding). */
   toolset?: string;
+  /** 阶段 14: sha256 of the pinned protocol — equal sha means comparable. */
+  protocolSha256?: string;
   repeats: number;
   arm: EvalArmResult;
   recordedAt: string;
@@ -104,6 +106,7 @@ function rowToBaseline(r: Row): EvalBaselineRow {
     evalSet: String(r.eval_set),
     modelSpec: String(r.model_spec),
     toolset: r.toolset == null ? undefined : String(r.toolset),
+    protocolSha256: r.protocol_sha256 == null ? undefined : String(r.protocol_sha256),
     repeats: Number(r.repeats),
     arm: JSON.parse(String(r.arm_json)) as EvalArmResult,
     recordedAt: String(r.recorded_at),
@@ -123,6 +126,7 @@ export class EvalBaselineRepo {
     evalSet: string;
     modelSpec: string;
     toolset?: string;
+    protocolSha256?: string;
     repeats: number;
     arm: EvalArmResult;
   }): EvalBaselineRow {
@@ -131,19 +135,21 @@ export class EvalBaselineRepo {
       evalSet: input.evalSet,
       modelSpec: input.modelSpec,
       toolset: input.toolset,
+      protocolSha256: input.protocolSha256,
       repeats: input.repeats,
       arm: input.arm,
       recordedAt: new Date().toISOString(),
     };
     this.db
       .prepare(
-        "INSERT INTO eval_baselines (id, eval_set, model_spec, toolset, repeats, arm_json, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO eval_baselines (id, eval_set, model_spec, toolset, protocol_sha256, repeats, arm_json, recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
         row.id,
         row.evalSet,
         row.modelSpec,
         row.toolset ?? null,
+        row.protocolSha256 ?? null,
         row.repeats,
         JSON.stringify(row.arm),
         row.recordedAt,

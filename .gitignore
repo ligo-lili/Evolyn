@@ -1,37 +1,18 @@
+# dependencies & build
 node_modules/
 dist/
+
+# runtime state (db, traces, memory, evidence) and cloned fixture repos
 .harness/
+/repos/
+
+# logs & secrets
 *.log
 .env
- 
-# demo run artifacts 
-/hello.txt 
-/note.txt
-/groceries.txt 
-/fruits.txt 
-/veggies.txt 
-/metals.txt
-STATUS.md 
-/budget-ok.txt 
-/drinks.txt 
-/books.txt
-/sorted-list.txt 
-/checklist.txt 
-/pantry.txt 
-/version.txt 
-/planets.txt 
-/mult-source.txt 
-/mult-doubled7.txt 
-/probe-*.txt
+
+# demo/eval runs drop artifacts into the repo root
+/*.txt
 /expected.tmp
-/smoke.txt
-/smoke2.txt
-/months-desc.txt 
-/animals-cons.txt 
-/brands-20.txt 
-/langs-desc.txt 
-/trees-30.txt 
-/pantry-fix.txt
-/smoke3.txt
-/smoke4.txt
-/repos/
+
+# local-only docs
+STATUS.md

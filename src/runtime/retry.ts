@@ -37,6 +37,9 @@ const TRANSIENT_PATTERNS: RegExp[] = [
 ];
 
 export function isTransientError(error: unknown): boolean {
+  // A wrapper-level timeout is NEVER transient regardless of its message
+  // (加固期 P1): the first execution may still be running in the background.
+  if (isToolTimeoutError(error)) return false;
   const message = error instanceof Error ? `${error.message}` : String(error);
   return TRANSIENT_PATTERNS.some((p) => p.test(message));
 }
@@ -67,6 +70,10 @@ export function withRetry(
             error: err instanceof Error ? err.message : String(err),
           });
           await new Promise((resolve) => setTimeout(resolve, backoffMs * attempt));
+          // 加固期复核: the abort may land DURING the backoff sleep — re-check
+          // before starting the next attempt, or an aborted run would still
+          // execute the tool again.
+          if (signal?.aborted) break;
         }
       }
       throw lastError;

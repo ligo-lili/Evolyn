@@ -476,6 +476,7 @@ export class RunManager {
     const runRepo = new RunRepo(database);
     const storedRow = runRepo.get(runId);
     if (!storedRow) throw new HarnessError(`run "${runId}" not found`);
+    mkdirSync(traceDir, { recursive: true });
     if (storedRow.status === "running") {
       const lastStoredEvent = new TraceEventRepo(database).getByRun(runId).at(-1);
       if (lastStoredEvent?.type === "run_end") {
@@ -493,23 +494,26 @@ export class RunManager {
         return { record: healed, messages: [], tracePath: traceFile };
       }
     }
+    // 阶段 13 (P1-2): the two sinks are written per-event (JSONL first, SQLite
+    // second) — a kill between the writes leaves a JSONL tail SQLite never saw.
+    // SQLite is the resume authority; reconcile the JSONL BEFORE rebuilding, or
+    // duplicated seqs would permanently fail readTraceFile. The reconcile ALSO
+    // backfills mid-log SQLite holes from the JSONL copy (加固期复核) — it must
+    // run BEFORE loadCrashedRun so the recovered transcript sees them.
+    const sqliteEvents = new TraceEventRepo(database).getByRun(runId);
+    const reconciled = reconcileJsonlTrace(traceFile, sqliteEvents, (event) => {
+      new TraceEventRepo(database).append(event);
+    });
+    if (reconciled.truncated > 0 || reconciled.rebuilt || reconciled.backfilled > 0) {
+      process.stderr.write(
+        `[harness] trace JSONL reconciled with SQLite (authoritative): dropped ${reconciled.truncated} tail event(s), rebuilt=${reconciled.rebuilt}, backfilled=${reconciled.backfilled}\n`,
+      );
+    }
     const crashed = loadCrashedRun(database, runId, resolvedTools);
 
     const record: RunRecord = { ...crashed.record, status: "running", finishedAt: undefined, error: undefined };
     this.runs.set(record.id, record);
 
-    mkdirSync(traceDir, { recursive: true });
-    // 阶段 13 (P1-2): the two sinks are written per-event (JSONL first, SQLite
-    // second) — a kill between the writes leaves a JSONL tail SQLite never saw.
-    // SQLite is the resume authority; reconcile the JSONL BEFORE continuing the
-    // seq, or duplicated seqs would permanently fail readTraceFile.
-    const sqliteEvents = new TraceEventRepo(database).getByRun(runId);
-    const reconciled = reconcileJsonlTrace(traceFile, sqliteEvents);
-    if (reconciled.truncated > 0 || reconciled.rebuilt) {
-      process.stderr.write(
-        `[harness] trace JSONL reconciled with SQLite (authoritative): dropped ${reconciled.truncated} tail event(s), rebuilt=${reconciled.rebuilt}\n`,
-      );
-    }
     // 加固期 (P2): resume accepts its own fault spec — mid_recovery kills with
     // N calls already resolved; between_sinks fires inside the fan-out below.
     const faultController = faultSpec ? new FaultController(faultSpec) : undefined;

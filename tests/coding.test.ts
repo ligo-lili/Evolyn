@@ -385,6 +385,54 @@ describe("P1-2 trace reconciliation (阶段 13)", () => {
     tmp.leave();
   });
 
+  it("backfills a mid-log SQLite hole from the JSONL copy; the tail stays truncated (加固期复核)", () => {
+    tmp.enter();
+    const dbPath = path.join(tmp.dir, "recon-hole", "harness.db");
+    const db = openDatabase(dbPath);
+    let all: Array<Record<string, unknown> & { seq: number }> = [];
+    try {
+      new RunRepo(db).insert({
+        id: "r1",
+        task: "t",
+        modelSpec: "m",
+        status: "running",
+        startedAt: new Date().toISOString(),
+      });
+      const repo = new TraceEventRepo(db);
+      const mk = (seq: number): Record<string, unknown> & { seq: number } => ({
+        v: 1,
+        seq,
+        ts: new Date().toISOString(),
+        runId: "r1",
+        type: seq === 1 ? "run_start" : "message_end",
+        ...(seq === 1 ? { task: "t", modelSpec: "m" } : { message: { role: "user", content: "x", timestamp: seq } }),
+      });
+      // SQLite has a HOLE at seq 3 (its sink failed); the JSONL copy survived.
+      for (const seq of [1, 2, 4, 5]) {
+        const event = mk(seq);
+        repo.append(event as never);
+        all.push(event);
+      }
+      const hole = mk(3);
+      all = [...all.slice(0, 2), hole, ...all.slice(2)];
+      const file = path.join(tmp.dir, "recon-hole", "trace.jsonl");
+      fs.writeFileSync(file, all.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf8");
+
+      const backfilledSeqs: number[] = [];
+      const result = reconcileJsonlTrace(file, all.filter((e) => e.seq !== 3) as never, (event) => {
+        backfilledSeqs.push(event.seq as number);
+        repo.append(event as never);
+      });
+      expect(result.backfilled).toBe(1);
+      expect(backfilledSeqs).toEqual([3]);
+      const after = new TraceEventRepo(db).getByRun("r1");
+      expect(after.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5]);
+    } finally {
+      db.close();
+    }
+    tmp.leave();
+  });
+
   it("rebuilds when the JSONL is damaged mid-write (partial final line)", () => {
     tmp.enter();
     const dbPath = path.join(tmp.dir, "recon3", "harness.db");
@@ -947,6 +995,35 @@ describe("加固期: tool path fence", () => {
     expect(files).toHaveLength(1);
     expect(files[0]).toBe("evil.md");
     expect(fs.existsSync(path.join(tmp.dir, "evil.md"))).toBe(false);
+    tmp.leave();
+  });
+
+  it("rejects NTFS stream specifiers and allows the workspace root itself (加固期复核)", async () => {
+    tmp.enter();
+    const calls: string[] = [];
+    const fenced = withPathFence(
+      [
+        {
+          name: "probe",
+          label: "Probe",
+          description: "probe tool",
+          parameters: {} as never,
+          replay: "safe" as const,
+          execute: async (_id: string, params: { path: string }) => {
+            calls.push(params.path);
+            return { content: [{ type: "text", text: "ok" }], details: undefined };
+          },
+        } as never,
+      ],
+      tmp.dir,
+    );
+    fs.writeFileSync(path.join(tmp.dir, "host.txt"), "x", "utf8");
+    if (process.platform === "win32") {
+      // an ADS write would land INSIDE the root but is hidden from listings — rejected
+      await expect(fenced[0]!.execute("t1", { path: "host.txt:hidden" })).rejects.toThrow(/stream specifier/);
+    }
+    await fenced[0]!.execute("t2", { path: "." }); // the root itself is inside, not an escape
+    expect(calls).toEqual(["."]);
     tmp.leave();
   });
 

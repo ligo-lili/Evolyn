@@ -3,11 +3,13 @@ import path from "node:path";
 /**
  * Resolve a tool-supplied path against the workspace root and refuse escapes.
  * Absolute paths are allowed only when they already live inside the root.
+ * 加固期复核: the root itself (rel === "") is ALLOWED — `ls path="."` is a
+ * legitimate directory operation, not an escape.
  */
 export function resolveWorkspacePath(root: string, p: string): string {
   const resolved = path.isAbsolute(p) ? path.normalize(p) : path.resolve(path.resolve(root), p);
   const rel = path.relative(path.resolve(root), resolved);
-  if (rel === "" || rel === ".." || rel.startsWith(".." + path.sep) || path.isAbsolute(rel)) {
+  if (rel === ".." || rel.startsWith(".." + path.sep) || path.isAbsolute(rel)) {
     throw new Error(`path escapes workspace root: ${p}`);
   }
   return resolved;

@@ -26,6 +26,11 @@ export function withToolTimeout(tools: readonly AnyAgentTool[], timeoutMs: numbe
   return tools.map((tool) => ({
     ...tool,
     execute: async (toolCallId: string, params: any, signal?: AbortSignal, onUpdate?: any) => {
+      // 加固期复核: addEventListener does NOT fire for an already-aborted
+      // signal — a tool started after the run aborted must not start at all.
+      if (signal?.aborted) {
+        return Promise.reject(new Error(`tool ${tool.name} aborted before start`));
+      }
       const controller = new AbortController();
       const onOuterAbort = () => controller.abort();
       signal?.addEventListener("abort", onOuterAbort);

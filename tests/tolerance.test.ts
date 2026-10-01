@@ -364,6 +364,28 @@ describe("加固期: timeouts and aborts are never retried", () => {
     expect(calls).toHaveLength(1);
   });
 
+  it("an abort landing during the backoff sleep prevents the next attempt (加固期复核)", async () => {
+    const calls: number[] = [];
+    const controller = new AbortController();
+    const tool: AnyAgentTool = {
+      name: "flaky-safe",
+      label: "FlakySafe",
+      description: "transient failure once",
+      parameters: {} as never,
+      replay: "safe" as const,
+      execute: async () => {
+        calls.push(1);
+        throw new Error("socket hang up");
+      },
+    } as never;
+    const wrapped = withRetry([tool], { policy: { maxAttempts: 3, backoffMs: 40 } });
+    const run = wrapped[0]!.execute("t1", {}, controller.signal);
+    setTimeout(() => controller.abort(), 10); // lands inside the 40ms backoff window
+    await expect(run).rejects.toThrow(/socket hang up/); // attempt 1's error, no retry
+    await new Promise((resolve) => setTimeout(resolve, 120)); // a phantom attempt 2 would show up here
+    expect(calls).toHaveLength(1);
+  });
+
   it("the demo exec tool runs with a whitelisted environment and honors timeouts", async () => {
     tmp.enter();
     process.env.HARNESS_CANARY = "leaked-secret";

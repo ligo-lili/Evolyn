@@ -137,6 +137,11 @@ export function findCutIndex(messages: readonly AgentMessage[], keepRecentTokens
       return end + 1;
     }
   }
+  // Final fallback (加固期 P1): no user message, no toolResult inside the
+  // window. Keep the last message ONLY if it is not a toolResult — a tail
+  // starting with a toolResult whose assistant is summarized away is exactly
+  // the orphan this function exists to prevent. An empty tail is always legal.
+  if (messages[messages.length - 1]?.role === "toolResult") return messages.length;
   return messages.length - 1;
 }
 

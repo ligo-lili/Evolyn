@@ -13,6 +13,8 @@ export type ApprovalMode = "auto-approve" | "auto-deny" | "interactive";
 export interface ApprovalRequest {
   toolName: string;
   assessment: RiskAssessment;
+  /** One-line truncated view of the actual call arguments (加固期 P0). */
+  argsPreview?: string;
 }
 
 /** Decision function for interactive mode; the default prompts on stderr. */
@@ -26,13 +28,27 @@ export interface ApprovalOptions {
   approveFn?: ApproveFn;
 }
 
+/** One-line, truncated view of the call's actual arguments for approval prompts. */
+export function argsPreview(args: unknown, max = 160): string | undefined {
+  let text: string;
+  try {
+    text = JSON.stringify(args) ?? "";
+  } catch {
+    return undefined;
+  }
+  text = text.replace(/\s+/g, " ");
+  if (!text || text === "{}") return undefined;
+  return text.length > max ? text.slice(0, max) + "…" : text;
+}
+
 export function defaultApproveFn(): ApproveFn {
-  return async ({ toolName, assessment }) => {
+  return async ({ toolName, assessment, argsPreview: preview }) => {
     if (!process.stdin.isTTY) return false; // non-interactive: never approve
     const readline = await import("node:readline/promises");
     const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
     try {
-      const answer = await rl.question(`[approval] ${assessment.risk} ${toolName} — approve? (y/N) `);
+      const args = preview ? ` ${preview}` : "";
+      const answer = await rl.question(`[approval] ${assessment.risk} ${toolName}${args} — approve? (y/N) `);
       return /^y(es)?$/i.test(answer.trim());
     } finally {
       rl.close();
@@ -76,7 +92,7 @@ export function createPermissionGate(
       allowed = false;
       reason = `mode=auto-deny risk=${assessment.risk}`;
     } else {
-      allowed = await approver({ toolName, assessment });
+      allowed = await approver({ toolName, assessment, argsPreview: argsPreview(context.args) });
       reason = allowed
         ? `approved interactively (risk=${assessment.risk})`
         : `rejected interactively (risk=${assessment.risk})`;

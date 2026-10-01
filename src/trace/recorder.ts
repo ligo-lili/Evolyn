@@ -30,6 +30,12 @@ export class JsonlTraceSink implements TraceSink {
 /**
  * Assigns the per-run envelope (versioned seq + ts) once and fans the event
  * out to every sink, so all stores share identical seq numbering.
+ *
+ * 加固期 (P0): a FAILING sink no longer kills the run — it simply lacks that
+ * event (a hole), which resume-time reconciliation and the gap-tolerant reader
+ * handle; the checkpoint only lags further, which is always the safe direction.
+ * An optional onSinkBoundary hook fires after the FIRST sink and before the
+ * rest (the between_sinks fault point).
  */
 export class TraceRecorder {
   private seq: number;
@@ -37,10 +43,13 @@ export class TraceRecorder {
   constructor(
     readonly runId: string,
     private readonly sinks: TraceSink[],
-    options: { startSeq?: number } = {},
+    options: { startSeq?: number; onSinkBoundary?: (event: TraceEvent) => void } = {},
   ) {
     this.seq = options.startSeq ?? 0;
+    this.onSinkBoundary = options.onSinkBoundary;
   }
+
+  private readonly onSinkBoundary?: (event: TraceEvent) => void;
 
   runStart(task: string, modelSpec: string, fault?: string, capabilities?: readonly string[]): void {
     this.append({ type: "run_start", task, modelSpec, fault, capabilities });
@@ -76,6 +85,21 @@ export class TraceRecorder {
     // Envelope LAST: a payload field must never override the harness-owned
     // envelope (v/seq/ts/runId are the log's spine).
     const event = { ...payload, ...envelope } as TraceEvent;
-    for (const sink of this.sinks) sink.append(event);
+    this.sinks.forEach((sink, index) => {
+      if (index === 1 && this.onSinkBoundary) {
+        try {
+          this.onSinkBoundary(event);
+        } catch (err) {
+          process.stderr.write(`[trace] sink-boundary hook failed: ${err instanceof Error ? err.message : err}\n`);
+        }
+      }
+      try {
+        sink.append(event);
+      } catch (err) {
+        process.stderr.write(
+          `[trace] sink ${sink.constructor.name} failed to persist seq ${event.seq}: ${err instanceof Error ? err.message : err}\n`,
+        );
+      }
+    });
   }
 }

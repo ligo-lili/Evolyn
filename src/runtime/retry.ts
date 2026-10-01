@@ -1,4 +1,5 @@
 import type { AnyAgentTool } from "./tools/index.js";
+import { isToolTimeoutError } from "./tools/timeout.js";
 import type { HarnessAuditEvent } from "../trace/schema.js";
 
 /**
@@ -6,6 +7,10 @@ import type { HarnessAuditEvent } from "../trace/schema.js";
  * automatically with backoff; non-idempotent tools are never auto-retried
  * (their failures flow back to the model, which chooses another approach —
  * the "换方案" tier). Retries are audited as `tool_retry` events.
+ *
+ * 加固期 (P1): timeouts and aborts are NEVER retried — a timeout means the
+ * previous execution may still be running in the background, and a retry
+ * would execute the tool concurrently with itself.
  */
 
 export interface RetryPolicy {
@@ -52,7 +57,7 @@ export function withRetry(
           return await tool.execute(toolCallId, params, signal, onUpdate);
         } catch (err) {
           lastError = err;
-          const transient = isTransientError(err);
+          const transient = !isToolTimeoutError(err) && !signal?.aborted && isTransientError(err);
           if (attempt >= attempts || !transient) break;
           options.audit?.({
             type: "tool_retry",

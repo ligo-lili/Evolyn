@@ -72,18 +72,30 @@ describe("TraceRecorder", () => {
     manager.close(); // release the default SQLite connection before tmp cleanup
   });
 
-  it("detects a trace with a seq gap", () => {
+  it("tolerates a seq gap (a failed sink leaves a hole; 加固期 P0) but still rejects reordering", () => {
     tmp.enter();
-    const file = path.join(tmp.dir, "gap.jsonl");
+    const gap = path.join(tmp.dir, "gap.jsonl");
     fs.writeFileSync(
-      file,
+      gap,
       [
         JSON.stringify({ v: 1, seq: 1, ts: "t", runId: "r1", type: "run_start", task: "t", modelSpec: "m" }),
         JSON.stringify({ v: 1, seq: 3, ts: "t", runId: "r1", type: "run_end", status: "completed", durationMs: 1 }),
       ].join("\n") + "\n",
       "utf8",
     );
-    expect(() => readTraceFile(file)).toThrow(/seq/);
+    const parsed = readTraceFile(gap);
+    expect(parsed.events.map((e) => e.seq)).toEqual([1, 3]);
+
+    const reordered = path.join(tmp.dir, "reordered.jsonl");
+    fs.writeFileSync(
+      reordered,
+      [
+        JSON.stringify({ v: 1, seq: 2, ts: "t", runId: "r1", type: "run_start", task: "t", modelSpec: "m" }),
+        JSON.stringify({ v: 1, seq: 2, ts: "t", runId: "r1", type: "run_end", status: "completed", durationMs: 1 }),
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    expect(() => readTraceFile(reordered)).toThrow(/reorder or duplicate/);
   });
 
   it("detects a truncated trace (killed before run_end)", () => {

@@ -18,6 +18,7 @@ import {
   renderExperienceBlock,
   renderSkillBlock,
   renderWorkspaceBlock,
+  escapeStructuralTags,
 } from "../context/assembler.js";
 import { buildWorkspaceTree } from "../context/workspace.js";
 import { SkillIndex, toAssemblerEntries } from "../skills/retrieve.js";
@@ -29,6 +30,7 @@ import { withToolTimeout } from "./tools/timeout.js";
 import { MemorySearchIndex } from "../memory/search.js";
 import { MemoryStore } from "../memory/store.js";
 import { withEvidenceCapture } from "./tools/evidence.js";
+import { withPathFence } from "./tools/fence.js";
 import { TraceRecorder, JsonlTraceSink, type TraceSink } from "../trace/recorder.js";
 import { reconcileJsonlTrace } from "../trace/reconcile.js";
 import {
@@ -81,6 +83,7 @@ function defaultLimitsFor(tools: ToolsetSpec | undefined, overrides: RunLimits |
     maxToolCalls: overrides?.maxToolCalls ?? DEFAULT_RUN_LIMITS.maxToolCalls,
     maxRepeatedToolCalls: overrides?.maxRepeatedToolCalls ?? (coding ? 12 : DEFAULT_RUN_LIMITS.maxRepeatedToolCalls),
     maxCostUsd: overrides?.maxCostUsd ?? DEFAULT_RUN_LIMITS.maxCostUsd,
+    maxTotalTokens: overrides?.maxTotalTokens ?? DEFAULT_RUN_LIMITS.maxTotalTokens,
     toolTimeoutMs: overrides?.toolTimeoutMs ?? DEFAULT_RUN_LIMITS.toolTimeoutMs,
   };
 }
@@ -108,7 +111,13 @@ function composeRuntime(input: {
 } {
   const tools = withRetry(
     withToolTimeout(
-      withEvidenceCapture(applyFaultToTools(input.tools, input.faultSpec), input.evidenceDir),
+      withEvidenceCapture(
+        // 加固期 (P0): path fence OUTSIDE the fault wrapper — every execution
+        // (live or fault-injected) checks path-like args against the workspace
+        // root, lexically AND through symlinks.
+        withPathFence(applyFaultToTools(input.tools, input.faultSpec)),
+        input.evidenceDir,
+      ),
       input.limits.toolTimeoutMs,
     ),
     { policy: input.retryPolicy, audit: input.audit },
@@ -200,8 +209,14 @@ export interface ResumeOptions {
   approval?: ApprovalOptions;
   /** Runaway guards for the resumed run. Defaults are always enforced. */
   limits?: RunLimits;
-  /** Tiered retry policy for idempotent tools. */
+  /** Tiered retry policy for the resumed run. */
   retry?: RetryPolicy;
+  /**
+   * 加固期 (P2): fault injection for the RECOVERY segment — e.g.
+   * "mid_recovery:1" kills with one call already resolved, "between_sinks"
+   * kills between the JSONL and SQLite writes.
+   */
+  fault?: string;
 }
 
 function sumUsage(messages: readonly AgentMessage[]): Usage | undefined {
@@ -291,7 +306,9 @@ export class RunManager {
     }
     const systemPrompt = assembleSystemPrompt({
       base: basePrompt,
-      core: core ? `<core_memory>\n${core}\n</core_memory>` : undefined,
+      // 加固期 (P1): core.md content is model-writable via the tools — escape
+      // structural tags in the CONTENT; the wrapper is built here, unescaped.
+      core: core ? `<core_memory>\n${escapeStructuralTags(core)}\n</core_memory>` : undefined,
       // 阶段 13: the coding toolset gets a deterministic workspace map.
       workspace: options.tools === "coding" ? renderWorkspaceBlock(buildWorkspaceTree()) : undefined,
       skills: skillBlock,
@@ -306,13 +323,18 @@ export class RunManager {
     let traceFile: string | undefined;
     let recorder: TraceRecorder | undefined;
     const grantedCapabilities = options.approval?.capabilities ?? ALL_CAPABILITIES;
+    // The controller must exist before the recorder: the between_sinks fault
+    // point fires from inside the fan-out (after the JSONL write, before SQLite).
+    const faultController = faultSpec ? new FaultController(faultSpec) : undefined;
     if (traceEnabled) {
       const traceDir = options.traceDir ?? path.join(harnessDataDir(process.cwd()), "traces");
       mkdirSync(traceDir, { recursive: true });
       traceFile = path.join(traceDir, `${record.id}.jsonl`);
       const sinks: TraceSink[] = [new JsonlTraceSink(traceFile)];
       if (database) sinks.push(new TraceEventRepo(database));
-      recorder = new TraceRecorder(record.id, sinks);
+      recorder = new TraceRecorder(record.id, sinks, {
+        onSinkBoundary: faultController ? (event) => faultController.onSinkBoundary(event) : undefined,
+      });
       recorder.runStart(
         record.task,
         record.modelSpec,
@@ -354,7 +376,6 @@ export class RunManager {
       beforeToolCall: composedBeforeToolCall,
       transformContext: contextTransformer,
     });
-    const faultController = faultSpec ? new FaultController(faultSpec) : undefined;
     // Checkpoint AFTER the trace sinks: a checkpoint may lag the log but never lead it.
     const checkpointWriter =
       database && recorder
@@ -383,6 +404,11 @@ export class RunManager {
       if (last && (last.stopReason === "error" || last.errorMessage)) {
         status = "failed";
         error = last.errorMessage ?? `stopReason=${last.stopReason}`;
+      } else if (last?.stopReason === "toolUse") {
+        // 加固期 (P0): a dangling toolUse is NOT a completion — never report
+        // "completed" when the model's last tool request was never answered.
+        status = "failed";
+        error = "run ended with an unanswered tool call (dangling toolUse)";
       } else {
         status = "completed";
       }
@@ -435,18 +461,44 @@ export class RunManager {
    * the crash left them.
    */
   async resume(runId: string, options: ResumeOptions = {}): Promise<RunResult> {
+    const faultSpec = parseFaultSpec(options.fault); // validates before anything is written
     const database = this.ensureDatabase(options.database);
     if (!database) throw new HarnessError("resume requires the SQLite database (do not pass database: false)");
     const resolvedTools = resolveTools(options.tools);
+    const traceDir = options.traceDir ?? path.join(harnessDataDir(process.cwd()), "traces");
+    const traceFile = path.join(traceDir, `${runId}.jsonl`);
+
+    // 加固期 (P0) zombie self-heal: the trace says the run FINISHED (run_end
+    // landed, but the runs-row status write was lost to a crash or a
+    // persistence failure). Backfill the row from the durable trace instead of
+    // rejecting — resuming would append a SECOND run_end and permanently break
+    // the run_start…run_end bracket that the reader validates.
+    const runRepo = new RunRepo(database);
+    const storedRow = runRepo.get(runId);
+    if (!storedRow) throw new HarnessError(`run "${runId}" not found`);
+    if (storedRow.status === "running") {
+      const lastStoredEvent = new TraceEventRepo(database).getByRun(runId).at(-1);
+      if (lastStoredEvent?.type === "run_end") {
+        const healed: RunRecord = {
+          ...storedRow,
+          status: lastStoredEvent.status === "failed" ? "failed" : "completed",
+          finishedAt: lastStoredEvent.ts,
+          error: lastStoredEvent.error,
+        };
+        runRepo.updateStatus(healed);
+        this.runs.set(runId, healed);
+        process.stderr.write(
+          `[harness] zombie run ${runId}: trace already ends with run_end (${healed.status}) — backfilled runs.status, nothing to recover\n`,
+        );
+        return { record: healed, messages: [], tracePath: traceFile };
+      }
+    }
     const crashed = loadCrashedRun(database, runId, resolvedTools);
 
     const record: RunRecord = { ...crashed.record, status: "running", finishedAt: undefined, error: undefined };
     this.runs.set(record.id, record);
-    const runRepo = new RunRepo(database);
 
-    const traceDir = options.traceDir ?? path.join(harnessDataDir(process.cwd()), "traces");
     mkdirSync(traceDir, { recursive: true });
-    const traceFile = path.join(traceDir, `${record.id}.jsonl`);
     // 阶段 13 (P1-2): the two sinks are written per-event (JSONL first, SQLite
     // second) — a kill between the writes leaves a JSONL tail SQLite never saw.
     // SQLite is the resume authority; reconcile the JSONL BEFORE continuing the
@@ -458,8 +510,12 @@ export class RunManager {
         `[harness] trace JSONL reconciled with SQLite (authoritative): dropped ${reconciled.truncated} tail event(s), rebuilt=${reconciled.rebuilt}\n`,
       );
     }
+    // 加固期 (P2): resume accepts its own fault spec — mid_recovery kills with
+    // N calls already resolved; between_sinks fires inside the fan-out below.
+    const faultController = faultSpec ? new FaultController(faultSpec) : undefined;
     const recorder = new TraceRecorder(record.id, [new JsonlTraceSink(traceFile), new TraceEventRepo(database)], {
       startSeq: crashed.lastSeq,
+      onSinkBoundary: faultController ? (event) => faultController.onSinkBoundary(event) : undefined,
     });
 
     const model = options.model ?? resolveModel(crashed.record.modelSpec);
@@ -486,7 +542,13 @@ export class RunManager {
 
     // Resolve every unresolved tool call, auditing each decision into the trace.
     const synthetic: AgentMessage[] = [];
+    let resolvedCalls = 0;
     for (const call of crashed.unresolved) {
+      // 加固期 (P2) mid_recovery fault point: kill with N calls already
+      // resolved — the crash lands between recovery decisions, the next resume
+      // must pick the stitched state back up cleanly.
+      if (resolvedCalls > 0) faultController?.onRecoveryStep(resolvedCalls);
+      resolvedCalls++;
       const action = planRecovery(call);
       if (action.kind === "synthesize_error" || !call.tool) {
         const reason = call.tool
@@ -517,14 +579,13 @@ export class RunManager {
         continue;
       }
       // reexecute: the execution genuinely happens now — record it as such, and
-      // put it through the SAME gates as a live call (limits → permission).
-      const limitResult = composed.limitEnforcer.beforeToolCall(call.toolName, call.args);
-      const gateDecision =
-        limitResult ??
-        (await composed.beforeToolCall({
-          toolCall: { id: call.toolCallId, name: call.toolName },
-          args: call.args,
-        } as unknown as Parameters<typeof composed.beforeToolCall>[0]));
+      // put it through the SAME gates as a live call. composed.beforeToolCall
+      // already runs limits→permission IN ORDER; calling the limit enforcer
+      // separately (加固期 fix) counted every recovered call twice.
+      const gateDecision = await composed.beforeToolCall({
+        toolCall: { id: call.toolCallId, name: call.toolName },
+        args: call.args,
+      } as unknown as Parameters<typeof composed.beforeToolCall>[0]);
       recorder.onEvent({
         type: "tool_execution_start",
         toolCallId: call.toolCallId,
@@ -583,6 +644,7 @@ export class RunManager {
       transformContext: createContextTransformer({
         contextWindow: model.contextWindow,
         model,
+        settings: options.compaction?.settings,
         summaryFn: options.compaction?.summaryFn,
         onEvent: (event) => recorder.record(event),
       }),
@@ -596,6 +658,10 @@ export class RunManager {
       reporter.onEvent(event);
       recorder.onEvent(event);
       checkpointWriter.onEvent(event);
+      // 加固期 (P1): the resumed segment is limit-enforced like a fresh run —
+      // without this the turns / token / cost / consecutive-error fuses never
+      // accumulate on the resume path (beforeToolCall counters still worked).
+      composed.limitEnforcer.onAgentEvent(event);
     };
     const unsubscribe = agent.subscribe(dispatch);
 
@@ -619,6 +685,11 @@ export class RunManager {
       if (last && (last.stopReason === "error" || last.errorMessage)) {
         status = "failed";
         error = last.errorMessage ?? `stopReason=${last.stopReason}`;
+      } else if (last?.stopReason === "toolUse") {
+        // 加固期 (P0): a dangling toolUse is NOT a completion — never report
+        // "completed" when the model's last tool request was never answered.
+        status = "failed";
+        error = "run ended with an unanswered tool call (dangling toolUse)";
       } else {
         status = "completed";
       }

@@ -24,14 +24,17 @@ import { localEmbedder } from "../memory/embedding.js";
 import { minePatternsFromDb } from "../learning/miner.js";
 import { draftSkillFromPattern } from "../learning/candidate.js";
 import {
+  assertEvalRepeats,
   buildProtocol,
   defaultEvalRunner,
   loadTaskSet,
+  MIN_EVAL_REPEATS,
   renderEvalReport,
   runEvalAgainstBaseline,
   runEvalArm,
   runEvalComparison,
 } from "../learning/eval.js";
+import { applyPrune, planPrune } from "../storage/prune.js";
 import { EvalBaselineRepo, SkillEvalRepo, skillEvalRowFromReport } from "../storage/repos/evals.js";
 import { promoteCandidate } from "../skills/promote.js";
 import { SkillIndex, toAssemblerEntries } from "../skills/retrieve.js";
@@ -40,41 +43,7 @@ import { PatternRepo } from "../storage/repos/patterns.js";
 import { SkillCandidateRepo } from "../storage/repos/candidates.js";
 import { promotedSkillsDir, skillsDir } from "../runtime/paths.js";
 import { DEMO_TOOLS } from "../runtime/tools/index.js";
-
-interface ParsedArgs {
-  command: string;
-  positional: string[];
-  flags: Record<string, string | boolean>;
-}
-
-function parseArgs(argv: string[]): ParsedArgs {
-  const flags: Record<string, string | boolean> = {};
-  const positional: string[] = [];
-  let command: string | undefined;
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i];
-    if (!arg) continue;
-    if (arg.startsWith("--")) {
-      const eq = arg.indexOf("=");
-      if (eq > 2) {
-        flags[arg.slice(2, eq)] = arg.slice(eq + 1);
-      } else {
-        const next = argv[i + 1];
-        if (next !== undefined && !next.startsWith("--")) {
-          flags[arg.slice(2)] = next;
-          i++;
-        } else {
-          flags[arg.slice(2)] = true;
-        }
-      }
-    } else if (command === undefined) {
-      command = arg;
-    } else {
-      positional.push(arg);
-    }
-  }
-  return { command: command ?? "help", positional, flags };
-}
+import { parseArgs } from "./parse-args.js";
 
 const HELP = `agent-harness — durable execution harness on top of Pi Agent Runtime
 
@@ -98,6 +67,8 @@ Usage:
   agent-harness skill show <candidateId>   print a candidate's SKILL.md
   agent-harness skill promote <candidateId> [--force]
                                            promote a candidate to .harness/skills/promoted/<name>/SKILL.md
+                                           (--force over an existing skill shows the diff and requires
+                                           confirmation: interactive y/N, or --yes in non-interactive shells)
   agent-harness skill list                 list promoted skills
   agent-harness skill retrieve "<task>"    preview which skills a run would inject
   agent-harness skill rebuild              rebuild the skill index from the promoted SKILL.md files
@@ -105,9 +76,16 @@ Usage:
                                            scripted A/B: no-skill baseline vs skill-injected (report persisted)
   agent-harness skill baseline <taskset.json> [--model <spec>] [--repeats <n>]
                                            record the no-skill regression baseline for a task set + model
+                                           NOTE: a task set is operator-provided executable configuration —
+                                           testCommand entries run through the shell, and eval arms execute
+                                           tools unattended (auto-approve). Only load task sets you trust.
   agent-harness skill evals [limit]        list persisted eval reports (the iteration ledger)
   agent-harness skill verify               check the promoted root loads via pi loadSkillsFromDir
   agent-harness models [provider]          list providers, or a provider's models
+  agent-harness prune [--keep-runs <n>] [--deep] [--dry-run]
+                                           prune checkpoints of finished runs, and traces/evidence beyond
+                                           the keep window (default 20 runs); --deep also drops the
+                                           trace_events ledger rows for pruned runs and VACUUMs
   agent-harness trace list                 list recorded runs
   agent-harness trace show <runId> [--all] render a run's execution timeline
   agent-harness trace summary <runId>      aggregate stats for a run
@@ -136,6 +114,22 @@ function loadRunEvents(id: string): TraceEvent[] {
   } finally {
     db.close();
   }
+}
+
+/** Line-level diff summary (removed then added) for the --force confirmation. */
+function simpleDiff(oldText: string, newText: string): string[] {
+  const oldLines = new Set(oldText.split("\n"));
+  const newLines = new Set(newText.split("\n"));
+  return [
+    ...oldText
+      .split("\n")
+      .filter((l) => !newLines.has(l))
+      .map((l) => `- ${l}`),
+    ...newText
+      .split("\n")
+      .filter((l) => !oldLines.has(l))
+      .map((l) => `+ ${l}`),
+  ];
 }
 
 async function main(): Promise<number> {
@@ -392,7 +386,50 @@ async function main(): Promise<number> {
         console.error("usage: agent-harness skill promote <candidateId> [--force]");
         return 2;
       }
-      const outcome = promoteCandidate(id, { skillsRoot: skillsDir(), force: flags.force === true });
+      // 加固期 (P1) poisoning defense: --force overwrites an existing skill —
+      // show the caller the actual diff and require explicit confirmation
+      // (TTY: interactive y/N; non-TTY: an explicit --yes flag).
+      let confirm: (() => boolean) | undefined;
+      if (flags.force === true) {
+        let draft: ReturnType<SkillCandidateRepo["get"]>;
+        {
+          const db = openDatabase(dbPath);
+          try {
+            draft = new SkillCandidateRepo(db).get(id);
+          } finally {
+            db.close();
+          }
+        }
+        const existingPath = draft ? path.join(promotedSkillsDir(), draft.name, "SKILL.md") : undefined;
+        const existingRaw =
+          draft && existingPath && fs.existsSync(existingPath) ? fs.readFileSync(existingPath, "utf8") : undefined;
+        const draftRaw =
+          draft && fs.existsSync(draft.skillMdPath) ? fs.readFileSync(draft.skillMdPath, "utf8") : undefined;
+        if (existingRaw !== undefined && draftRaw !== undefined && existingRaw !== draftRaw) {
+          console.log("[promote --force] overwriting the existing promoted SKILL.md. Diff (old → new):");
+          for (const line of simpleDiff(existingRaw, draftRaw).slice(0, 60)) console.log(`  ${line}`);
+        }
+        if (process.stdin.isTTY) {
+          const readline = await import("node:readline/promises");
+          const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
+          try {
+            const answer = await rl.question("[promote --force] overwrite the promoted skill? type yes: ");
+            if (!/^y(es)?$/i.test(answer.trim())) {
+              console.error("cancelled");
+              return 1;
+            }
+          } finally {
+            rl.close();
+          }
+        } else if (flags.yes !== true) {
+          console.error(
+            "[promote --force] non-interactive shell — pass --yes to confirm the overwrite (the diff above is what changes)",
+          );
+          return 2;
+        }
+        confirm = () => true; // already confirmed above; the library hook stays satisfied
+      }
+      const outcome = promoteCandidate(id, { skillsRoot: skillsDir(), force: flags.force === true, confirm });
       console.log(
         outcome.overwritten
           ? `promoted "${outcome.skill.name}" v${outcome.skill.version} (overwrote previous version)`
@@ -483,15 +520,20 @@ async function main(): Promise<number> {
         console.error("no model selected: pass --model provider/model-id or set HARNESS_MODEL");
         return 2;
       }
-      const repeatsFlag = typeof flags.repeats === "string" ? Number(flags.repeats) : 1;
-      const repeats = Number.isFinite(repeatsFlag) && repeatsFlag >= 1 ? Math.floor(repeatsFlag) : 1;
+      const repeatsFlag = typeof flags.repeats === "string" ? Number(flags.repeats) : MIN_EVAL_REPEATS;
+      const repeats = assertEvalRepeats(Number.isFinite(repeatsFlag) ? Math.floor(repeatsFlag) : MIN_EVAL_REPEATS);
       const toolsFlag = typeof flags.tools === "string" ? flags.tools : undefined;
       if (toolsFlag !== undefined && toolsFlag !== "demo" && toolsFlag !== "coding") {
         console.error(`unknown --tools "${toolsFlag}" (expected demo | coding)`);
         return 2;
       }
       const runner = defaultEvalRunner(spec, { toolset: toolsFlag as "demo" | "coding" | undefined });
-      const artifactsDir = path.join(harnessDataDir(process.cwd()), "evals", taskSet.name, `run-${new Date().toISOString().replace(/[:.]/g, "-")}`);
+      const artifactsDir = path.join(
+        harnessDataDir(process.cwd()),
+        "evals",
+        taskSet.name,
+        `run-${new Date().toISOString().replace(/[:.]/g, "-")}`,
+      );
       const currentSha = buildProtocol(taskSet, { model: spec, toolset: toolsFlag, repeats }).sha256;
       let report;
       if (flags["against-baseline"] === true) {
@@ -566,8 +608,8 @@ async function main(): Promise<number> {
         console.error("no model selected: pass --model provider/model-id or set HARNESS_MODEL");
         return 2;
       }
-      const repeatsFlag = typeof flags.repeats === "string" ? Number(flags.repeats) : 1;
-      const repeats = Number.isFinite(repeatsFlag) && repeatsFlag >= 1 ? Math.floor(repeatsFlag) : 1;
+      const repeatsFlag = typeof flags.repeats === "string" ? Number(flags.repeats) : MIN_EVAL_REPEATS;
+      const repeats = assertEvalRepeats(Number.isFinite(repeatsFlag) ? Math.floor(repeatsFlag) : MIN_EVAL_REPEATS);
       const toolsFlag = typeof flags.tools === "string" ? flags.tools : undefined;
       if (toolsFlag !== undefined && toolsFlag !== "demo" && toolsFlag !== "coding") {
         console.error(`unknown --tools "${toolsFlag}" (expected demo | coding)`);
@@ -791,6 +833,35 @@ async function main(): Promise<number> {
     }
     manager.close();
     return record.status === "completed" ? 0 : 1;
+  }
+
+  if (command === "prune") {
+    // 加固期 (P2) retention: checkpoints of finished runs are dead weight;
+    // traces/evidence are kept for the newest keep-runs finished runs.
+    const keepFlag = typeof flags["keep-runs"] === "string" ? Number(flags["keep-runs"]) : undefined;
+    const db = openDatabase(defaultDbPath());
+    try {
+      const plan = planPrune(db, { keepRuns: keepFlag, deep: flags.deep === true });
+      console.log(
+        `prune plan: keep newest ${plan.keepRuns} finished run(s) — ` +
+          `${plan.beyond.length} beyond window, ${plan.checkpointRows} checkpoint row(s) across ${plan.checkpointRuns} finished run(s)${plan.deep ? ", deep (ledger rows + VACUUM)" : ""}`,
+      );
+      if (flags["dry-run"] === true) {
+        console.log("(dry run — nothing deleted)");
+        return 0;
+      }
+      const result = applyPrune(db, plan, {
+        tracesDir: tracesDir(),
+        evidenceDir: path.join(harnessDataDir(process.cwd()), "evidence"),
+      });
+      console.log(
+        `pruned: ${result.checkpointsDeleted} checkpoint row(s), ${result.tracesDeleted} trace file(s), ` +
+          `${result.evidenceDeleted} evidence dir(s), ${result.eventRowsDeleted} ledger row(s), ${(result.bytesFreed / 1024).toFixed(1)} KiB freed`,
+      );
+    } finally {
+      db.close();
+    }
+    return 0;
   }
 
   if (command !== "run") {

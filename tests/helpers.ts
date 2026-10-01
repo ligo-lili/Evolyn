@@ -80,38 +80,76 @@ export interface TempCwd {
   leave(): void;
 }
 
-/** Fresh temp dir + chdir so tool side effects and traces stay out of the repo. */
+/**
+ * Fresh temp dir + chdir so tool side effects and traces stay out of the repo.
+ * 加固期 (P2): NESTED enter() calls reuse the current dir (depth-counted) —
+ * previously each enter allocated a new temp dir whose `prev` clobbered the
+ * outer one, leaking every dir whose owner never called leave (storage.test
+ * entered once per test with a single afterAll leave).
+ */
+/**
+ * Fresh temp dir + chdir so tool side effects and traces stay out of the repo.
+ * Every enter() allocates a FRESH dir (tests stay isolated from each other);
+ * leave() undoes its own enter. 加固期 (P2): every allocated dir is also
+ * registered for a best-effort process-exit sweep, so unmatched enter/leave
+ * pairs (storage.test enters per test with a single afterAll leave) no longer
+ * leak temp directories.
+ */
 export function makeTempCwd(): TempCwd {
-  let dir = "";
-  let prev = "";
+  interface Entry {
+    prev: string;
+    dir: string;
+  }
+  const stack: Entry[] = [];
+  const allocated: string[] = [];
+  let sweepRegistered = false;
+
+  const rm = (target: string): void => {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        fs.rmSync(target, { recursive: true, force: true });
+        break;
+      } catch (err) {
+        if (attempt >= 9) {
+          console.warn(`[test cleanup] could not remove ${target}: ${err instanceof Error ? err.message : err}`);
+          break;
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+      }
+    }
+  };
+
+  if (!sweepRegistered) {
+    sweepRegistered = true;
+    process.on("exit", () => {
+      for (const dir of allocated) {
+        try {
+          fs.rmSync(dir, { recursive: true, force: true });
+        } catch {
+          // best-effort: open handles (AV/indexer/sqlite) can block removal
+        }
+      }
+    });
+  }
+
   return {
     get dir() {
-      return dir;
+      return stack.at(-1)?.dir ?? "";
     },
     enter() {
-      prev = process.cwd();
-      dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-harness-test-"));
+      const prev = process.cwd();
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-harness-test-"));
+      allocated.push(dir);
+      stack.push({ prev, dir });
       process.chdir(dir);
     },
     leave() {
-      if (!dir) return; // never entered — nothing to restore
-      process.chdir(prev);
-      // Windows: open handles (AV/indexer/lingering sqlite) can briefly block
-      // deletion; retry briefly, then tolerate so tests don't flake on cleanup.
-      for (let attempt = 0; ; attempt++) {
-        try {
-          fs.rmSync(dir, { recursive: true, force: true });
-          break;
-        } catch (err) {
-          if (attempt >= 9) {
-            console.warn(`[test cleanup] could not remove ${dir}: ${err instanceof Error ? err.message : err}`);
-            break;
-          }
-          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
-        }
-      }
-      dir = "";
-      prev = "";
+      const top = stack.pop();
+      if (!top) return; // never entered — nothing to restore
+      process.chdir(top.prev);
+      rm(top.dir);
+      const index = allocated.indexOf(top.dir);
+      if (index !== -1) allocated.splice(index, 1);
     },
   };
 }

@@ -1,11 +1,29 @@
 import type { AgentEvent } from "@earendil-works/pi-agent-core";
 import { HarnessError } from "../errors.js";
+import type { TraceEvent } from "../trace/schema.js";
 import type { AnyAgentTool } from "../runtime/tools/index.js";
 
-export type FaultPoint = "after_tool_call" | "mid_tool_execution";
+/**
+ * Fault points (阶段 5 + 加固期 P2 补盲区):
+ *   after_tool_call:<tool>     kill after the matched tool_execution_end is durably recorded
+ *   mid_tool_execution:<tool>  kill after the side effect, before the result reaches the loop
+ *   between_sinks:[<eventType>]  kill between the FIRST sink write (JSONL) and the rest (SQLite)
+ *                              — the exact window where the two stores diverge
+ *   after_assistant_message:[<tool>]  kill right after a message_end carrying tool calls but
+ *                              BEFORE any tool_execution_start — the "planned" window
+ *   mid_recovery:[<n>]         kill during resume with n calls already resolved (default 1)
+ *
+ * `toolName` is reused as the per-point argument: an event-type filter for
+ * between_sinks, a tool filter for after_assistant_message, and the step
+ * count for mid_recovery. The first two points keep the original semantics
+ * (tool name required); the new points make the argument optional.
+ */
+export type FaultPoint =
+  "after_tool_call" | "mid_tool_execution" | "between_sinks" | "after_assistant_message" | "mid_recovery";
 
 export interface FaultSpec {
   point: FaultPoint;
+  /** Tool name, event-type filter, or step count — see the point list above. */
   toolName: string;
 }
 
@@ -14,12 +32,22 @@ export function parseFaultSpec(spec: string | undefined): FaultSpec | undefined 
   if (!spec) return undefined;
   const sep = spec.indexOf(":");
   const point = sep === -1 ? spec : spec.slice(0, sep);
-  const toolName = sep === -1 ? "" : spec.slice(sep + 1);
-  if (point !== "after_tool_call" && point !== "mid_tool_execution") {
-    throw new HarnessError(`unknown fault point "${point}" (expected after_tool_call | mid_tool_execution)`);
+  const arg = sep === -1 ? "" : spec.slice(sep + 1);
+  switch (point) {
+    case "after_tool_call":
+    case "mid_tool_execution":
+      if (!arg) throw new HarnessError(`fault point "${point}" needs a tool name: --fault ${point}:<toolName>`);
+      break;
+    case "between_sinks":
+    case "after_assistant_message":
+    case "mid_recovery":
+      break; // argument optional
+    default:
+      throw new HarnessError(
+        `unknown fault point "${point}" (expected after_tool_call | mid_tool_execution | between_sinks | after_assistant_message | mid_recovery)`,
+      );
   }
-  if (!toolName) throw new HarnessError("fault spec needs a tool name: --fault <point>:<toolName>");
-  return { point, toolName };
+  return { point: point as FaultPoint, toolName: arg };
 }
 
 export function formatFaultSpec(fault: FaultSpec): string {
@@ -52,14 +80,21 @@ export function applyFaultToTools(
 }
 
 /**
- * after_tool_call: fire from the dispatch path AFTER the matched event is
- * durably recorded, so the trace ends exactly at the chosen point.
+ * Fault injection controller. after_tool_call fires from the dispatch path
+ * AFTER the matched event is durably recorded, so the trace ends exactly at
+ * the chosen point. between_sinks / after_assistant_message / mid_recovery are
+ * driven by the hooks the run/resume paths call at the corresponding moments.
  */
 export class FaultController {
+  private readonly stepTarget: number;
+
   constructor(
     readonly spec: FaultSpec,
     private readonly kill: () => void = killProcess,
-  ) {}
+  ) {
+    const parsed = Number.parseInt(spec.toolName, 10);
+    this.stepTarget = Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+  }
 
   onEvent(event: AgentEvent): void {
     if (
@@ -68,7 +103,31 @@ export class FaultController {
       event.toolName === this.spec.toolName
     ) {
       this.kill();
+      return;
     }
+    if (
+      this.spec.point === "after_assistant_message" &&
+      event.type === "message_end" &&
+      event.message.role === "assistant"
+    ) {
+      const callsTool = event.message.content.some((b) => b.type === "toolCall");
+      const matches =
+        !this.spec.toolName ||
+        event.message.content.some((b) => b.type === "toolCall" && b.name === this.spec.toolName);
+      if (callsTool && matches) this.kill();
+    }
+  }
+
+  /** Fired by the recorder after the FIRST sink persisted the event. */
+  onSinkBoundary(event: TraceEvent): void {
+    if (this.spec.point !== "between_sinks") return;
+    if (!this.spec.toolName || event.type === this.spec.toolName) this.kill();
+  }
+
+  /** Fired by resume after n unresolved calls have been resolved. */
+  onRecoveryStep(resolved: number): void {
+    if (this.spec.point !== "mid_recovery") return;
+    if (resolved >= this.stepTarget) this.kill();
   }
 }
 

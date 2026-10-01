@@ -30,6 +30,13 @@ export interface PromoteOptions {
   force?: boolean;
   /** Skip the eval-ledger gate (verification always runs). */
   skipGate?: boolean;
+  /**
+   * 加固期 (P1) poisoning defense: when --force overwrites an existing skill,
+   * the caller shows the operator the diff and asks for confirmation through
+   * this hook. Returning false aborts the promotion with nothing written.
+   * Absent hook = previous behavior (the CLI always wires it).
+   */
+  confirm?: () => boolean;
 }
 
 export interface PromoteOutcome {
@@ -80,6 +87,9 @@ export function promoteCandidate(candidateId: string, options: PromoteOptions = 
       throw new HarnessError(
         `a promoted skill named "${doc.name}" already exists (v${existing.version}) — edit the draft or pass force to overwrite`,
       );
+    }
+    if (existing && options.force && options.confirm && !options.confirm()) {
+      throw new HarnessError(`promotion of "${doc.name}" cancelled by the operator`);
     }
 
     fs.mkdirSync(dirPath, { recursive: true });

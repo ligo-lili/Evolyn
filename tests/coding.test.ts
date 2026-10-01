@@ -9,6 +9,7 @@ import { CheckpointRepo } from "../src/storage/repos/checkpoints.js";
 import { readTraceFile } from "../src/trace/read.js";
 import { reconcileJsonlTrace } from "../src/trace/reconcile.js";
 import { RunManager } from "../src/runtime/run-manager.js";
+import { DEFAULT_RUN_LIMITS, LimitEnforcer, type LimitViolation } from "../src/runtime/limits.js";
 import { CollectingReporter } from "../src/runtime/reporter.js";
 import { createCodingToolset } from "../src/runtime/tools/coding.js";
 import { permissionsFor } from "../src/runtime/permissions.js";
@@ -20,19 +21,32 @@ import { MemoryStore } from "../src/memory/store.js";
 import { parseMemory, MEMORY_ID_PATTERN } from "../src/memory/model.js";
 import { distillRunById } from "../src/memory/distiller.js";
 import { promoteCandidate } from "../src/skills/promote.js";
+import { SkillIndex } from "../src/skills/retrieve.js";
+import { serializeSkillMd } from "../src/skills/format.js";
+import { parseArgs } from "../src/cli/parse-args.js";
+import { withPathFence } from "../src/runtime/tools/fence.js";
+import { withEvidenceCapture } from "../src/runtime/tools/evidence.js";
+import { TraceRecorder, type TraceSink } from "../src/trace/recorder.js";
+import { FaultController, parseFaultSpec } from "../src/execution/fault.js";
+import { applyPrune, planPrune } from "../src/storage/prune.js";
+import { SkillCandidateRepo } from "../src/storage/repos/candidates.js";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AnyAgentTool } from "../src/runtime/tools/index.js";
 import { PatternRepo } from "../src/storage/repos/patterns.js";
 import { minePatternsFromDb } from "../src/learning/miner.js";
 import { draftSkillFromPattern } from "../src/learning/candidate.js";
 import {
+  assertEvalRepeats,
   buildProtocol,
   judgeRun,
   prepareRepoFixture,
   runEvalArm,
   runEvalComparison,
   stableStringify,
+  wilsonInterval,
   type EvalRunner,
 } from "../src/learning/eval.js";
-import { assistantMessage, FAKE_MODEL, makeTempCwd, scriptedStreamFn } from "./helpers.js";
+import { assistantMessage, FAKE_MODEL, makeTempCwd, scriptedStreamFn, USAGE } from "./helpers.js";
 
 const tmp = makeTempCwd();
 
@@ -150,59 +164,60 @@ describe("P0 approval posture (阶段 13)", () => {
 
 // ---------- P1-3: resume runs recovered executions through the gates ----------
 
-describe("P1-3 resume gating (阶段 13)", () => {
-  async function seed(prefix: string): Promise<{ runId: string; dbPath: string }> {
-    const dbPath = path.join(tmp.dir, prefix, "harness.db");
-    const manager = new RunManager();
-    const result = await manager.run({
-      task: "write the file",
-      model: FAKE_MODEL,
-      streamFn: scriptedStreamFn([
-        assistantMessage(
-          [
-            {
-              type: "toolCall",
-              id: "call_1",
-              name: "write_file",
-              arguments: { path: "gated.txt", content: "payload" },
-            },
-          ],
-          "toolUse",
-        ),
-        assistantMessage([{ type: "text", text: "written" }], "stop"),
-      ]),
-      reporter: new CollectingReporter(),
-      database: dbPath,
-      tools: [writeFileTool],
-    });
-    manager.close();
-    expect(result.record.status).toBe("completed");
-    return { runId: result.record.id, dbPath };
-  }
+/** Seed a completed run that wrote gated.txt (hoisted to module scope — the
+ * hardening suites reuse it for zombie/self-heal and single-count tests). */
+async function seed(prefix: string): Promise<{ runId: string; dbPath: string }> {
+  const dbPath = path.join(tmp.dir, prefix, "harness.db");
+  const manager = new RunManager();
+  const result = await manager.run({
+    task: "write the file",
+    model: FAKE_MODEL,
+    streamFn: scriptedStreamFn([
+      assistantMessage(
+        [
+          {
+            type: "toolCall",
+            id: "call_1",
+            name: "write_file",
+            arguments: { path: "gated.txt", content: "payload" },
+          },
+        ],
+        "toolUse",
+      ),
+      assistantMessage([{ type: "text", text: "written" }], "stop"),
+    ]),
+    reporter: new CollectingReporter(),
+    database: dbPath,
+    tools: [writeFileTool],
+  });
+  manager.close();
+  expect(result.record.status).toBe("completed");
+  return { runId: result.record.id, dbPath };
+}
 
-  function crashAround(dbPath: string, runId: string): void {
-    // fabricate the kill AFTER tool_execution_start: the call sits in
-    // "executing" and write_file (replay:"safe") takes the re-execute branch.
-    const db = openDatabase(dbPath);
-    try {
-      const events = new TraceEventRepo(db).getByRun(runId);
-      const idx = events.findIndex((e) => e.type === "tool_execution_start");
-      const cutSeq = events[idx]!.seq;
-      db.prepare("DELETE FROM trace_events WHERE run_id = ? AND seq > ?").run(runId, cutSeq);
-      db.prepare("UPDATE runs SET status = 'running', finished_at = NULL, error = NULL WHERE id = ?").run(runId);
-      for (const cp of new CheckpointRepo(db).list(runId)) {
-        const state = cp.state as { lastSeq: number };
-        if (state.lastSeq > cutSeq)
-          db.prepare("DELETE FROM checkpoints WHERE run_id = ? AND seq = ?").run(runId, cp.seq);
-      }
-      const surviving = new TraceEventRepo(db).getByRun(runId);
-      const tracePath = path.join(tmp.dir, ".harness", "traces", `${runId}.jsonl`);
-      fs.writeFileSync(tracePath, surviving.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf8");
-    } finally {
-      db.close();
+function crashAround(dbPath: string, runId: string): void {
+  // fabricate the kill AFTER tool_execution_start: the call sits in
+  // "executing" and write_file (replay:"safe") takes the re-execute branch.
+  const db = openDatabase(dbPath);
+  try {
+    const events = new TraceEventRepo(db).getByRun(runId);
+    const idx = events.findIndex((e) => e.type === "tool_execution_start");
+    const cutSeq = events[idx]!.seq;
+    db.prepare("DELETE FROM trace_events WHERE run_id = ? AND seq > ?").run(runId, cutSeq);
+    db.prepare("UPDATE runs SET status = 'running', finished_at = NULL, error = NULL WHERE id = ?").run(runId);
+    for (const cp of new CheckpointRepo(db).list(runId)) {
+      const state = cp.state as { lastSeq: number };
+      if (state.lastSeq > cutSeq) db.prepare("DELETE FROM checkpoints WHERE run_id = ? AND seq = ?").run(runId, cp.seq);
     }
+    const surviving = new TraceEventRepo(db).getByRun(runId);
+    const tracePath = path.join(tmp.dir, ".harness", "traces", `${runId}.jsonl`);
+    fs.writeFileSync(tracePath, surviving.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf8");
+  } finally {
+    db.close();
   }
+}
 
+describe("P1-3 resume gating (阶段 13)", () => {
   it("auto-deny blocks the recovered re-execution; the model sees the denial with a permission audit", async () => {
     const { runId, dbPath } = await seed("gate-deny");
     crashAround(dbPath, runId);
@@ -252,6 +267,40 @@ describe("P1-3 resume gating (阶段 13)", () => {
     if (toolResults[0]?.role === "toolResult") expect(toolResults[0].isError).toBe(false);
     // write_file resolves against the workspace cwd (the temp dir root)
     expect(fs.readFileSync(path.join(tmp.dir, "gated.txt"), "utf8")).toBe("payload");
+  });
+
+  it("enforces the event-driven limits on the resumed segment (cost fuse, 加固期 P1)", async () => {
+    const { runId, dbPath } = await seed("gate-limit");
+    crashAround(dbPath, runId);
+
+    // The scripted continuation reports real cost: after this assistant turn
+    // the cost fuse must deny its tool call and degrade the run to failed.
+    // (Regression: the resume dispatch used to skip limitEnforcer.onAgentEvent,
+    // so turns/cost/consecutive-error fuses never accumulated after a crash.)
+    const costly = {
+      ...assistantMessage(
+        [{ type: "toolCall", id: "call_2", name: "write_file", arguments: { path: "again.txt", content: "x" } }],
+        "toolUse",
+      ),
+      usage: { ...USAGE, totalTokens: 5000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 5 } },
+    };
+    const manager = new RunManager();
+    const result = await manager.resume(runId, {
+      model: FAKE_MODEL,
+      streamFn: scriptedStreamFn([costly, assistantMessage([{ type: "text", text: "done" }], "stop")]),
+      reporter: new CollectingReporter(),
+      database: dbPath,
+      tools: [writeFileTool],
+      limits: { maxCostUsd: 1 },
+    });
+    manager.close();
+
+    expect(result.record.status).toBe("failed");
+    expect(result.record.error).toContain("limit (cost)");
+    const trace = readTraceFile(result.tracePath as string);
+    expect(trace.events.some((e) => e.type === "limit_exceeded" && e.kind === "cost")).toBe(true);
+    // the over-budget tool call must never have executed
+    expect(fs.existsSync(path.join(tmp.dir, "again.txt"))).toBe(false);
   });
 });
 
@@ -654,7 +703,13 @@ describe("阶段 14 protocol + session artifacts", () => {
       return { taskId: task.id, status: "completed", tracePath: path.join(tmp.dir, task.id + ".jsonl"), tokens: 1 };
     };
     const artifactsDir = path.join(tmp.dir, "artifacts");
-    const report = await runEvalComparison(taskSet, { runner, skillName: "s", modelSpec: "m", artifactsDir, repeats: 2 });
+    const report = await runEvalComparison(taskSet, {
+      runner,
+      skillName: "s",
+      modelSpec: "m",
+      artifactsDir,
+      repeats: 2,
+    });
     // odd repeat → baseline first; even repeat → treatment first
     expect(calls[0]).toEqual({ arm: "baseline", taskId: "t1" });
     expect(calls[2]).toEqual({ arm: "treatment", taskId: "t1" });
@@ -746,6 +801,486 @@ describe("P1-4 promotion cleanup (阶段 13)", () => {
     expect(() => promoteCandidate(draft.candidate.id, { database: dbPath, skillsRoot })).toThrow(/loadSkillsFromDir/);
     spy.mockRestore();
     expect(fs.existsSync(path.join(skillsRoot, "promoted", "rollback-skill"))).toBe(false);
+    tmp.leave();
+  });
+});
+
+// ---------- 加固期: punch-list fixes ----------
+
+describe("加固期: token fuse for cost-less models", () => {
+  it("trips on cumulative tokens when the model reports zero cost", () => {
+    const violations: LimitViolation[] = [];
+    const enforcer = new LimitEnforcer(
+      { ...DEFAULT_RUN_LIMITS, maxTotalTokens: 100 },
+      () => {},
+      (v) => violations.push(v),
+    );
+    for (let i = 0; i < 2; i++) {
+      enforcer.onAgentEvent({
+        type: "message_end",
+        message: {
+          role: "assistant",
+          usage: { ...USAGE, totalTokens: 60, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+        },
+      } as never);
+    }
+    const decision = enforcer.beforeToolCall("read", {});
+    expect(decision).toMatchObject({ block: true, terminate: true });
+    expect(violations[0]?.kind).toBe("tokens");
+  });
+
+  it("a normal run stays well under the default token budget", () => {
+    const enforcer = new LimitEnforcer(
+      { ...DEFAULT_RUN_LIMITS },
+      () => {},
+      () => {},
+    );
+    enforcer.onAgentEvent({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        usage: { ...USAGE, totalTokens: 50_000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+      },
+    } as never);
+    expect(enforcer.beforeToolCall("read", {})).toBeUndefined();
+  });
+});
+
+describe("加固期: rebuild loader gate", () => {
+  it("rebuild skips directories the pi loader rejects (only loader-clean skills get indexed)", async () => {
+    tmp.enter();
+    const root = path.join(tmp.dir, "rebuild-gate");
+    const db = openDatabase(path.join(root, "harness.db"));
+    try {
+      const promoted = path.join(root, "promoted");
+      for (const name of ["good-skill", "bad-skill"]) {
+        fs.mkdirSync(path.join(promoted, name), { recursive: true });
+        fs.writeFileSync(
+          path.join(promoted, name, "SKILL.md"),
+          serializeSkillMd({ name, description: "d", body: "b" }),
+        );
+      }
+      const verify = await import("../src/skills/verify.js");
+      const real = verify.verifyPromotedSkills;
+      const spy = vi
+        .spyOn(verify, "verifyPromotedSkills")
+        .mockImplementation((dir) =>
+          String(dir).includes("bad-skill")
+            ? { ok: false, skills: [], diagnostics: [{ type: "error", message: "pi loader rejects" }] }
+            : real(dir),
+        );
+      try {
+        const index = new SkillIndex(db);
+        expect(index.rebuild(promoted)).toBe(1);
+        expect(index.getByName(["good-skill"])).toHaveLength(1);
+        expect(index.getByName(["bad-skill"])).toHaveLength(0);
+      } finally {
+        spy.mockRestore();
+      }
+    } finally {
+      db.close();
+    }
+    tmp.leave();
+  });
+});
+
+describe("加固期: switch-flag coercion (--yolo true)", () => {
+  it("coerces `--yolo true` to a boolean so the approval default does not silently downgrade", () => {
+    expect(parseArgs(["run", "task text", "--yolo", "true"]).flags.yolo).toBe(true);
+    expect(parseArgs(["run", "task text", "--yolo"]).flags.yolo).toBe(true);
+    expect(parseArgs(["run", "task text", "--yolo=1"]).flags.yolo).toBe(true);
+    // a value flag still captures its value as a string
+    expect(parseArgs(["run", "task text", "--model", "deepseek/deepseek-flash"]).flags.model).toBe(
+      "deepseek/deepseek-flash",
+    );
+    // positionals are untouched
+    expect(parseArgs(["run", "a", "b"]).positional).toEqual(["a", "b"]);
+  });
+});
+
+// ---------- 加固期第二轮: P0/P1/P2 work order ----------
+
+describe("加固期: tool path fence", () => {
+  it("rejects lexical escapes and symlink (junction) escapes", async () => {
+    tmp.enter();
+    // The fence root is a subdirectory; the junction target lives OUTSIDE it.
+    const root = path.join(tmp.dir, "workspace");
+    const outside = path.join(tmp.dir, "outside");
+    fs.mkdirSync(path.join(root, "inner"), { recursive: true });
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(path.join(outside, "secret.txt"), "top secret", "utf8");
+    const link = path.join(root, "innocent-link");
+    fs.symlinkSync(outside, link, "junction");
+    const calls: string[] = [];
+    const fenced = withPathFence(
+      [
+        {
+          name: "probe",
+          label: "Probe",
+          description: "probe tool",
+          parameters: {} as never,
+          replay: "safe" as const,
+          execute: async (_id: string, params: { path: string }) => {
+            calls.push(params.path);
+            return { content: [{ type: "text", text: "ok" }], details: undefined };
+          },
+        } as never,
+      ],
+      root,
+    );
+    await expect(fenced[0]!.execute("t1", { path: path.join(link, "secret.txt") })).rejects.toThrow(
+      /escapes workspace root through a symlink/,
+    );
+    await expect(fenced[0]!.execute("t2", { path: "../outside/secret.txt" })).rejects.toThrow(/escapes workspace root/);
+    await fenced[0]!.execute("t3", { path: "inner/inside.txt" });
+    // the fence checks but does NOT rewrite — the tool receives the raw argument
+    expect(calls).toEqual(["inner/inside.txt"]);
+    tmp.leave();
+  });
+
+  it("sanitizes evidence filenames (model-controlled toolCallId cannot traverse)", async () => {
+    tmp.enter();
+    const dir = path.join(tmp.dir, "evidence");
+    const tools = withEvidenceCapture([writeFileTool], dir);
+    await tools[0]!.execute("../../evil", { path: "ok.txt", content: "x" });
+    const files = fs.readdirSync(dir);
+    expect(files).toHaveLength(1);
+    expect(files[0]).toBe("evil.md");
+    expect(fs.existsSync(path.join(tmp.dir, "evil.md"))).toBe(false);
+    tmp.leave();
+  });
+
+  it("captures FAILED executions so tidy pointers never dangle", async () => {
+    tmp.enter();
+    const dir = path.join(tmp.dir, "evidence-err");
+    const boom: AnyAgentTool = {
+      ...writeFileTool,
+      execute: async () => {
+        throw new Error("disk exploded");
+      },
+    };
+    const tools = withEvidenceCapture([boom], dir);
+    await expect(tools[0]!.execute("call_err", { path: "x", content: "y" })).rejects.toThrow(/disk exploded/);
+    const written = fs.readFileSync(path.join(dir, "call_err.md"), "utf8");
+    expect(written).toContain("EXECUTION ERROR");
+    expect(written).toContain("disk exploded");
+    tmp.leave();
+  });
+
+  it("the approval request carries a preview of the actual arguments", async () => {
+    const seen: string[] = [];
+    const gate = createPermissionGate(
+      {
+        mode: "interactive",
+        approveFn: ({ toolName, argsPreview: preview }) => {
+          seen.push(`${toolName}: ${preview}`);
+          return false;
+        },
+      },
+      () => {},
+    );
+    await gate({
+      toolCall: { id: "c1", name: "write_file" },
+      args: { path: "a.txt", content: "secret payload" },
+    } as never);
+    expect(seen[0]).toContain("write_file");
+    expect(seen[0]).toContain("secret payload");
+  });
+});
+
+describe("加固期: zombie run self-heal + single count", () => {
+  it("a run whose trace already has run_end is healed (status backfilled), not resumed", async () => {
+    const { runId, dbPath } = await seed("zombie");
+    // Fabricate the zombie: the status write was lost, the trace is complete.
+    const db = openDatabase(dbPath);
+    db.prepare("UPDATE runs SET status = 'running', finished_at = NULL, error = NULL WHERE id = ?").run(runId);
+    db.close();
+
+    const manager = new RunManager();
+    const result = await manager.resume(runId, { database: dbPath, model: FAKE_MODEL });
+    manager.close();
+    expect(result.record.status).toBe("completed");
+    expect(result.messages).toEqual([]);
+    const trace = readTraceFile(result.tracePath as string);
+    expect(trace.events.filter((e) => e.type === "run_end")).toHaveLength(1); // no second run_end
+  });
+
+  it("a recovered re-execution counts ONCE against the tool-call budget", async () => {
+    const { runId, dbPath } = await seed("single-count");
+    crashAround(dbPath, runId);
+    const manager = new RunManager();
+    const result = await manager.resume(runId, {
+      model: FAKE_MODEL,
+      streamFn: scriptedStreamFn([assistantMessage([{ type: "text", text: "done" }], "stop")]),
+      reporter: new CollectingReporter(),
+      database: dbPath,
+      tools: [writeFileTool],
+      approval: { mode: "auto-approve" },
+      limits: { maxToolCalls: 1 }, // the recovered call is the one call — double counting would deny it
+    });
+    manager.close();
+    expect(result.record.status).toBe("completed");
+    expect(fs.readFileSync(path.join(tmp.dir, "gated.txt"), "utf8")).toBe("payload");
+  });
+});
+
+describe("加固期: compaction single-turn shapes", () => {
+  const system: AgentMessage = { role: "system", content: "sys" } as never;
+  const user: AgentMessage = { role: "user", content: "do three things", timestamp: 1 } as never;
+  const toolCall = (id: string): AgentMessage["content"] =>
+    [{ type: "toolCall", id, name: "read", arguments: {} }] as never;
+  const tr = (id: string): AgentMessage =>
+    ({ role: "toolResult", toolCallId: id, content: [{ type: "text", text: "r" }] }) as never;
+
+  it("single turn, many tool calls: the cut never separates an assistant from its toolResults", () => {
+    const msgs = [
+      system,
+      user,
+      { role: "assistant", content: toolCall("c1"), usage: USAGE, stopReason: "toolUse" } as never,
+      tr("c1"),
+      { role: "assistant", content: toolCall("c2"), usage: USAGE, stopReason: "toolUse" } as never,
+      tr("c2"),
+      { role: "assistant", content: toolCall("c3"), usage: USAGE, stopReason: "toolUse" } as never,
+      tr("c3"),
+    ];
+    const cut = findCutIndex(msgs, Number.POSITIVE_INFINITY);
+    expect(cut).toBe(msgs.length); // empty tail is the only safe cut without a user boundary
+  });
+
+  it("final fallback never returns a tail that starts with a toolResult", () => {
+    const msgs = [
+      system,
+      user,
+      { role: "assistant", content: toolCall("c1"), usage: USAGE, stopReason: "toolUse" } as never,
+      tr("c1"),
+    ];
+    const cut = findCutIndex(msgs, Number.POSITIVE_INFINITY);
+    expect(cut).toBe(msgs.length); // guarded — the old code returned length-1 (orphaned toolResult)
+    const asstTail = [system, user, { role: "assistant", content: [{ type: "text", text: "t" }] } as never];
+    expect(findCutIndex(asstTail, Number.POSITIVE_INFINITY)).toBe(asstTail.length - 1);
+  });
+});
+
+describe("加固期: eval robustness", () => {
+  const taskSet = {
+    name: "hardening",
+    tasks: [
+      { id: "t1", task: "task one" },
+      { id: "t2", task: "task two" },
+    ],
+  };
+  const okRunner: EvalRunner = async (task) => ({ taskId: task.id, status: "completed" });
+
+  it("wilsonInterval brackets the pass rate honestly", () => {
+    const zero = wilsonInterval(0, 10);
+    expect(zero.lo).toBe(0);
+    expect(zero.hi).toBeGreaterThan(0);
+    expect(zero.hi).toBeLessThan(0.35);
+    const all = wilsonInterval(18, 18);
+    expect(all.lo).toBeGreaterThan(0.8);
+    expect(all.hi).toBe(1);
+  });
+
+  it("refuses single-repeat comparisons (a verdict of one run is noise)", async () => {
+    await expect(runEvalComparison(taskSet, { runner: okRunner, skillName: "s", repeats: 1 })).rejects.toThrow(
+      /repeats >= 2/,
+    );
+    expect(() => assertEvalRepeats(1)).toThrow(/repeats >= 2/);
+  });
+
+  it("a runner crash becomes a failed run and the arm completes (partial results land)", async () => {
+    const arm = await runEvalArm(
+      taskSet,
+      async (task) => {
+        if (task.id === "t2") throw new Error("provider exploded");
+        return okRunner(task);
+      },
+      false,
+      { repeats: 2 },
+    );
+    expect(arm.results).toHaveLength(4);
+    const crashed = arm.results.filter((r) => r.status === "runner_error");
+    expect(crashed).toHaveLength(2);
+    expect(crashed.every((r) => r.pass === false && /runner crashed/.test(r.reason ?? ""))).toBe(true);
+  });
+
+  it("a judge crash fails the run instead of failing the comparison", async () => {
+    const judged = await runEvalArm(
+      { name: "judge-crash", tasks: [{ id: "j1", task: "explain", judgeInstructions: "be fair" }] },
+      okRunner,
+      false,
+      {
+        repeats: 2,
+        judge: async () => {
+          throw new Error("judge down");
+        },
+      },
+    );
+    expect(judged.results.every((r) => r.pass === false && /judge crashed/.test(r.reason ?? ""))).toBe(true);
+  });
+});
+
+describe("加固期: fault windows", () => {
+  it("parses the new points (argument optional where meaningful)", () => {
+    expect(parseFaultSpec("between_sinks")).toEqual({ point: "between_sinks", toolName: "" });
+    expect(parseFaultSpec("between_sinks:message_end")).toEqual({ point: "between_sinks", toolName: "message_end" });
+    expect(parseFaultSpec("after_assistant_message")).toEqual({ point: "after_assistant_message", toolName: "" });
+    expect(parseFaultSpec("mid_recovery:3")).toEqual({ point: "mid_recovery", toolName: "3" });
+    expect(() => parseFaultSpec("after_tool_call")).toThrow(/tool name/);
+  });
+
+  it("after_assistant_message fires on a tool-carrying assistant message (the planned window)", () => {
+    const kills: string[] = [];
+    const controller = new FaultController({ point: "after_assistant_message", toolName: "" }, () => kills.push("k"));
+    controller.onEvent({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "text", text: "hi" }] },
+    } as never);
+    expect(kills).toEqual([]);
+    controller.onEvent({
+      type: "message_end",
+      message: { role: "assistant", content: [{ type: "toolCall", id: "c1", name: "edit", arguments: {} }] },
+    } as never);
+    expect(kills).toEqual(["k"]);
+  });
+
+  it("mid_recovery fires after N resolved calls", () => {
+    const kills: string[] = [];
+    const controller = new FaultController({ point: "mid_recovery", toolName: "2" }, () => kills.push("k"));
+    controller.onRecoveryStep(1);
+    expect(kills).toEqual([]);
+    controller.onRecoveryStep(2);
+    expect(kills).toEqual(["k"]);
+  });
+
+  it("between_sinks fires after the first sink persisted the event", () => {
+    const order: string[] = [];
+    const sink = (name: string): TraceSink => ({ append: (event) => order.push(`${name}:${event.seq}`) });
+    const recorder = new TraceRecorder("r", [sink("jsonl"), sink("sqlite")], {
+      onSinkBoundary: (event) => order.push(`boundary:${event.seq}`),
+    });
+    recorder.record({ type: "recovery_action", toolCallId: "c", toolName: "t", action: "reexecute" });
+    expect(order).toEqual(["jsonl:1", "boundary:1", "sqlite:1"]);
+  });
+});
+
+describe("加固期: prune (retention)", () => {
+  it("prunes checkpoints of finished runs and traces/evidence beyond the keep window", () => {
+    tmp.enter();
+    const db = openDatabase(path.join(tmp.dir, "prune", "harness.db"));
+    try {
+      const now = Date.now();
+      const runIds = ["old-1", "old-2", "old-3", "new-1", "live-1"];
+      runIds.forEach((id, i) => {
+        new RunRepo(db).insert({
+          id,
+          task: `task ${id}`,
+          modelSpec: "m",
+          status: id === "live-1" ? "running" : "completed",
+          startedAt: new Date(now - (runIds.length - i) * 60_000).toISOString(),
+        });
+        db.prepare(
+          "INSERT INTO checkpoints (run_id, seq, kind, state_json, created_at) VALUES (?, 1, 'message_boundary', '{}', ?)",
+        ).run(id, new Date().toISOString());
+      });
+      const tracesDirPath = path.join(tmp.dir, "prune", "traces");
+      const evidencePath = path.join(tmp.dir, "prune", "evidence");
+      // finished DESC = [new-1, old-3, old-2, old-1]; keepRuns 2 → beyond = [old-2, old-1]
+      for (const id of ["old-1", "old-2"]) {
+        fs.mkdirSync(tracesDirPath, { recursive: true });
+        fs.writeFileSync(path.join(tracesDirPath, `${id}.jsonl`), "x\n", "utf8");
+        fs.mkdirSync(path.join(evidencePath, id), { recursive: true });
+      }
+      const plan = planPrune(db, { keepRuns: 2 });
+      expect(plan.beyond.map((r) => r.runId).sort()).toEqual(["old-1", "old-2"]);
+      const result = applyPrune(db, plan, { tracesDir: tracesDirPath, evidenceDir: evidencePath });
+      expect(result.tracesDeleted).toBe(2);
+      expect(result.evidenceDeleted).toBe(2);
+      const cpRows = (id: string): number =>
+        Number((db.prepare("SELECT COUNT(*) AS n FROM checkpoints WHERE run_id = ?").get(id) as { n: number }).n);
+      expect(cpRows("old-1")).toBe(0);
+      expect(cpRows("new-1")).toBe(0);
+      expect(cpRows("live-1")).toBe(1); // interrupted runs keep their checkpoints
+    } finally {
+      db.close();
+    }
+    tmp.leave();
+  });
+});
+
+describe("加固期: --force promotion requires confirmation", () => {
+  it("a declined confirmation leaves the promoted skill untouched; an accepted one overwrites", async () => {
+    tmp.enter();
+    const dbPath = path.join(tmp.dir, "confirm", "harness.db");
+    const db = openDatabase(dbPath);
+    let patternId = "";
+    try {
+      for (const i of [0, 1, 2]) {
+        new RunRepo(db).insert({
+          id: `cf-${i}`,
+          task: `note file task ${i}`,
+          modelSpec: "m",
+          status: "completed",
+          startedAt: new Date().toISOString(),
+        });
+        const repo = new TraceEventRepo(db);
+        const calls: Array<[string, number]> = [
+          ["write_file", i * 2 + 1],
+          ["read_file", i * 2 + 2],
+        ];
+        for (const [toolName, seq] of calls) {
+          repo.append({
+            v: 1,
+            seq,
+            ts: new Date().toISOString(),
+            runId: `cf-${i}`,
+            type: "message_end",
+            message: {
+              role: "toolResult",
+              toolCallId: `c-${toolName}-${seq}`,
+              toolName,
+              content: [{ type: "text", text: "w" }],
+              isError: false,
+              timestamp: Date.now(),
+            },
+          } as never);
+        }
+      }
+      new PatternRepo(db).replaceAll(minePatternsFromDb(db));
+      patternId = new PatternRepo(db).list()[0]!.id;
+    } finally {
+      db.close();
+    }
+    const skillsRoot = path.join(tmp.dir, "confirm", "skills");
+    const draft = await draftSkillFromPattern(patternId, {
+      database: dbPath,
+      complete: async () => JSON.stringify({ name: "confirm-skill", description: "d", body: "b" }),
+      skillsRoot,
+    });
+    promoteCandidate(draft.candidate.id, { database: dbPath, skillsRoot });
+    const promotedPath = path.join(skillsRoot, "promoted", "confirm-skill", "SKILL.md");
+    expect(fs.readFileSync(promotedPath, "utf8")).toContain("confirm-skill");
+
+    // simulate a v2 draft for the same skill
+    fs.writeFileSync(
+      draft.candidate.skillMdPath,
+      serializeSkillMd({ name: "confirm-skill", description: "d", body: "v2 body" }),
+      "utf8",
+    );
+    {
+      const db2 = openDatabase(dbPath);
+      try {
+        new SkillCandidateRepo(db2).setStatus(draft.candidate.id, "draft");
+      } finally {
+        db2.close();
+      }
+    }
+    expect(() =>
+      promoteCandidate(draft.candidate.id, { database: dbPath, skillsRoot, force: true, confirm: () => false }),
+    ).toThrow(/cancelled/);
+    expect(fs.readFileSync(promotedPath, "utf8")).not.toContain("v2 body");
+    promoteCandidate(draft.candidate.id, { database: dbPath, skillsRoot, force: true, confirm: () => true });
+    expect(fs.readFileSync(promotedPath, "utf8")).toContain("v2 body");
     tmp.leave();
   });
 });

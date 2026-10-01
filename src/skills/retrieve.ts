@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { parseSkillMd } from "./format.js";
+import { verifyPromotedSkills } from "./verify.js";
 import type { SkillEntry } from "../context/assembler.js";
 import { SkillCandidateRepo } from "../storage/repos/candidates.js";
 import { SkillRegistry, type SkillRow } from "../storage/repos/skills.js";
@@ -145,6 +146,18 @@ export class SkillIndex {
         doc = parseSkillMd(raw, file);
       } catch (err) {
         process.stderr.write(`[skills] skipping unreadable ${file}: ${err instanceof Error ? err.message : err}\n`);
+        continue;
+      }
+      // 加固期 (P2): the local parser is necessary but not sufficient — a hand
+      // dropped directory must pass PI'S OWN loader before it can be indexed
+      // and injected into runs (same gate as promote).
+      const verification = verifyPromotedSkills(dirPath);
+      if (!verification.ok) {
+        const errors = verification.diagnostics
+          .filter((d) => d.type === "error")
+          .map((d) => d.message)
+          .join("; ");
+        process.stderr.write(`[skills] rebuild: pi loader rejects ${dirPath} — skipping (${errors})\n`);
         continue;
       }
       const source = promotedCandidates.find((c) => c.name === doc.name);

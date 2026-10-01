@@ -20,9 +20,7 @@ describe("context assembler (阶段 8)", () => {
       skills: renderSkillBlock([
         { name: "demo-skill", description: "does demo things", location: "/skills/demo/SKILL.md" },
       ]),
-      experiences: renderExperienceBlock([
-        { summaryZh: "先读后写", approach: "read then write", pitfalls: "不要盲目覆盖" },
-      ]),
+      experiences: renderExperienceBlock([{ summaryZh: "先读后写", path: ".harness/memory/ordinary/first.md" }]),
     };
     expect(assembleSystemPrompt(sections)).toBe(assembleSystemPrompt({ ...sections }));
     expect(assembleSystemPrompt(sections)).toContain("BASE");

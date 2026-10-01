@@ -15,6 +15,12 @@ export interface RunLimits {
   /** Same tool + same arguments, counted per run. */
   maxRepeatedToolCalls?: number;
   maxCostUsd?: number;
+  /**
+   * Cumulative total tokens across the run (加固期). The cost fuse is blind on
+   * models that report cost.total = 0 (e.g. DashScope qwen registrations), so
+   * the token count is the reliable runaway backstop.
+   */
+  maxTotalTokens?: number;
   /** Per-execution timeout in ms. */
   toolTimeoutMs?: number;
 }
@@ -24,11 +30,12 @@ export const DEFAULT_RUN_LIMITS: Required<RunLimits> = {
   maxToolCalls: 120,
   maxRepeatedToolCalls: 3,
   maxCostUsd: Number.POSITIVE_INFINITY,
+  maxTotalTokens: 2_000_000,
   toolTimeoutMs: 120_000,
 };
 
 export interface LimitViolation {
-  kind: "turns" | "tool_calls" | "repeat" | "cost" | "consecutive_errors";
+  kind: "turns" | "tool_calls" | "repeat" | "cost" | "tokens" | "consecutive_errors";
   reason: string;
 }
 
@@ -40,6 +47,7 @@ export class LimitEnforcer {
   private turns = 0;
   private toolCalls = 0;
   private costUsd = 0;
+  private totalTokens = 0;
   private consecutiveErrors = 0;
   private readonly callHashes = new Map<string, number>();
 
@@ -53,6 +61,7 @@ export class LimitEnforcer {
     if (event.type === "message_end" && event.message.role === "assistant") {
       this.turns++;
       this.costUsd += event.message.usage.cost.total;
+      this.totalTokens += event.message.usage.totalTokens;
       this.consecutiveErrors = 0; // a fresh assistant turn resets the strike counter
     } else if (event.type === "tool_execution_end") {
       this.consecutiveErrors = event.isError ? this.consecutiveErrors + 1 : 0;
@@ -78,6 +87,9 @@ export class LimitEnforcer {
         "cost",
         `cost budget exhausted ($${this.costUsd.toFixed(4)} > $${this.limits.maxCostUsd.toFixed(4)})`,
       );
+    }
+    if (this.totalTokens > this.limits.maxTotalTokens) {
+      return deny("tokens", `token budget exhausted (${this.totalTokens} > ${this.limits.maxTotalTokens} tokens)`);
     }
     if (this.consecutiveErrors >= 5) {
       return deny("consecutive_errors", `${this.consecutiveErrors} consecutive tool failures — degrading`);

@@ -16,8 +16,9 @@ export interface TraceFileInfo {
 
 /**
  * Parses and validates a trace file: schema version, envelope integrity,
- * strictly increasing seq from 1, and the run_start…run_end lifecycle bracket.
- * A trace ending without run_end means the process died mid-run — that is a
+ * monotonically increasing seq (GAPS are tolerated — a failed sink leaves a
+ * hole; 加固期 P0), and the run_start…run_end lifecycle bracket. A trace
+ * ending without run_end means the process died mid-run — that is a
  * crash-recovery candidate (阶段 5), reported as its own error here.
  */
 export function readTraceFile(filePath: string): ParsedTrace {
@@ -59,8 +60,16 @@ export function readTraceFile(filePath: string): ParsedTrace {
   }
 
   events.forEach((ev, i) => {
-    if (ev.seq !== i + 1) {
-      throw new HarnessError(`${filePath}: seq ${ev.seq} at position ${i + 1}, expected ${i + 1} (gap or reorder)`);
+    if (i > 0) {
+      const prev = events[i - 1]!;
+      // Monotonicity is required; GAPS are tolerated (加固期 P0): a sink that
+      // failed to persist one event leaves a hole — the event is simply absent
+      // from this store, the same safe direction as a lagging checkpoint.
+      if (ev.seq <= prev.seq) {
+        throw new HarnessError(
+          `${filePath}: seq ${ev.seq} at position ${i + 1} follows ${prev.seq} (reorder or duplicate)`,
+        );
+      }
     }
     if (ev.runId !== events[0]?.runId) {
       throw new HarnessError(`${filePath}: mixed runIds "${events[0]?.runId}" and "${ev.runId}"`);

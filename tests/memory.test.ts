@@ -245,3 +245,37 @@ describe("memory injection into runs (阶段 9.5)", () => {
     tmp.leave();
   });
 });
+
+describe("加固期: memory index reset order (vectors FK)", () => {
+  it("reset() deletes vectors before experience rows — no FK violation once vectors exist", () => {
+    tmp.enter();
+    const db = openDatabase(path.join(tmp.dir, "fk", "harness.db"));
+    try {
+      const store = new MemoryStore(path.join(tmp.dir, "fk", "memory"));
+      const index = new MemorySearchIndex(db);
+      // experiences.run_id references runs — seed the parent row first
+      new RunRepo(db).insert({
+        id: "seed",
+        task: "seed task",
+        modelSpec: "m",
+        status: "completed",
+        startedAt: new Date().toISOString(),
+      });
+      const record = mkRecord({ id: "fk-record" });
+      store.save(record);
+      index.syncRecord(record);
+      // a vector row referencing the experience — the old delete order crashed here
+      db.prepare("INSERT INTO memory_vectors (exp_id, dim, vec) VALUES (?, 2, ?)").run(
+        record.id,
+        Buffer.from(new Float32Array([0.1, 0.2]).buffer),
+      );
+      expect(index.vectorCount()).toBe(1);
+      expect(() => index.rebuild(store)).not.toThrow();
+      expect(index.vectorCount()).toBe(0);
+      expect(index.searchFts("dedupe", 3).length).toBeGreaterThan(0);
+    } finally {
+      db.close();
+    }
+    tmp.leave();
+  });
+});

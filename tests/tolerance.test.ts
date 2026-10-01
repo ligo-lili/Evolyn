@@ -5,7 +5,8 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { completeStructured } from "../src/llm/structured.js";
 import { isTransientError, withRetry } from "../src/runtime/retry.js";
-import { withToolTimeout } from "../src/runtime/tools/timeout.js";
+import { ToolTimeoutError, withToolTimeout } from "../src/runtime/tools/timeout.js";
+import { execTool } from "../src/runtime/tools/exec.js";
 import { readTraceFile } from "../src/trace/read.js";
 import type { AnyAgentTool } from "../src/index.js";
 import { RunManager } from "../src/runtime/run-manager.js";
@@ -340,6 +341,49 @@ describe("runaway guards (阶段 9.8)", () => {
     const runId = result.record.id;
     const evidence = fs.readFileSync(path.join(tmp.dir, ".harness", "evidence", runId, "c1.md"), "utf8");
     expect(evidence).toContain("evidence body");
+    tmp.leave();
+  });
+});
+
+describe("加固期: timeouts and aborts are never retried", () => {
+  it("a ToolTimeoutError on a replay:safe tool executes exactly once (no concurrent retry)", async () => {
+    const calls: number[] = [];
+    const tool: AnyAgentTool = {
+      name: "slow-safe",
+      label: "SlowSafe",
+      description: "always times out",
+      parameters: {} as never,
+      replay: "safe" as const,
+      execute: async () => {
+        calls.push(1);
+        throw new ToolTimeoutError("slow-safe", 10);
+      },
+    } as never;
+    const wrapped = withRetry([tool], { policy: { maxAttempts: 3, backoffMs: 1 } });
+    await expect(wrapped[0]!.execute("t1", {})).rejects.toThrow(/timed out/);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("the demo exec tool runs with a whitelisted environment and honors timeouts", async () => {
+    tmp.enter();
+    process.env.HARNESS_CANARY = "leaked-secret";
+    try {
+      // probe via a script file — immune to shell quoting differences
+      fs.writeFileSync(
+        path.join(tmp.dir, "env-probe.js"),
+        "console.log(process.env.HARNESS_CANARY === undefined ? 'clean' : 'LEAKED');",
+        "utf8",
+      );
+      fs.writeFileSync(path.join(tmp.dir, "sleeper.js"), "setTimeout(() => {}, 30000);", "utf8");
+      const leaked = await execTool.execute("t1", { command: "node env-probe.js" });
+      expect((leaked.content[0] as { text: string }).text).toContain("clean");
+
+      const timedOut = await execTool.execute("t2", { command: "node sleeper.js", timeout_ms: 1000 });
+      expect(timedOut.details?.timedOut).toBe(true);
+      expect((timedOut.content[0] as { text: string }).text).toContain("(timed out)");
+    } finally {
+      delete process.env.HARNESS_CANARY;
+    }
     tmp.leave();
   });
 });

@@ -4,6 +4,7 @@ import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { resolveModel } from "../providers.js";
+import { HarnessError } from "../errors.js";
 import { RunManager, type SkillInjection } from "../runtime/run-manager.js";
 
 /**
@@ -72,6 +73,10 @@ export interface EvalTask {
    * 阶段 14 deterministic test check: run this command (in `cwd`, default
    * workspace root) after the run — exit 0 passes, anything else fails with
    * the output tail. No LLM involved.
+   *
+   * Executable configuration: the command runs through the shell verbatim, so
+   * a task set carries the same trust level as an npm script — only load task
+   * sets you wrote or trust (documented in the CLI help).
    */
   testCommand?: string;
   /** Directory the testCommand runs in, workspace-relative (default: root). */
@@ -121,6 +126,15 @@ export function prepareRepoFixture(spec: NonNullable<EvalTask["setupRepo"]>): vo
   }
   if (spec.url) {
     const ref = spec.ref ?? "HEAD";
+    // A task set is operator-provided executable configuration (testCommand is
+    // a shell command by design), but url/ref are interpolated into git shell
+    // strings — quote them AND reject quote/whitespace injection outright.
+    for (const [label, value] of [
+      ["url", spec.url],
+      ["ref", ref],
+    ] as const) {
+      if (/["\s]/.test(value)) throw new Error(`setupRepo.${label} must not contain quotes or whitespace`);
+    }
     const git = (args: string): string =>
       execSync(`git ${args}`, {
         cwd: dir,
@@ -131,13 +145,13 @@ export function prepareRepoFixture(spec: NonNullable<EvalTask["setupRepo"]>): vo
     if (!fs.existsSync(path.join(dir, ".git"))) {
       fs.mkdirSync(path.dirname(dir), { recursive: true });
       fs.rmSync(dir, { recursive: true, force: true });
-      execSync(`git clone ${spec.url} ${JSON.stringify(dir)}`, {
+      execSync(`git clone ${JSON.stringify(spec.url)} ${JSON.stringify(dir)}`, {
         stdio: ["ignore", "pipe", "pipe"],
         timeout: 300_000,
         windowsHide: true,
       });
     }
-    git(`fetch origin ${ref} --force`);
+    git(`fetch origin ${JSON.stringify(ref)} --force`);
     git(`checkout --force ${JSON.stringify(ref)}`);
     git(`clean -fd`);
     return;
@@ -369,12 +383,37 @@ export interface EvalArmResult {
   results: EvalResult[];
   taskSummaries: EvalTaskSummary[];
   passRate: number;
+  /** Wilson 95% interval over the pass rate — honest uncertainty even at n=18 (加固期 P2). */
+  passCi?: { lo: number; hi: number };
   /** Runs that read back a written file — the skill-adoption process metric. */
   verifiedRuns: number;
   /** Runs that died to provider infrastructure (rate limit/quota/auth). */
   infraFailures: number;
   totalTokens: number;
   totalDurationMs: number;
+}
+
+/** Wilson score interval (95%, z=1.96) for a binomial proportion. */
+export function wilsonInterval(passes: number, total: number, z = 1.96): { lo: number; hi: number } {
+  if (total <= 0) return { lo: 0, hi: 1 };
+  const p = passes / total;
+  const z2 = z * z;
+  const denom = 1 + z2 / total;
+  const center = (p + z2 / (2 * total)) / denom;
+  const spread = (z * Math.sqrt((p * (1 - p)) / total + z2 / (4 * total * total))) / denom;
+  return { lo: Math.max(0, center - spread), hi: Math.min(1, center + spread) };
+}
+
+/** 加固期 (P2): a single-repeat comparison is noise — the floor for anything that gates. */
+export const MIN_EVAL_REPEATS = 2;
+
+export function assertEvalRepeats(repeats: number): number {
+  if (!Number.isFinite(repeats) || repeats < MIN_EVAL_REPEATS) {
+    throw new HarnessError(
+      `eval comparisons need repeats >= ${MIN_EVAL_REPEATS} (got ${repeats}) — a single-repeat verdict is noise, not evidence`,
+    );
+  }
+  return repeats;
 }
 
 function summarizeArm(arm: EvalArmResult["arm"], results: EvalResult[]): EvalArmResult {
@@ -386,11 +425,13 @@ function summarizeArm(arm: EvalArmResult["arm"], results: EvalResult[]): EvalArm
     else s.failures.push(`#${r.repeat}: ${r.reason}`);
     byTask.set(r.taskId, s);
   }
+  const passes = results.filter((r) => r.pass).length;
   return {
     arm,
     results,
     taskSummaries: [...byTask.values()],
-    passRate: results.length ? results.filter((r) => r.pass).length / results.length : 0,
+    passRate: results.length ? passes / results.length : 0,
+    passCi: wilsonInterval(passes, results.length),
     verifiedRuns: results.filter((r) => r.verified === true).length,
     infraFailures: results.filter((r) => r.infra === true).length,
     totalTokens: results.reduce((sum, r) => sum + (r.tokens ?? 0), 0),
@@ -404,7 +445,10 @@ export interface EvalArmOptions {
   judge?: JudgeFn;
 }
 
-/** Run one arm of the task set, `repeats` times over, resetting fixtures per run. */
+/** Run one arm of the task set, `repeats` times over, resetting fixtures per run.
+ * 加固期 (P2): each run is individually fault-isolated — a runner or judge
+ * crash records a failed EvalResult and the arm continues, so a partial
+ * report still lands. */
 export async function runEvalArm(
   taskSet: EvalTaskSet,
   runner: EvalRunner,
@@ -416,17 +460,30 @@ export async function runEvalArm(
   for (let repeat = 1; repeat <= repeats; repeat++) {
     for (const task of taskSet.tasks) {
       prepareTaskWorkspace(task);
-      const raw = await runner(task, skills);
-      const judged = judgeRun(task, raw, repeat);
+      let raw: EvalRawRun;
+      let judged: EvalResult;
+      try {
+        raw = await runner(task, skills);
+        judged = judgeRun(task, raw, repeat);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        raw = { taskId: task.id, status: "runner_error", error: message };
+        judged = { ...raw, repeat, pass: false, reason: `runner crashed: ${message}` };
+      }
       if (judged.pass && task.judgeInstructions && opts.judge) {
         // 阶段 11 ordering: deterministic checks already passed; the judge now
         // decides. A deterministic failure never reaches the judge.
-        const verdict = await opts.judge({
-          task: task.task,
-          judgeInstructions: task.judgeInstructions,
-          finalText: raw.finalText,
-          status: raw.status,
-        });
+        let verdict: { pass: boolean; reason?: string };
+        try {
+          verdict = await opts.judge({
+            task: task.task,
+            judgeInstructions: task.judgeInstructions,
+            finalText: raw.finalText,
+            status: raw.status,
+          });
+        } catch (err) {
+          verdict = { pass: false, reason: `judge crashed: ${err instanceof Error ? err.message : String(err)}` };
+        }
         results.push({ ...judged, pass: verdict.pass, reason: verdict.pass ? undefined : verdict.reason });
       } else {
         results.push(judged);
@@ -576,7 +633,7 @@ function writeSessionArtifacts(
  * treatment first) so arm is never confounded with drift or quota-depletion
  * order. Writes protocol.json + session.jsonl when an artifactsDir is given. */
 export async function runEvalComparison(taskSet: EvalTaskSet, options: EvalRunOptions): Promise<EvalReport> {
-  const repeats = Math.max(1, options.repeats ?? 1);
+  const repeats = assertEvalRepeats(options.repeats ?? MIN_EVAL_REPEATS);
   const { protocol, sha256 } = buildProtocol(taskSet, {
     model: options.modelSpec ?? "",
     toolset: options.toolset,
@@ -600,15 +657,29 @@ export async function runEvalComparison(taskSet: EvalTaskSet, options: EvalRunOp
     for (const [arm, skills] of arms) {
       for (const task of taskSet.tasks) {
         prepareTaskWorkspace(task);
-        const raw = await options.runner(task, skills);
-        let judged = judgeRun(task, raw, repeat);
+        let raw: EvalRawRun;
+        let judged: EvalResult;
+        try {
+          raw = await options.runner(task, skills);
+          judged = judgeRun(task, raw, repeat);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          raw = { taskId: task.id, status: "runner_error", error: message };
+          judged = { ...raw, repeat, pass: false, reason: `runner crashed: ${message}` };
+        }
         if (judged.pass && task.judgeInstructions && options.judge) {
-          const verdict = await options.judge({
+          const verdictInput = {
             task: task.task,
             judgeInstructions: task.judgeInstructions,
             finalText: raw.finalText,
             status: raw.status,
-          });
+          };
+          let verdict: { pass: boolean; reason?: string };
+          try {
+            verdict = await options.judge(verdictInput);
+          } catch (err) {
+            verdict = { pass: false, reason: `judge crashed: ${err instanceof Error ? err.message : String(err)}` };
+          }
           judged = { ...judged, pass: verdict.pass, reason: verdict.pass ? undefined : verdict.reason };
         }
         seq += 1;
@@ -658,7 +729,7 @@ export async function runEvalAgainstBaseline(
   taskSet: EvalTaskSet,
   options: EvalRunOptions & { stored: { arm: EvalArmResult; repeats: number } },
 ): Promise<EvalReport> {
-  const repeats = Math.max(1, options.repeats ?? 1);
+  const repeats = assertEvalRepeats(options.repeats ?? MIN_EVAL_REPEATS);
   const treatment = await runEvalArm(
     taskSet,
     options.runner,
@@ -715,8 +786,9 @@ export function renderEvalReport(report: EvalReport): string {
     const avgTokens = runs ? Math.round(arm.totalTokens / runs) : 0;
     const avgSec = runs ? arm.totalDurationMs / runs / 1000 : 0;
     const infra = arm.infraFailures > 0 ? `, ${arm.infraFailures} INFRA-FAILED` : "";
+    const ci = arm.passCi ? ` [95% CI ${Math.round(arm.passCi.lo * 100)}–${Math.round(arm.passCi.hi * 100)}%]` : "";
     return (
-      `${label}: ${arm.results.filter((r) => r.pass).length}/${runs} pass (${pct(arm.passRate)}), ` +
+      `${label}: ${arm.results.filter((r) => r.pass).length}/${runs} pass (${pct(arm.passRate)})${ci}, ` +
       `verify-read-back ${arm.verifiedRuns}/${runs}, ~${avgTokens} tok/run, ~${avgSec.toFixed(1)}s/run${infra}`
     );
   };
@@ -775,6 +847,11 @@ export function defaultEvalRunner(modelSpec: string, options: DefaultRunnerOptio
         reporter: { onEvent: () => {} },
         skills,
         tools: options.toolset,
+        // Explicit, not inherited: eval arms run UNATTENDED by design (batch
+        // runs over real shell tools, identical across both arms). This is
+        // safe only because a task set is operator-provided executable
+        // configuration — see the trust note in the CLI help and EvalTask.
+        approval: { mode: "auto-approve" },
       });
       const toolCalls = result.messages.filter((m) => m.role === "toolResult").length;
       return {

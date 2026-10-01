@@ -45,7 +45,11 @@ export type HarnessAuditEvent =
       cutIndex: number;
     }
   | { type: "tool_retry"; toolCallId: string; toolName: string; attempt: number; error: string }
-  | { type: "limit_exceeded"; kind: "turns" | "tool_calls" | "repeat" | "cost" | "consecutive_errors"; reason: string };
+  | {
+      type: "limit_exceeded";
+      kind: "turns" | "tool_calls" | "repeat" | "cost" | "tokens" | "consecutive_errors";
+      reason: string;
+    };
 
 export type TraceEventPayload = AgentEvent | RunLifecycleEvent | HarnessAuditEvent;
 

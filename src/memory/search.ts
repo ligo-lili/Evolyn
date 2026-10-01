@@ -71,9 +71,12 @@ export class MemorySearchIndex {
   }
 
   reset(): void {
+    // 加固期 (P1) delete order: memory_vectors references experiences (FK),
+    // so the vectors must go BEFORE the experience rows or the reset fails
+    // with a foreign-key violation once vectors exist.
     this.db.exec("DELETE FROM experiences_fts");
-    this.db.exec("DELETE FROM experiences");
     this.db.exec("DELETE FROM memory_vectors");
+    this.db.exec("DELETE FROM experiences");
   }
 
   /** Wipe and repopulate the FTS index from the Markdown store. Returns record count. */

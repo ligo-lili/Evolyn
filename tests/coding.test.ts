@@ -8,6 +8,7 @@ import { TraceEventRepo } from "../src/storage/repos/trace-events.js";
 import { CheckpointRepo } from "../src/storage/repos/checkpoints.js";
 import { readTraceFile } from "../src/trace/read.js";
 import { reconcileJsonlTrace } from "../src/trace/reconcile.js";
+import { summarize } from "../src/trace/query.js";
 import { RunManager } from "../src/runtime/run-manager.js";
 import { DEFAULT_RUN_LIMITS, LimitEnforcer, type LimitViolation } from "../src/runtime/limits.js";
 import { CollectingReporter } from "../src/runtime/reporter.js";
@@ -443,6 +444,64 @@ describe("P1-2 trace reconciliation (阶段 13)", () => {
     const result = reconcileJsonlTrace(file, events as never);
     expect(result.rebuilt).toBe(true);
     expect(() => readTraceFile(file)).not.toThrow();
+    tmp.leave();
+  });
+});
+
+// ---------- trace summary --json ----------
+
+describe("trace summary machine-readable output", () => {
+  it("summarize() returns a JSON-serializable object carrying the runId", () => {
+    tmp.enter();
+    const dbPath = path.join(tmp.dir, "summary-json", "harness.db");
+    const db = openDatabase(dbPath);
+    try {
+      new RunRepo(db).insert({
+        id: "run-json-1",
+        task: "probe",
+        modelSpec: "m",
+        status: "completed",
+        startedAt: new Date().toISOString(),
+      });
+      const repo = new TraceEventRepo(db);
+      const ts = new Date().toISOString();
+      repo.append({
+        v: 1,
+        seq: 1,
+        ts,
+        runId: "run-json-1",
+        type: "run_start",
+        task: "probe",
+        modelSpec: "m",
+      } as never);
+      repo.append({
+        v: 1,
+        seq: 2,
+        ts,
+        runId: "run-json-1",
+        type: "message_end",
+        message: assistantMessage([{ type: "text", text: "hello" }], "stop"),
+      } as never);
+      repo.append({
+        v: 1,
+        seq: 3,
+        ts,
+        runId: "run-json-1",
+        type: "run_end",
+        status: "completed",
+        durationMs: 5,
+      } as never);
+
+      const summary = summarize(new TraceEventRepo(db).getByRun("run-json-1"));
+      const json = JSON.stringify(summary, null, 2);
+      expect(json).toContain("run-json-1");
+      const parsed = JSON.parse(json) as { runId: string; status?: string; eventCount: number };
+      expect(parsed.runId).toBe("run-json-1");
+      expect(parsed.status).toBe("completed");
+      expect(parsed.eventCount).toBe(3);
+    } finally {
+      db.close();
+    }
     tmp.leave();
   });
 });

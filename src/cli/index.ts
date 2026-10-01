@@ -9,6 +9,7 @@ import { explain } from "../trace/replay.js";
 import { summarize } from "../trace/query.js";
 import { renderReplay, renderSummary, renderTimeline } from "../trace/show.js";
 import { defaultDbPath, openDatabase } from "../storage/db.js";
+import { RunRepo } from "../storage/repos/runs.js";
 import { TraceEventRepo } from "../storage/repos/trace-events.js";
 import { harnessDataDir, tracesDir } from "../runtime/paths.js";
 import { ConsoleReporter } from "../runtime/reporter.js";
@@ -88,7 +89,8 @@ Usage:
                                            trace_events ledger rows for pruned runs and VACUUMs
   agent-harness trace list                 list recorded runs
   agent-harness trace show <runId> [--all] render a run's execution timeline
-  agent-harness trace summary <runId>      aggregate stats for a run
+  agent-harness trace summary <runId> [--json]
+                                            aggregate stats for a run
   agent-harness trace replay <runId> [--until <seq>]
                                            rebuild the run's state at any point + explain why
   agent-harness trace query <runId> [--tool <name>] [--errors]
@@ -130,6 +132,20 @@ function simpleDiff(oldText: string, newText: string): string[] {
       .filter((l) => !oldLines.has(l))
       .map((l) => `+ ${l}`),
   ];
+}
+
+/** Parse `--repeats` at the CLI boundary. An unparseable value (`--repeats abc`)
+ *  used to flow through as NaN and surface as a confusing "got NaN" error
+ *  deep inside eval.ts; reject it here instead, before any eval work starts.
+ *  Returns undefined when the flag is absent (callers apply their default). */
+function parseRepeatsFlag(value: string | boolean | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (!/^\d+$/.test(raw) || Number(raw) < 1) {
+    console.error(`invalid --repeats value: ${String(value)} (expected a positive integer)`);
+    return undefined;
+  }
+  return Number(raw);
 }
 
 async function main(): Promise<number> {
@@ -520,8 +536,8 @@ async function main(): Promise<number> {
         console.error("no model selected: pass --model provider/model-id or set HARNESS_MODEL");
         return 2;
       }
-      const repeatsFlag = typeof flags.repeats === "string" ? Number(flags.repeats) : MIN_EVAL_REPEATS;
-      const repeats = assertEvalRepeats(Number.isFinite(repeatsFlag) ? Math.floor(repeatsFlag) : MIN_EVAL_REPEATS);
+      if (flags.repeats !== undefined && parseRepeatsFlag(flags.repeats) === undefined) return 2;
+      const repeats = assertEvalRepeats(parseRepeatsFlag(flags.repeats) ?? MIN_EVAL_REPEATS);
       const toolsFlag = typeof flags.tools === "string" ? flags.tools : undefined;
       if (toolsFlag !== undefined && toolsFlag !== "demo" && toolsFlag !== "coding") {
         console.error(`unknown --tools "${toolsFlag}" (expected demo | coding)`);
@@ -608,8 +624,8 @@ async function main(): Promise<number> {
         console.error("no model selected: pass --model provider/model-id or set HARNESS_MODEL");
         return 2;
       }
-      const repeatsFlag = typeof flags.repeats === "string" ? Number(flags.repeats) : MIN_EVAL_REPEATS;
-      const repeats = assertEvalRepeats(Number.isFinite(repeatsFlag) ? Math.floor(repeatsFlag) : MIN_EVAL_REPEATS);
+      if (flags.repeats !== undefined && parseRepeatsFlag(flags.repeats) === undefined) return 2;
+      const repeats = assertEvalRepeats(parseRepeatsFlag(flags.repeats) ?? MIN_EVAL_REPEATS);
       const toolsFlag = typeof flags.tools === "string" ? flags.tools : undefined;
       if (toolsFlag !== undefined && toolsFlag !== "demo" && toolsFlag !== "coding") {
         console.error(`unknown --tools "${toolsFlag}" (expected demo | coding)`);
@@ -732,7 +748,8 @@ async function main(): Promise<number> {
         console.error("usage: agent-harness trace summary <runId>");
         return 2;
       }
-      console.log(renderSummary(summarize(loadRunEvents(id))));
+      const summary = summarize(loadRunEvents(id));
+      console.log(flags.json === true ? JSON.stringify(summary, null, 2) : renderSummary(summary));
       return 0;
     }
     if (sub === "replay") {
@@ -758,10 +775,15 @@ async function main(): Promise<number> {
       }
       const db = openDatabase(defaultDbPath());
       try {
+        const run = new RunRepo(db).get(id);
+        if (!run) {
+          console.error(`unknown run: ${id}`);
+          return 1;
+        }
         const repo = new TraceEventRepo(db);
         const tool = typeof flags.tool === "string" ? flags.tool : undefined;
         const events = tool ? repo.queryToolCalls(tool, id) : flags.errors ? repo.queryErrors(id) : repo.getByRun(id);
-        if (events.length === 0) console.log("(no matching events)");
+        if (events.length === 0) console.log(`no matching events for run ${id}`);
         for (const e of events) {
           const toolName = "toolName" in e && typeof e.toolName === "string" ? ` ${e.toolName}` : "";
           console.log(`#${e.seq} ${e.ts.slice(11, 23)} ${e.type}${toolName}`);

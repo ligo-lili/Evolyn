@@ -631,7 +631,10 @@ export class RunManager {
         synthetic.push(toolResultMessage(call.toolCallId, call.toolName, [{ type: "text", text }], true));
       }
     }
-
+    // 加固期 (P2) mid_recovery: the loop-end check — with a single unresolved
+    // call the in-loop check never fires, but killing between "recovery done"
+    // and "continuation prompt sent" is exactly the window worth covering.
+    faultController?.onRecoveryStep(resolvedCalls);
     const transcript = [...crashed.messages];
     // The trace never contains the synthesized system message, so the stored
     // systemPrompt is the only faithful way to rebuild the agent.
@@ -666,6 +669,8 @@ export class RunManager {
       // without this the turns / token / cost / consecutive-error fuses never
       // accumulate on the resume path (beforeToolCall counters still worked).
       composed.limitEnforcer.onAgentEvent(event);
+      // 加固期 (P2): after_assistant_message also covers the resumed segment.
+      faultController?.onEvent(event);
     };
     const unsubscribe = agent.subscribe(dispatch);
 
@@ -676,6 +681,14 @@ export class RunManager {
     try {
       if (synthetic.length > 0) {
         await agent.prompt(synthetic);
+        await agent.waitForIdle();
+      } else if (!messages.some((m) => m.role === "assistant")) {
+        // 加固期 (P2): a crash before ANY assistant response (e.g.
+        // between_sinks landing on the user message) leaves a transcript with
+        // no model output — the task itself still needs driving. Finalizing
+        // here would be the false completion the dangling-toolUse guard
+        // exists to prevent.
+        await agent.prompt(crashed.record.task);
         await agent.waitForIdle();
       } else if (messages.at(-1)?.role === "toolResult") {
         await agent.continue();

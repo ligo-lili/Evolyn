@@ -17,7 +17,8 @@
     "lint": "eslint src tests",
     "lint:fix": "eslint src tests --fix",
     "format:check": "prettier --check src tests",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "chaos": "node --disable-warning=ExperimentalWarning scripts/chaos.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.87.1",

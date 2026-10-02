@@ -134,7 +134,12 @@ export function makeTempCwd(): TempCwd {
 
   return {
     get dir() {
-      return stack.at(-1)?.dir ?? "";
+      // 加固期复核: an empty stack used to return "" — path.join with an empty
+      // base manufactures a RELATIVE path that lands in whatever cwd the test
+      // process happens to have. Fail loudly instead.
+      const top = stack.at(-1);
+      if (!top) throw new Error("makeTempCwd: tmp.enter() has not been called");
+      return top.dir;
     },
     enter() {
       const prev = process.cwd();

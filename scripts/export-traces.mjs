@@ -31,23 +31,45 @@ try {
   const runs = new harness.RunRepo(db).list(10_000);
   let files = 0;
   let events = 0;
+  let incomplete = 0;
   for (const run of runs) {
-    const eventsForRun = new harness.TraceEventRepo(db).getByRun(run.id);
-    if (eventsForRun.length === 0) continue;
-    fs.mkdirSync(tracesDir, { recursive: true });
-    const file = path.join(tracesDir, `${run.id}.jsonl`);
-    fs.writeFileSync(
-      file,
-      eventsForRun.map((e) => JSON.stringify(e)).join("\n") + "\n",
-      "utf8",
-    );
-    // Every exported trace must pass the reader's validation — the projection
-    // is only valid if the authority round-trips.
-    harness.readTraceFile(file);
-    files++;
-    events += eventsForRun.length;
+    try {
+      const eventsForRun = new harness.TraceEventRepo(db).getByRun(run.id);
+      if (eventsForRun.length === 0) continue;
+      fs.mkdirSync(tracesDir, { recursive: true });
+      const file = path.join(tracesDir, `${run.id}.jsonl`);
+      fs.writeFileSync(
+        file,
+        eventsForRun.map((e) => JSON.stringify(e)).join("\n") + "\n",
+        "utf8",
+      );
+      // 加固期复核: interrupted runs (status=running, no run_end) are EXPECTED
+      // in a crash-recovery repo — the full bracket check would abort the
+      // export on exactly the runs this tool exists to recover. Validate seq
+      // monotonicity inline and let the bracket check apply only to complete
+      // traces.
+      const last = eventsForRun.at(-1);
+      if (last?.type === "run_end") {
+        harness.readTraceFile(file);
+      } else {
+        incomplete++;
+        for (let s = 1; s < eventsForRun.length; s++) {
+          if (eventsForRun[s].seq <= eventsForRun[s - 1].seq) {
+            throw new Error(`seq ${eventsForRun[s].seq} follows ${eventsForRun[s - 1].seq} (reorder or duplicate)`);
+          }
+        }
+      }
+      files++;
+      events += eventsForRun.length;
+    } catch (err) {
+      // One damaged run must not abort the whole projection rebuild.
+      console.warn(`[export] skipped run ${run.id}: ${err instanceof Error ? err.message : err}`);
+    }
   }
-  console.log(`exported ${files} trace file(s), ${events} event(s) from ${dbPath}`);
+  console.log(
+    `exported ${files} trace file(s), ${events} event(s) from ${dbPath}` +
+      (incomplete ? ` (${incomplete} interrupted run(s) exported without bracket validation)` : ""),
+  );
 } finally {
   db.close();
 }

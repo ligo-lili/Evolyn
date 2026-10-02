@@ -57,10 +57,14 @@ export function summarize(events: readonly TraceEvent[]): TraceSummary {
         const m = event.message;
         if (m.role === "assistant") {
           summary.assistantTurns++;
-          summary.tokens.input += m.usage.input;
-          summary.tokens.output += m.usage.output;
-          summary.tokens.total += m.usage.totalTokens;
-          summary.tokens.cost += m.usage.cost.total;
+          // 加固期复核: usage (and cost.total) can be missing on messages
+          // from providers without pricing — NaN would poison the summary and
+          // JSON.stringify would silently emit null.
+          const usage = m.usage ?? { input: 0, output: 0, totalTokens: 0 };
+          summary.tokens.input += usage.input ?? 0;
+          summary.tokens.output += usage.output ?? 0;
+          summary.tokens.total += usage.totalTokens ?? 0;
+          summary.tokens.cost += usage.cost?.total ?? 0;
           if (m.errorMessage) summary.errorCount++;
         } else if (m.role === "toolResult") {
           // Authoritative call stats: every call — real execution OR recovery-

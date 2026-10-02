@@ -688,7 +688,15 @@ export class RunManager {
         // no model output — the task itself still needs driving. Finalizing
         // here would be the false completion the dangling-toolUse guard
         // exists to prevent.
-        await agent.prompt(crashed.record.task);
+        // 加固期复核: the user message itself may already be persisted (a kill
+        // after its message_end) — pi's continue() handles a transcript that
+        // ends on a user message, so drive WITHOUT appending the task a second
+        // time; only a genuinely empty transcript gets prompt(task).
+        if (messages.some((m) => m.role === "user")) {
+          await agent.continue();
+        } else {
+          await agent.prompt(crashed.record.task);
+        }
         await agent.waitForIdle();
       } else if (messages.at(-1)?.role === "toolResult") {
         await agent.continue();

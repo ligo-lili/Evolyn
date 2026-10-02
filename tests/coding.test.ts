@@ -303,6 +303,63 @@ describe("P1-3 resume gating (阶段 13)", () => {
     // the over-budget tool call must never have executed
     expect(fs.existsSync(path.join(tmp.dir, "again.txt"))).toBe(false);
   });
+
+  it("resume with a persisted user message and no assistant output continues WITHOUT duplicating the task (加固期复核)", async () => {
+    // Fabricate the exact between_sinks-at-user-message state: the user
+    // message_end is durable, nothing else happened.
+    const ws = path.join(tmp.dir, "resume-user");
+    const dbPath = path.join(ws, "harness.db");
+    fs.mkdirSync(path.join(ws, ".harness", "traces"), { recursive: true });
+    const db = openDatabase(dbPath);
+    let runId: string;
+    try {
+      runId = "user-continue-" + Date.now();
+      new RunRepo(db).insert({
+        id: runId,
+        task: "write the file",
+        modelSpec: "chaos/chaos-fake",
+        status: "running",
+        startedAt: new Date().toISOString(),
+      });
+      const repo = new TraceEventRepo(db);
+      const push = (seq: number, type: string, payload: Record<string, unknown>): void =>
+        repo.append({ v: 1, seq, ts: new Date().toISOString(), runId, type, ...payload } as never);
+      push(1, "run_start", { task: "write the file", modelSpec: "chaos/chaos-fake" });
+      push(2, "message_end", { message: { role: "user", content: "write the file", timestamp: Date.now() } });
+    } finally {
+      db.close();
+    }
+    fs.writeFileSync(
+      path.join(ws, ".harness", "traces", `${runId}.jsonl`),
+      "",
+      "utf8",
+    );
+    // The JSONL was truncated away by a between_sinks reconcile (SQLite is the
+    // authority) — resume must drive the task via continue() without
+    // appending the user message twice.
+
+    const manager = new RunManager();
+    const result = await manager.resume(runId, {
+      model: FAKE_MODEL,
+      streamFn: scriptedStreamFn([
+        assistantMessage(
+          [{ type: "toolCall", id: "c1", name: "write_file", arguments: { path: "task.txt", content: "done" } }],
+          "toolUse",
+        ),
+        assistantMessage([{ type: "text", text: "finished" }], "stop"),
+      ]),
+      reporter: new CollectingReporter(),
+      database: dbPath,
+      tools: [writeFileTool],
+    });
+    manager.close();
+
+    expect(result.record.status).toBe("completed");
+    const userMessages = result.messages.filter((m) => m.role === "user");
+    expect(userMessages).toHaveLength(1); // NOT duplicated
+    // the in-process resume runs with the test's cwd — task.txt lands there
+    expect(fs.readFileSync(path.join(tmp.dir, "task.txt"), "utf8")).toBe("done");
+  });
 });
 
 // ---------- P1-2: JSONL/SQLite reconciliation ----------
@@ -495,14 +552,20 @@ describe("trace summary machine-readable output", () => {
       const summary = summarize(new TraceEventRepo(db).getByRun("run-json-1"));
       const json = JSON.stringify(summary, null, 2);
       expect(json).toContain("run-json-1");
-      const parsed = JSON.parse(json) as { runId: string; status?: string; eventCount: number };
+      const parsed = JSON.parse(json) as { runId: string; status?: string; eventCount: number; tokens: { cost: number } };
       expect(parsed.runId).toBe("run-json-1");
       expect(parsed.status).toBe("completed");
       expect(parsed.eventCount).toBe(3);
+      // 加固期复核: cost must stay a number even when usage.cost.total is
+      // absent — JSON.stringify used to turn NaN into null here.
+      expect(typeof parsed.tokens.cost).toBe("number");
+      expect(Number.isNaN(parsed.tokens.cost)).toBe(false);
     } finally {
       db.close();
+      // 加固期复核: the leave belongs INSIDE the finally — a failing assertion
+      // used to skip it and strand the temp workspace (cwd stuck outside).
+      tmp.leave();
     }
-    tmp.leave();
   });
 });
 

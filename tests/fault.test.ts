@@ -132,7 +132,6 @@ describe.skipIf(!fs.existsSync(DIST))("fault windows E2E (加固期第三轮, re
   it("between_sinks: JSONL ahead of SQLite, resume completes (no duplicate seqs)", async () => {
     tmp.enter();
     const ws = path.join(tmp.dir, "e2e-sinks");
-    tmp.enter();
     fs.mkdirSync(ws, { recursive: true });
     const dbPath = path.join(ws, "harness.db");
 
@@ -226,7 +225,6 @@ describe.skipIf(!fs.existsSync(DIST))("fault windows E2E (加固期第三轮, re
   it("mid_recovery: killed between recovery decisions, the next resume stitches and completes", async () => {
     tmp.enter();
     const ws = path.join(tmp.dir, "e2e-recovery");
-    tmp.enter();
     fs.mkdirSync(ws, { recursive: true });
     const dbPath = path.join(ws, "harness.db");
 

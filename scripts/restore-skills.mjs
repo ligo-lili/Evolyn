@@ -14,6 +14,7 @@ import { pathToFileURL } from "node:url";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const dist = pathToFileURL(path.join(here, "..", "dist", "index.js")).href;
 const harness = await import(dist);
+const format = await import(pathToFileURL(path.join(here, "..", "dist", "skills", "format.js")).href);
 
 function arg(flag, fallback) {
   const i = process.argv.indexOf(flag);
@@ -41,7 +42,7 @@ try {
     }
     fs.mkdirSync(dirPath, { recursive: true });
     // The FTS body is the distilled text; promote-time validation re-parses it.
-    const raw = `---\nname: ${row.name}\ndescription: ${JSON.stringify(row.description)}\n---\n${row.body}\n`;
+    const raw = format.serializeSkillMd({ name: row.name, description: row.description, body: row.body });
     fs.writeFileSync(file, raw, "utf8");
     restored++;
     console.log(`restored ${row.name} from the FTS projection`);

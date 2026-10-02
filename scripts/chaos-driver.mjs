@@ -78,7 +78,6 @@ function scriptedStreamFn() {
   // random kills a real window across ALL phases of the plan.
   const STEP_DELAY_MS = Number(process.env.CHAOS_STEP_DELAY ?? 30);
   return async (_model, context) => {
-    call++;
     await new Promise((resolve) => setTimeout(resolve, STEP_DELAY_MS));
     call++;
     const messages = context?.messages ?? [];
@@ -178,6 +177,4 @@ try {
 } catch (err) {
   console.error(String(err?.message ?? err));
   process.exit(1);
-} finally {
-  manager.close();
 }

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
-import type { AgentEvent, AgentOptions, AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
+import type { AgentEvent, AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
 import type { Api, AssistantMessage, Model, Usage } from "@earendil-works/pi-ai";
 import type { DatabaseSync } from "node:sqlite";
 import { CODING_SYSTEM_PROMPT, DEFAULT_SYSTEM_PROMPT } from "../config.js";
@@ -22,31 +22,24 @@ import {
 } from "../context/assembler.js";
 import { buildWorkspaceTree } from "../context/workspace.js";
 import { SkillIndex, toAssemblerEntries } from "../skills/retrieve.js";
-import { createContextTransformer } from "../context/compaction.js";
-import type { CompactionSettings } from "@earendil-works/pi-agent-core";
-import { DEFAULT_RUN_LIMITS, LimitEnforcer, type LimitViolation, type RunLimits } from "./limits.js";
-import { withRetry, type RetryPolicy } from "./retry.js";
-import { withToolTimeout } from "./tools/timeout.js";
+import { createContextTransformer, type ContextManagementOptions } from "../context/compaction.js";
+import { DEFAULT_RUN_LIMITS, type LimitViolation, type RunLimits } from "./limits.js";
+import type { RetryPolicy } from "./retry.js";
+import { composeRuntime, sumAgentUsage } from "./compose.js";
 import { MemorySearchIndex } from "../memory/search.js";
 import { MemoryStore } from "../memory/store.js";
-import { withEvidenceCapture } from "./tools/evidence.js";
-import { withPathFence } from "./tools/fence.js";
+import { createMemoryTools } from "../memory/tools.js";
 import { TraceRecorder, JsonlTraceSink, type TraceSink } from "../trace/recorder.js";
 import { reconcileJsonlTrace } from "../trace/reconcile.js";
-import {
-  applyFaultToTools,
-  FaultController,
-  formatFaultSpec,
-  parseFaultSpec,
-  type FaultSpec,
-} from "../execution/fault.js";
-import { createPermissionGate, type ApprovalOptions } from "./approval.js";
+import { FaultController, formatFaultSpec, parseFaultSpec } from "../execution/fault.js";
+import type { ApprovalOptions } from "./approval.js";
 import { ALL_CAPABILITIES } from "./permissions.js";
 import { harnessDataDir } from "./paths.js";
 import { createAgent } from "./agent-factory.js";
 import { ConsoleReporter, type RunReporter } from "./reporter.js";
 import { DEMO_TOOLS, type AnyAgentTool } from "./tools/index.js";
 import { createCodingToolset } from "./tools/coding.js";
+import type { ExploreToolDeps } from "./tools/explore.js";
 import type { HarnessAuditEvent } from "../trace/schema.js";
 
 export type RunStatus = "running" | "completed" | "failed";
@@ -64,8 +57,8 @@ const DEFAULT_SKILL_LIMIT = 2;
  * comparable) or pi's coding toolset (阶段 13), or an explicit array. */
 export type ToolsetSpec = AnyAgentTool[] | "demo" | "coding";
 
-function resolveTools(tools: ToolsetSpec | undefined): AnyAgentTool[] {
-  if (tools === "coding") return createCodingToolset();
+function resolveTools(tools: ToolsetSpec | undefined, explore?: ExploreToolDeps): AnyAgentTool[] {
+  if (tools === "coding") return createCodingToolset(process.cwd(), { explore });
   if (tools === "demo" || tools === undefined) return DEMO_TOOLS;
   return tools;
 }
@@ -88,50 +81,6 @@ function defaultLimitsFor(tools: ToolsetSpec | undefined, overrides: RunLimits |
   };
 }
 
-/**
- * 阶段 13 (P1-3): the ONE place where tools get wrapped (fault → evidence →
- * timeout → retry) and the beforeToolCall chain is composed (limits →
- * permission gate). run() and resume() MUST share this — a resume executing
- * recovered tools outside the chain would run real shell commands in the
- * workspace without permission checks or audit (coding scenario: unacceptable).
- */
-function composeRuntime(input: {
-  tools: AnyAgentTool[];
-  faultSpec: FaultSpec | undefined;
-  evidenceDir: string;
-  limits: Required<RunLimits>;
-  retryPolicy: RetryPolicy | undefined;
-  approval: ApprovalOptions | undefined;
-  audit: (event: HarnessAuditEvent) => void;
-  onLimitViolation: (violation: LimitViolation) => void;
-}): {
-  tools: AnyAgentTool[];
-  beforeToolCall: NonNullable<AgentOptions["beforeToolCall"]>;
-  limitEnforcer: LimitEnforcer;
-} {
-  const tools = withRetry(
-    withToolTimeout(
-      withEvidenceCapture(
-        // 加固期 (P0): path fence OUTSIDE the fault wrapper — every execution
-        // (live or fault-injected) checks path-like args against the workspace
-        // root, lexically AND through symlinks.
-        withPathFence(applyFaultToTools(input.tools, input.faultSpec)),
-        input.evidenceDir,
-      ),
-      input.limits.toolTimeoutMs,
-    ),
-    { policy: input.retryPolicy, audit: input.audit },
-  );
-  const permissionGate = createPermissionGate(input.approval, input.audit);
-  const limitEnforcer = new LimitEnforcer(input.limits, input.audit, input.onLimitViolation);
-  const beforeToolCall: NonNullable<AgentOptions["beforeToolCall"]> = async (context) => {
-    const violation = limitEnforcer.beforeToolCall(context.toolCall.name, context.args);
-    if (violation) return violation;
-    return permissionGate(context);
-  };
-  return { tools, beforeToolCall, limitEnforcer };
-}
-
 export interface RunRecord {
   id: string;
   task: string;
@@ -142,6 +91,13 @@ export interface RunRecord {
   error?: string;
   /** Persisted for recovery: the trace never contains the synthesized system message. */
   systemPrompt?: string;
+  /**
+   * Persisted for recovery: resume rebuilds the SAME toolset (a crashed coding
+   * run resumed with the demo default would synthesize "not registered" errors
+   * for every unresolved call). Only the named presets are persistable —
+   * explicit tool arrays stay undefined and fall back to the demo default.
+   */
+  toolset?: "demo" | "coding";
 }
 
 export interface RunResult {
@@ -171,14 +127,19 @@ export interface RunOptions {
   approval?: ApprovalOptions;
   /** Fault injection spec "point:toolName" for crash demos/tests, e.g. "after_tool_call:send_notification". */
   fault?: string;
-  /** Context compaction overrides; defaults to pi's threshold math on the run's model. */
-  compaction?: {
-    settings?: Partial<CompactionSettings>;
-    /** Injectable summarizer for tests; default calls models.completeSimple. */
-    summaryFn?: (prefix: readonly AgentMessage[], previousSummary?: string) => Promise<string>;
-  };
-  /** Ordinary-memory retrieval for pointer injection. Default: 3 hits when an index exists. */
-  memory?: { limit?: number };
+  /**
+   * Context management overrides (blocks / budget lines / two-layer reduction).
+   * Defaults derive the six budget lines from the run model's window.
+   */
+  context?: Omit<ContextManagementOptions, "model" | "onEvent" | "historyCount" | "evidenceBase">;
+  /**
+   * Ordinary-memory recall + tool surface (memory-design.md §8). Default: 5
+   * cue hits injected at run start (snapshot, no side effects). `tools` adds
+   * the model tool surface (memory_read/search/create/update/archive +
+   * core_memory_update) — default true for the coding toolset, opt-in
+   * otherwise; memory_read arms the run's update whitelist.
+   */
+  memory?: { limit?: number; tools?: boolean };
   /**
    * 阶段 10 skill injection for <available_skills>. Default: FTS top-2 from
    * the promoted skill index when a database is attached; `false` disables
@@ -200,46 +161,22 @@ export interface ResumeOptions {
   reporter?: RunReporter;
   database?: string | false;
   traceDir?: string;
-  /** Context compaction overrides for the resumed agent. */
-  compaction?: {
-    settings?: Partial<CompactionSettings>;
-    summaryFn?: (prefix: readonly AgentMessage[]) => Promise<string>;
-  };
+  /** Context management overrides for the resumed agent. */
+  context?: Omit<ContextManagementOptions, "model" | "onEvent" | "historyCount" | "evidenceBase">;
   /** Approval gate for the resumed run — recovery re-executions go through it (阶段 13). */
   approval?: ApprovalOptions;
   /** Runaway guards for the resumed run. Defaults are always enforced. */
   limits?: RunLimits;
   /** Tiered retry policy for the resumed run. */
   retry?: RetryPolicy;
+  /** Memory tool surface for the resumed segment (same default as run). */
+  memory?: { tools?: boolean };
   /**
    * 加固期 (P2): fault injection for the RECOVERY segment — e.g.
    * "mid_recovery:1" kills with one call already resolved, "between_sinks"
    * kills between the JSONL and SQLite writes.
    */
   fault?: string;
-}
-
-function sumUsage(messages: readonly AgentMessage[]): Usage | undefined {
-  let total: Usage | undefined;
-  for (const m of messages) {
-    if (m.role !== "assistant") continue;
-    const u = m.usage;
-    if (!total) {
-      total = { ...u, cost: { ...u.cost } };
-      continue;
-    }
-    total.input += u.input;
-    total.output += u.output;
-    total.cacheRead += u.cacheRead;
-    total.cacheWrite += u.cacheWrite;
-    total.totalTokens += u.totalTokens;
-    total.cost.input += u.cost.input;
-    total.cost.output += u.cost.output;
-    total.cost.cacheRead += u.cost.cacheRead;
-    total.cost.cacheWrite += u.cost.cacheWrite;
-    total.cost.total += u.cost.total;
-  }
-  return total;
 }
 
 function lastAssistant(messages: readonly AgentMessage[]): AssistantMessage | undefined {
@@ -275,24 +212,55 @@ export class RunManager {
       status: "running",
       startedAt: new Date().toISOString(),
     };
+    // Resume restores the toolset from this field (migration 012) — named
+    // presets only; explicit tool arrays are not persistable.
+    if (options.tools === "demo" || options.tools === "coding") record.toolset = options.tools;
     this.runs.set(record.id, record);
 
     const database = this.ensureDatabase(options.database);
     const runRepo = database ? new RunRepo(database) : undefined;
 
-    // 阶段 9.5 memory injection: Core Memory is always resident; Ordinary
-    // Memory enters as pointers (model reads the full file on demand).
-    const memoryStore = new MemoryStore(path.join(harnessDataDir(process.cwd()), "memory"));
+    // Memory (memory-design.md §8/§9): Core 常驻注入；自动召回每 Run 一次、
+    // 是 cue 快照（id/title/revision/summary/snippet）——无副作用、不授权更新。
+    // 启动对账以 Markdown 为权威同步文本投影（关键路径不做 embedding）。
+    // 权威目录与 reflect/CLI 同源：自定义 database 时用其所在目录下的 memory/，
+    // 默认（或 database:false）回落 .harness/memory。
+    const memoryDir =
+      typeof options.database === "string"
+        ? path.join(path.dirname(options.database), "memory")
+        : path.join(harnessDataDir(process.cwd()), "memory");
+    const memoryStore = new MemoryStore(memoryDir);
     const core = memoryStore.readCore();
+    let memoryIndex: MemorySearchIndex | undefined;
     let experienceBlock: string | undefined;
     if (database) {
-      const hits = new MemorySearchIndex(database).searchFts(options.task, options.memory?.limit ?? 3);
+      memoryIndex = new MemorySearchIndex(database);
+      memoryIndex.reconcile(memoryStore);
+      const hits = await memoryIndex.search(memoryStore, options.task.slice(0, 1600), {
+        limit: options.memory?.limit ?? 5,
+      });
       if (hits.length > 0) {
         experienceBlock = renderExperienceBlock(
-          hits.map((h) => ({ summaryZh: h.summaryZh, path: path.relative(process.cwd(), memoryStore.pathOf(h.id)) })),
+          hits.map((h) => ({
+            id: h.record.id,
+            title: h.record.title,
+            revision: h.record.revision,
+            summary: h.record.summary,
+            snippet: h.snippet,
+            path: path.relative(process.cwd(), memoryStore.pathOf(h.record.id)),
+          })),
         );
       }
     }
+    // Memory tool surface (§8): coding runs get it by default; explicit opt-in
+    // via memory.tools for any toolset. Created BEFORE composeRuntime so the
+    // tools go through the SAME wrapper chain (evidence capture / timeout /
+    // retry) — a memory_read result trimmed by compaction must have a real
+    // evidence file behind its pointer.
+    const memoryTools =
+      memoryIndex && (options.memory?.tools ?? options.tools === "coding")
+        ? createMemoryTools({ store: memoryStore, index: memoryIndex, runId: record.id })
+        : [];
     // 阶段 10 skill injection: promoted skills enter as <available_skills> —
     // the model reads the SKILL.md body on demand, mirroring pi's mechanism.
     let skillBlock: string | undefined;
@@ -343,8 +311,24 @@ export class RunManager {
       );
     }
 
+    // Phase-1 explore subagent: deps close over `composed` (initialized right
+    // below) so the child's spend lands on the parent's money fuses — the
+    // closure only fires at tool-execution time, after `composed` exists.
+    const exploreDeps: ExploreToolDeps | undefined =
+      options.tools === "coding"
+        ? {
+            model: options.model,
+            streamFn: options.streamFn,
+            approval: options.approval,
+            retryPolicy: options.retry,
+            parentEvidenceDir: path.join(harnessDataDir(process.cwd()), "evidence", record.id),
+            charge: (usage) => composed.limitEnforcer.charge(usage),
+            audit: (event) => recorder?.record(event),
+            summaryChat: options.context?.summaryChat,
+          }
+        : undefined;
     const composed = composeRuntime({
-      tools: resolveTools(options.tools),
+      tools: [...resolveTools(options.tools, exploreDeps), ...memoryTools],
       faultSpec,
       evidenceDir: path.join(harnessDataDir(process.cwd()), "evidence", record.id),
       limits,
@@ -360,12 +344,12 @@ export class RunManager {
     // not optional. Default options grant everything (backwards compatible).
     const composedBeforeToolCall = composed.beforeToolCall;
     const contextTransformer = createContextTransformer({
-      contextWindow: options.model.contextWindow,
+      ...options.context,
       model: options.model,
-      settings: options.compaction?.settings,
-      summaryFn: options.compaction?.summaryFn,
+      models: options.context?.models,
+      summaryChat: options.context?.summaryChat,
       onEvent: (event) => recorder?.record(event),
-      tidy: { evidenceBase: path.join(".harness", "evidence", record.id) },
+      evidenceBase: path.join(".harness", "evidence", record.id),
     });
     const agent = createAgent({
       model: options.model,
@@ -436,7 +420,7 @@ export class RunManager {
       }
     }
 
-    return { record, messages, usage: sumUsage(messages), tracePath: traceFile };
+    return { record, messages, usage: sumAgentUsage(messages), tracePath: traceFile };
   }
 
   get(id: string): RunRecord | undefined {
@@ -464,7 +448,6 @@ export class RunManager {
     const faultSpec = parseFaultSpec(options.fault); // validates before anything is written
     const database = this.ensureDatabase(options.database);
     if (!database) throw new HarnessError("resume requires the SQLite database (do not pass database: false)");
-    const resolvedTools = resolveTools(options.tools);
     const traceDir = options.traceDir ?? path.join(harnessDataDir(process.cwd()), "traces");
     const traceFile = path.join(traceDir, `${runId}.jsonl`);
 
@@ -509,7 +492,52 @@ export class RunManager {
         `[harness] trace JSONL reconciled with SQLite (authoritative): dropped ${reconciled.truncated} tail event(s), rebuilt=${reconciled.rebuilt}, backfilled=${reconciled.backfilled}\n`,
       );
     }
-    const crashed = loadCrashedRun(database, runId, resolvedTools);
+    // Phase-1 explore subagent: the resolved toolset MUST include explore so a
+    // crashed subagent call re-executes on recovery — which orders deps before
+    // loadCrashedRun. The model falls back to the stored row's spec (the
+    // crashed record is not loaded yet); evidence keys on runId, identical to
+    // record.id once the crashed record is rebuilt. audit closes over a bridge
+    // that binds to the recorder once it exists — it only fires later.
+    const auditBridge: { record: (event: HarnessAuditEvent) => void } = { record: () => {} };
+    const model = options.model ?? resolveModel(storedRow.modelSpec);
+    const startedMs = Date.now();
+    // Toolset identity: the caller's explicit choice wins; otherwise the
+    // toolset persisted on the run row (migration 012) is restored so a
+    // crashed coding run does not resume against the demo default.
+    const toolsetSpec = options.tools ?? storedRow.toolset;
+    const limits: Required<RunLimits> = defaultLimitsFor(toolsetSpec, options.limits);
+    let limitViolation: LimitViolation | undefined;
+    const exploreDeps: ExploreToolDeps | undefined =
+      toolsetSpec === "coding"
+        ? {
+            model,
+            streamFn: options.streamFn,
+            approval: options.approval,
+            retryPolicy: options.retry,
+            parentEvidenceDir: path.join(harnessDataDir(process.cwd()), "evidence", runId),
+            charge: (usage) => composed.limitEnforcer.charge(usage),
+            audit: (event) => auditBridge.record(event),
+            summaryChat: options.context?.summaryChat,
+          }
+        : undefined;
+    // Memory tool surface for the resumed segment (§8) — same default as run(),
+    // same authoritative dir convention (dirname(database)/memory), and resume
+    // is a startup too: reconcile before anything resolves tools. Tools are
+    // created BEFORE loadCrashedRun/composeRuntime so an interrupted memory_read
+    // re-resolves and executes through the SAME wrapper chain.
+    const memoryDir =
+      typeof options.database === "string"
+        ? path.join(path.dirname(options.database), "memory")
+        : path.join(path.dirname(defaultDbPath()), "memory");
+    const memoryStore = new MemoryStore(memoryDir);
+    const memoryIndex = new MemorySearchIndex(database);
+    memoryIndex.reconcile(memoryStore);
+    const memoryTools =
+      (options.memory?.tools ?? toolsetSpec === "coding")
+        ? createMemoryTools({ store: memoryStore, index: memoryIndex, runId })
+        : [];
+    const resolvedTools = resolveTools(toolsetSpec, exploreDeps);
+    const crashed = loadCrashedRun(database, runId, [...resolvedTools, ...memoryTools]);
 
     const record: RunRecord = { ...crashed.record, status: "running", finishedAt: undefined, error: undefined };
     this.runs.set(record.id, record);
@@ -521,18 +549,10 @@ export class RunManager {
       startSeq: crashed.lastSeq,
       onSinkBoundary: faultController ? (event) => faultController.onSinkBoundary(event) : undefined,
     });
+    auditBridge.record = (event) => recorder.record(event);
 
-    const model = options.model ?? resolveModel(crashed.record.modelSpec);
-    const startedMs = Date.now();
-
-    const limits: Required<RunLimits> = defaultLimitsFor(options.tools, options.limits);
-    let limitViolation: LimitViolation | undefined;
-    // 阶段 13 (P1-3): the resumed run shares run()'s runtime composition —
-    // wrapped tools (fault/evidence/timeout/retry) and the composed
-    // limits→permission gate. Recovered re-executions are gated below; the
-    // agent's own continuation goes through beforeToolCall.
     const composed = composeRuntime({
-      tools: resolvedTools,
+      tools: [...resolvedTools, ...memoryTools],
       faultSpec: undefined,
       evidenceDir: path.join(harnessDataDir(process.cwd()), "evidence", record.id),
       limits,
@@ -543,6 +563,7 @@ export class RunManager {
         limitViolation = violation;
       },
     });
+    const tools = composed.tools;
 
     // Resolve every unresolved tool call, auditing each decision into the trace.
     const synthetic: AgentMessage[] = [];
@@ -589,7 +610,7 @@ export class RunManager {
       const gateDecision = await composed.beforeToolCall({
         toolCall: { id: call.toolCallId, name: call.toolName },
         args: call.args,
-      } as unknown as Parameters<typeof composed.beforeToolCall>[0]);
+      });
       recorder.onEvent({
         type: "tool_execution_start",
         toolCallId: call.toolCallId,
@@ -608,7 +629,7 @@ export class RunManager {
         synthetic.push(toolResultMessage(call.toolCallId, call.toolName, [{ type: "text", text: reason }], true));
         continue;
       }
-      const wrapped = composed.tools.find((t) => t.name === call.toolName) ?? call.tool;
+      const wrapped = tools.find((t) => t.name === call.toolName) ?? call.tool;
       try {
         const result = await wrapped.execute(call.toolCallId, call.args, undefined, undefined);
         recorder.onEvent({
@@ -643,17 +664,22 @@ export class RunManager {
     const agent = createAgent({
       model,
       systemPrompt: resumeSystemPrompt,
-      tools: composed.tools,
+      tools,
       streamFn: options.streamFn,
       sessionId: record.id,
       messages: transcript,
       beforeToolCall: composed.beforeToolCall,
+      // 加固期 (P0): the recovered transcript is the persisted prefix —
+      // historyCount marks the boundary so the current segment's messages are
+      // never touched by the tool reducer or the summary watermark.
       transformContext: createContextTransformer({
-        contextWindow: model.contextWindow,
+        ...options.context,
         model,
-        settings: options.compaction?.settings,
-        summaryFn: options.compaction?.summaryFn,
+        models: options.context?.models,
+        summaryChat: options.context?.summaryChat,
+        historyCount: transcript.length,
         onEvent: (event) => recorder.record(event),
+        evidenceBase: path.join(".harness", "evidence", record.id),
       }),
     });
     const checkpointWriter = new CheckpointWriter(new CheckpointRepo(database), record.id, () => recorder.lastSeq, {
@@ -742,7 +768,7 @@ export class RunManager {
       }
     }
 
-    return { record, messages, usage: sumUsage(messages), tracePath: traceFile };
+    return { record, messages, usage: sumAgentUsage(messages), tracePath: traceFile };
   }
 
   close(): void {

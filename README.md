@@ -10,7 +10,7 @@ English | [简体中文](README.zh-CN.md)
 git clone https://github.com/ligo-lili/Evolyn
 cd Evolyn\agent-harness
 npm install
-npm test          # 148 tests — every one runs without an API key
+npm test          # 219 tests — every one runs without an API key
 npm run harness -- run "<task>" --model deepseek/deepseek-flash --tools coding --yolo
 ```
 
@@ -22,7 +22,8 @@ environment. Tool calls default to **interactive approval**; `--yolo` opts out.
 
 - **Durable execution** — every run is checkpointed at message boundaries; a
   killed process resumes on the **same run id** with the trace sequence
-  continuing. Pending tool calls are resolved by rule: rebuild from the logged
+  continuing, and the run's toolset is restored from the persisted run row
+  (a crashed `--tools coding` run does not resume against the demo default). Pending tool calls are resolved by rule: rebuild from the logged
   result, gated re-execute (idempotent tools), or a synthesized
   "result unknown" error fed back to the model — never a hallucinated success.
   A "zombie" run whose trace already finished is self-healed (status
@@ -46,12 +47,49 @@ environment. Tool calls default to **interactive approval**; `--yolo` opts out.
   per-tool timeouts (which are never retried — the first execution may still
   be running); violations degrade the run to `failed` with the reason
   attached.
-- **Context that scales** — rolling compaction and tool-result tidying change
-  only what the model sees (via `transformContext`); the transcript and trace
-  stay append-only, so recovery and replay need no special cases.
-- **Experience memory** — finished runs are distilled into Markdown memories
-  (human-readable, hand-editable); FTS + local vector embeddings give hybrid
-  recall; similar memories are merged on confirmation, not duplicated.
+- **Context that scales** — context management rebuilt around a block model
+  (system / conversation / tool-round / malformed blocks — tool-call ids must
+  pair exactly via a Counter or the whole round degrades to a conservatively
+  kept malformed block), six budget lines (input budget → 64k working
+  preference → 0.80 soft trigger → forced ceiling → 0.45 deep target → an
+  independent tool-result ledger), calibrated token estimation (chars/4 ×
+  model-family coefficient, `scripts/calibrate_tokens.mjs` recalibrates against
+  real traces), and a prompt-cache-first decision loop: every model call
+  produces a `prefix_decision` — reuse / defer (over the soft line but the
+  cached prefix is reusable: keep appending!) / compact / rebuild (prefix
+  broken: deep-compact to the target). Layer 1 trims old tool results
+  deterministically (head+tail with an evidence pointer, oldest-first whole-
+  round removal, semantic JSON trimming for registered tools); layer 2 folds
+  the prefix into a strict-JSON rolling summary (hard caps, a must-be-smaller
+  gate, one retry with the failure reason, big-fold relaxation). All of it is
+  model-view only: the transcript and trace stay append-only, and every
+  decision lands in the trace as a `context_decision` event.
+- **Read-only subagents (context isolation)** — the `explore` tool (coding
+  toolset) spawns a full child agent with its own context window, a restricted
+  readonly toolset (read/grep/ls/find — no shell, no recursion) and its own
+  tighter limits + context management. The child's final answer arrives as the
+  tool result; its intermediate reads never enter the parent's conversation.
+  The child is a pure function of (task, workspace): the parent call is
+  `replay: "safe"`, so a crash mid-subagent re-executes the whole child on
+  resume through the ordinary recovery path — no nested checkpointing. The
+  child's usage lands on the parent's cost/token fuses, its audit events
+  (`subagent_start/end`) land in the trace, and its full transcript lands in
+  the evidence directory.
+- **Experience memory** (per `memory-design.md`) — dual-layer: structured
+  **Core Memory** (key upserts only, every entry carries `reason` +
+  `source_statement` evidence, 2000-token injection budget) and **ordinary
+  memories** (one Markdown file each, `M001…` ids, optimistic-lock
+  `revision`, active/archive with a hard 25-active cap, atomic writes,
+  `INDEX.md` projection). Writes go through **three gates**: a deterministic
+  reflection gate → a strict-JSON `{action: none|create|update}` reflector →
+  an authorized write (updates allowed only for ids the run actually READ —
+  mechanism, not prompt). Retrieval is chunk-level FTS (trigram-probed) +
+  local `e5` vectors fused by memory-level RRF with an explicit degrade chain
+  (`mode` + `degrade_reason` on every result); startup reconciles from the
+  Markdown authority, embeddings backfill in the background with bounded
+  backoff. The model gets `memory_read / memory_search / memory_create /
+  memory_update / memory_archive / core_memory_update` (coding toolset by
+  default).
 - **Skill self-evolution** — recurring patterns are mined from traces
   (support ≥ 3 hard gate), distilled into pi-compatible `SKILL.md` files,
   verified with Pi's own loader, and injected as `<available_skills>` into
@@ -97,16 +135,31 @@ keys.
 
 - **`context/`** — what the model sees. `assembler` builds the system prompt
   deterministically (base → core memory → skills → experience → workspace
-  tree; byte-stable for prompt caching). `compaction` reuses Pi's token math
-  but re-implements splicing on the message array, hooked at
-  `transformContext` — cuts never split an assistant/toolResult pair, and old
-  tool results are tidied into pointers to on-disk evidence files.
+  tree; byte-stable for prompt caching). The rest is a two-layer context
+  manager hooked at `transformContext`: `blocks` partitions the transcript
+  into the four block types (the minimum unit of every compression decision —
+  never a half tool-round); `tokens` estimates with a calibrated model-family
+  coefficient and blends the last measured usage; `budget` derives the six
+  lines; `reducers/tool` is the deterministic layer-1 (truncate head+tail with
+  an evidence pointer, remove whole rounds oldest-first, semantic JSON
+  trimming, resume-boundary aware); `summarizer` + `reducers/conversation`
+  are the model-driven layer-2 (strict JSON rolling summary with hard
+  validation, a covered-message watermark, and id/tool-call-precise prefix
+  replacement); `compaction` is the orchestrator producing a `prefix_decision`
+  (reuse/defer/compact/rebuild) for every request — the raw history is never
+  modified, only projected. `compose.ts` is the shared tool-wrapper chain and
+  the gate composition, reused verbatim by the explore subagent as
+  "run-lite" (restricted toolset, own limits, own enforcer).
 
-- **`memory/`** — experience that survives runs. One memory = one Markdown
-  file (YAML frontmatter) as the authority; SQLite FTS5 and local `e5`
-  embeddings (transformers.js, RRF fusion) are rebuildable projections. The
-  distiller extracts structured experience via a tolerant JSON pipeline and
-  merges into similar existing memories on confirmation.
+- **`memory/`** — experience that survives runs, per `memory-design.md`.
+  `model` (M### record + 900/180/16 chunking with `title | summary` semantic
+  headers and per-chunk sha256), `store` (Markdown authority: CORE.md /
+  INDEX.md / active / archive, atomic writes, mutation guard, capacity),
+  `core` (evidence-backed key upserts, token-budgeted injection), `search`
+  (chunk index + FTS5 tokenizer probe + RRF-by-memory fusion, degrade chain,
+  reconcile, background embedding backfill with conditional writes),
+  `reflection` (deterministic gate → strict-JSON reflector → authorized
+  write), `tools` (the model's memory surface).
 
 - **`learning/`** — the self-improvement loop. `miner` extracts ordered tool
   sequences and error→repair pairs (hard support ≥ 3 gate; deterministic

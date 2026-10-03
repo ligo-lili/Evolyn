@@ -22,37 +22,49 @@ export function isToolTimeoutError(error: unknown): error is ToolTimeoutError {
   return error instanceof ToolTimeoutError;
 }
 
+/**
+ * Per-tool override: a tool may declare `timeoutMs` (e.g. the explore
+ * subagent legitimately runs minutes) to opt out of the run-wide default.
+ */
+function effectiveTimeoutMs(tool: AnyAgentTool, timeoutMs: number): number {
+  const override = (tool as { timeoutMs?: number }).timeoutMs;
+  return typeof override === "number" && override > 0 ? override : timeoutMs;
+}
+
 export function withToolTimeout(tools: readonly AnyAgentTool[], timeoutMs: number): AnyAgentTool[] {
-  return tools.map((tool) => ({
-    ...tool,
-    execute: async (toolCallId: string, params: any, signal?: AbortSignal, onUpdate?: any) => {
-      // 加固期复核: addEventListener does NOT fire for an already-aborted
-      // signal — a tool started after the run aborted must not start at all.
-      if (signal?.aborted) {
-        return Promise.reject(new Error(`tool ${tool.name} aborted before start`));
-      }
-      const controller = new AbortController();
-      const onOuterAbort = () => controller.abort();
-      signal?.addEventListener("abort", onOuterAbort);
-      let timedOut = false;
-      const timer = setTimeout(() => {
-        timedOut = true;
-        controller.abort();
-      }, timeoutMs);
-      try {
-        return await Promise.race([
-          tool.execute(toolCallId, params, controller.signal, onUpdate),
-          new Promise<never>((_, reject) => {
-            controller.signal.addEventListener("abort", () => {
-              if (timedOut) reject(new ToolTimeoutError(tool.name, timeoutMs));
-              else reject(new Error(`tool ${tool.name} aborted`));
-            });
-          }),
-        ]);
-      } finally {
-        clearTimeout(timer);
-        signal?.removeEventListener("abort", onOuterAbort);
-      }
-    },
-  }));
+  return tools.map((tool) => {
+    const ms = effectiveTimeoutMs(tool, timeoutMs);
+    return {
+      ...tool,
+      execute: async (toolCallId: string, params: any, signal?: AbortSignal, onUpdate?: any) => {
+        // 加固期复核: addEventListener does NOT fire for an already-aborted
+        // signal — a tool started after the run aborted must not start at all.
+        if (signal?.aborted) {
+          return Promise.reject(new Error(`tool ${tool.name} aborted before start`));
+        }
+        const controller = new AbortController();
+        const onOuterAbort = () => controller.abort();
+        signal?.addEventListener("abort", onOuterAbort);
+        let timedOut = false;
+        const timer = setTimeout(() => {
+          timedOut = true;
+          controller.abort();
+        }, ms);
+        try {
+          return await Promise.race([
+            tool.execute(toolCallId, params, controller.signal, onUpdate),
+            new Promise<never>((_, reject) => {
+              controller.signal.addEventListener("abort", () => {
+                if (timedOut) reject(new ToolTimeoutError(tool.name, ms));
+                else reject(new Error(`tool ${tool.name} aborted`));
+              });
+            }),
+          ]);
+        } finally {
+          clearTimeout(timer);
+          signal?.removeEventListener("abort", onOuterAbort);
+        }
+      },
+    };
+  });
 }

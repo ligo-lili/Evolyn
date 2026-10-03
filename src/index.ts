@@ -52,23 +52,74 @@ export {
   type PromptSections,
   type SkillEntry,
 } from "./context/assembler.js";
-export { createContextTransformer, findCutIndex, type CompactionOptions } from "./context/compaction.js";
+export { partitionMessages, blockStats, type Block } from "./context/blocks.js";
+export {
+  computeContextBudget,
+  DEFAULT_BUDGET_OPTIONS,
+  type BudgetOptions,
+  type ContextBudget,
+} from "./context/budget.js";
+export {
+  tokenCoefficient,
+  tokenCoefficientFor,
+  TOKEN_COEFFICIENTS,
+  DEFAULT_TOKEN_COEFFICIENT,
+  estimateContextTokens,
+  estimateMessagesTokens,
+  estimateMessageTokens,
+  type ContextUsageEstimate,
+} from "./context/tokens.js";
+export {
+  reduceToolResults,
+  compactionMarker,
+  jsonArraySemanticTrim,
+  type SemanticTrimmer,
+  type ToolReducerOptions,
+  type ToolReduction,
+} from "./context/reducers/tool.js";
+export {
+  summaryCutoffBlockIndex,
+  countUnsummarizedConversationBlocks,
+  coveredBoundaryIndex,
+  replaceCoveredPrefix,
+  advanceWatermark,
+  buildSummaryCandidate,
+  type SummaryWatermark,
+} from "./context/reducers/conversation.js";
+export {
+  generateRollingSummary,
+  renderSummaryText,
+  validateSummary,
+  summaryCaps,
+  serializeMaterial,
+  SummaryGenerationError,
+  SUMMARY_SYSTEM_PROMPT,
+  BIG_FOLD_SPAN_TOKENS,
+  type RollingConversationSummary,
+  type SummaryCaps,
+} from "./context/summarizer.js";
+export { createContextTransformer, type ContextManagementOptions } from "./context/compaction.js";
+export { type ContextDecision, type PrefixDecisionKind } from "./context/decision.js";
 export {
   buildRunDigest,
-  distillExperience,
-  distillRunById,
-  fallbackDraft,
-  parseExperienceDraft,
-  parseExperienceDraftStrict,
-  MEMORY_DRAFT_SCHEMA,
-  type DistillOptions,
-  type DistillOutcome,
-  type ExperienceDraft,
+  shouldReflect,
+  parseReflectionDecision,
+  reflectRunById,
+  REFLECTION_SCHEMA,
+  REFLECTION_SYSTEM_PROMPT,
+  type GateDecision,
+  type ReflectOptions,
+  type ReflectOutcome,
+  type ReflectionAction,
+  type ReflectionCandidate,
+  type ReflectionDecision,
   type RunDigest,
-} from "./memory/distiller.js";
-export { MemoryStore } from "./memory/store.js";
-export { MemorySearchIndex, passageText } from "./memory/search.js";
-export { parseMemory, serializeMemory, type MemoryRecord } from "./memory/model.js";
+} from "./memory/reflection.js";
+export { createMemoryTools, type MemoryToolDeps } from "./memory/tools.js";
+export { MAX_ACTIVE_MEMORIES, MemoryConflictError, MemoryStore } from "./memory/store.js";
+export { MemorySearchIndex, MIN_VECTOR_SIMILARITY, RRF_K, type MemoryHit, type SearchMode } from "./memory/search.js";
+export { chunkMemory, parseMemory, serializeMemory, type MemoryRecord, type MemoryStatus } from "./memory/model.js";
+export { parseCore, renderCore, upsertCoreEntry, type CoreEntry, type CoreFile } from "./memory/core.js";
 export {
   completeStructured,
   defaultChat,
@@ -99,6 +150,12 @@ export {
   type UnresolvedToolCall,
 } from "./execution/recovery.js";
 export { DEMO_TOOLS, type AnyAgentTool } from "./runtime/tools/index.js";
+export {
+  createExploreTool,
+  EXPLORE_CHILD_TOOLS,
+  type ExploreToolDeps,
+  type ExploreDetails,
+} from "./runtime/tools/explore.js";
 export { harnessDataDir, resolveWorkspacePath, tracesDir } from "./runtime/paths.js";
 export { TRACE_SCHEMA_VERSION, type RunLifecycleEvent, type TraceEnvelope, type TraceEvent } from "./trace/schema.js";
 export { TraceRecorder, JsonlTraceSink, type TraceSink } from "./trace/recorder.js";

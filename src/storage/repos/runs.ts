@@ -13,6 +13,7 @@ function rowToRun(r: Row): RunRecord {
     finishedAt: r.finished_at == null ? undefined : String(r.finished_at),
     error: r.error == null ? undefined : String(r.error),
     systemPrompt: r.system_prompt == null ? undefined : String(r.system_prompt),
+    toolset: r.toolset == null ? undefined : (String(r.toolset) as "demo" | "coding"),
   };
 }
 
@@ -23,7 +24,7 @@ export class RunRepo {
   insert(record: RunRecord): void {
     this.db
       .prepare(
-        "INSERT INTO runs (id, task, model_spec, status, started_at, system_prompt, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO runs (id, task, model_spec, status, started_at, system_prompt, toolset, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
         record.id,
@@ -32,6 +33,7 @@ export class RunRepo {
         record.status,
         record.startedAt,
         record.systemPrompt ?? null,
+        record.toolset ?? null,
         new Date().toISOString(),
       );
   }

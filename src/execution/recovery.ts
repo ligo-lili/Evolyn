@@ -22,7 +22,12 @@ export interface UnresolvedToolCall {
 
 export interface CrashedRun {
   record: RunRecord;
-  /** Transcript rebuilt from recorded message_end events (system message included). */
+  /**
+   * Transcript rebuilt from recorded message_end events. pi never emits an
+   * event for the synthesized system message (it is created in the Agent
+   * constructor), so the rebuild starts at the user message — the system
+   * prompt is restored from the runs row (migration 002) by the resume path.
+   */
   messages: AgentMessage[];
   unresolved: UnresolvedToolCall[];
   /** seq of the last recorded trace event — resume continues numbering from here. */

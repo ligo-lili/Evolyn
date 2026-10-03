@@ -116,6 +116,9 @@ export class ReplayMachine {
       case "permission":
       case "recovery_action":
       case "compaction":
+      case "context_decision":
+      case "subagent_start":
+      case "subagent_end":
         s.audits.push(event);
         break;
       default:

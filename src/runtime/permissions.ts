@@ -61,6 +61,17 @@ export const TOOL_PERMISSIONS: Readonly<Record<string, ToolPermissions>> = {
   write: { capabilities: ["fs:write"], risk: "mutating" },
   bash: { capabilities: ["fs:read", "fs:write", "process:exec", "net:outbound"], risk: "destructive" },
   powershell: { capabilities: ["fs:read", "fs:write", "process:exec", "net:outbound"], risk: "destructive" },
+  // read-only subagent (Phase 1): the child runs inside the tool call and can
+  // only touch fs:read tools itself, so the parent call is readonly too.
+  explore: { capabilities: ["fs:read"], risk: "readonly" },
+  // memory tool surface (memory-design.md §8): reads/searches are readonly;
+  // every mutation touches .harness/memory/*.md → fs:write mutating.
+  memory_read: { capabilities: ["fs:read"], risk: "readonly" },
+  memory_search: { capabilities: ["fs:read"], risk: "readonly" },
+  memory_create: { capabilities: ["fs:write"], risk: "mutating" },
+  memory_update: { capabilities: ["fs:write"], risk: "mutating" },
+  memory_archive: { capabilities: ["fs:write"], risk: "mutating" },
+  core_memory_update: { capabilities: ["fs:write"], risk: "mutating" },
 };
 
 const UNKNOWN_TOOL_PERMISSIONS: ToolPermissions = { capabilities: [...ALL_CAPABILITIES], risk: "destructive" };

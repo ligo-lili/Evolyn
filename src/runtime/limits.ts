@@ -1,4 +1,5 @@
 import type { AgentEvent, BeforeToolCallResult } from "@earendil-works/pi-agent-core";
+import type { Usage } from "@earendil-works/pi-ai";
 import type { HarnessAuditEvent } from "../trace/schema.js";
 
 /**
@@ -60,12 +61,22 @@ export class LimitEnforcer {
   onAgentEvent(event: AgentEvent): void {
     if (event.type === "message_end" && event.message.role === "assistant") {
       this.turns++;
-      this.costUsd += event.message.usage.cost.total;
-      this.totalTokens += event.message.usage.totalTokens;
+      this.charge(event.message.usage);
       this.consecutiveErrors = 0; // a fresh assistant turn resets the strike counter
     } else if (event.type === "tool_execution_end") {
       this.consecutiveErrors = event.isError ? this.consecutiveErrors + 1 : 0;
     }
+  }
+
+  /**
+   * Subagent (and other internal LLM work) usage lands on the SAME money
+   * fuses (cost / total tokens) as the parent's own turns — an unaccounted
+   * subagent would bypass the runaway backstop — but never touches the turn
+   * budget or the consecutive-error strike counter.
+   */
+  charge(usage: Usage): void {
+    this.costUsd += usage.cost.total;
+    this.totalTokens += usage.totalTokens;
   }
 
   beforeToolCall(toolName: string, args: unknown): BeforeToolCallResult | undefined {

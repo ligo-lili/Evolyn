@@ -144,6 +144,84 @@ const workspace = path.dirname(path.resolve(dbPath));
 fs.mkdirSync(workspace, { recursive: true });
 process.chdir(workspace);
 
+// Episode selection: "plan" (default) = the multi-step demo plan; "explore" =
+// the Phase-1 read-only subagent — the parent delegates to `explore`, the
+// child reads note.txt and answers. Used by the E2E test that kills the
+// process MID-SUBAGENT and asserts the whole child re-runs on resume.
+const EPISODE = process.env.CHAOS_EPISODE ?? "plan";
+if (EPISODE === "explore") {
+  fs.writeFileSync(path.join(workspace, "note.txt"), "hello explore", "utf8");
+}
+
+function exploreStreamFn() {
+  const STEP_DELAY_MS = Number(process.env.CHAOS_STEP_DELAY ?? 30);
+  return async (_model, context) => {
+    await new Promise((resolve) => setTimeout(resolve, STEP_DELAY_MS));
+    const messages = context?.messages ?? [];
+    const isChild = String(messages[0]?.content ?? "").includes("read-only code explorer");
+    const signatures = new Set(
+      messages
+        .filter((m) => m.role === "assistant")
+        .flatMap((m) =>
+          m.content.filter((b) => b.type === "toolCall").map((b) => b.name + JSON.stringify(b.arguments)),
+        ),
+    );
+    let message;
+    if (isChild) {
+      message = signatures.has("read" + JSON.stringify({ path: "note.txt" }))
+        ? assistantMessage([{ type: "text", text: "explored: hello explore" }], "stop")
+        : assistantMessage(
+            [{ type: "toolCall", id: "child-read", name: "read", arguments: { path: "note.txt" } }],
+            "toolUse",
+          );
+    } else {
+      const explored = [...signatures].some((s) => s.startsWith("explore{"));
+      message = explored
+        ? assistantMessage([{ type: "text", text: "parent done" }], "stop")
+        : assistantMessage(
+            [
+              {
+                type: "toolCall",
+                id: "parent-explore",
+                name: "explore",
+                arguments: { task: "read note.txt and report its content" },
+              },
+            ],
+            "toolUse",
+          );
+    }
+    const stream = new AssistantMessageEventStream();
+    stream.push({ type: "start", partial: message });
+    message.content.forEach((block, contentIndex) => {
+      if (block.type === "text") {
+        stream.push({ type: "text_start", contentIndex, partial: message });
+        stream.push({ type: "text_end", contentIndex, partial: message });
+      } else if (block.type === "toolCall") {
+        stream.push({ type: "toolcall_start", contentIndex, partial: message });
+        stream.push({ type: "toolcall_end", contentIndex, toolCall: block, partial: message });
+      }
+    });
+    stream.push({ type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message });
+    return stream;
+  };
+}
+
+const streamFn = EPISODE === "explore" ? exploreStreamFn() : scriptedStreamFn();
+// The explore child shares the same scripted stream as the parent — without
+// this the child would hit the real provider registry (no key, no network).
+const tools =
+  EPISODE === "explore"
+    ? [
+        harness.createExploreTool({
+          model: MODEL,
+          streamFn,
+          parentEvidenceDir: path.join(workspace, ".harness", "evidence", "explore-e2e"),
+          charge: () => {},
+          audit: () => {},
+        }),
+      ]
+    : harness.DEMO_TOOLS;
+
 const manager = new harness.RunManager();
 const reporter = { onEvent: () => {} };
 // The fuzzer kills only AFTER setup is done — otherwise most random kills land
@@ -154,9 +232,9 @@ try {
     const result = await manager.run({
       task: "chaos: write out.txt, send one notification, verify by reading it back",
       model: MODEL,
-      streamFn: scriptedStreamFn(),
+      streamFn,
       database: path.resolve(dbPath),
-      tools: harness.DEMO_TOOLS,
+      tools,
       fault: fault || undefined,
       reporter,
     });
@@ -166,8 +244,8 @@ try {
     const result = await manager.resume(runId, {
       database: path.resolve(dbPath),
       model: MODEL,
-      streamFn: scriptedStreamFn(),
-      tools: harness.DEMO_TOOLS,
+      streamFn,
+      tools,
       fault: fault || undefined,
       reporter,
     });

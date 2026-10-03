@@ -13,7 +13,8 @@ import type { AnyAgentTool } from "./index.js";
  * executions are captured too — the tidy pointer must never dangle.
  */
 
-function safeEvidenceName(toolCallId: string): string {
+/** Flat safe filename token for a model-controlled toolCallId (no traversal). */
+export function safeEvidenceName(toolCallId: string): string {
   const cleaned = toolCallId
     .replace(/[^A-Za-z0-9_-]/g, "_")
     .replace(/^_+/, "")

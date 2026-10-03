@@ -18,8 +18,8 @@ import { type ApprovalMode } from "../runtime/approval.js";
 import { ALL_CAPABILITIES, type Capability } from "../runtime/permissions.js";
 import type { ToolsetSpec } from "../runtime/run-manager.js";
 import type { TraceEvent } from "../trace/schema.js";
-import { distillRunById } from "../memory/distiller.js";
-import { MemoryStore } from "../memory/store.js";
+import { reflectRunById } from "../memory/reflection.js";
+import { MAX_ACTIVE_MEMORIES, MemoryStore } from "../memory/store.js";
 import { MemorySearchIndex } from "../memory/search.js";
 import { localEmbedder } from "../memory/embedding.js";
 import { minePatternsFromDb } from "../learning/miner.js";
@@ -54,11 +54,12 @@ Usage:
                     [--capabilities fs:read,fs:write,...] [--fault point:tool]
   agent-harness resume [runId]           recover an interrupted run (default: latest)
                     [--yolo] — approval gates apply to recovered tool executions too
-  agent-harness memory core              show/create the always-resident Core Memory file
-  agent-harness memory list              list Ordinary Memory files (authoritative markdown)
-  agent-harness memory search <query> [--limit <n>] [--hybrid]   FTS5, or FTS+embeddings fused (RRF)
-  agent-harness memory rebuild [--vector]      rebuild indexes from the .md files (--vector embeds)
-  agent-harness memory distill <runId>   distill a run manually
+  agent-harness memory core              show/create the always-resident Core Memory (key entries + evidence)
+  agent-harness memory list [--all]      list active (or all incl. archived) memories (authoritative markdown)
+  agent-harness memory search <query> [--limit <n>]   hybrid FTS5+vector with the documented degrade chain
+  agent-harness memory rebuild [--vector]      reconcile/rebuild indexes from the .md files (--vector embeds)
+  agent-harness memory status            index diagnostics: tokenizer, schema, backfill state, capacity
+  agent-harness memory distill <runId> [--force]   reflect a run into memory (gate skipped with --force)
   agent-harness skill mine [--min-support <n>]
                                            mine tool-sequence / error-repair patterns from finished runs
   agent-harness skill patterns             list mined patterns
@@ -195,56 +196,63 @@ async function main(): Promise<number> {
     const dbPath = defaultDbPath();
     const store = new MemoryStore(path.join(path.dirname(dbPath), "memory"));
     if (sub === "core") {
-      const existing = store.readCore();
-      if (existing !== undefined && flags.edit !== true) {
-        console.log(existing);
+      const existing = store.readCoreFile();
+      if (existing === undefined) {
+        store.ensureCore();
+        console.log(`created ${store.corePath} — entries upsert via core_memory_update; edit the file freely.`);
       } else {
-        if (existing === undefined) {
-          store.writeCore("# Core Memory\n\n<项目级事实、用户偏好、长期约束。每轮 run 都会注入 system prompt。>\n");
-          console.log(`created ${store.corePath} — edit it freely; it is injected into every run.`);
-        } else {
-          console.log(`core memory file: ${store.corePath}`);
+        console.log(`core memory file: ${store.corePath}`);
+        console.log(`entries (${existing.entries.length}):`);
+        for (const e of existing.entries) {
+          console.log(`  - ${e.key}: ${e.content}`);
+          console.log(`      reason: ${e.reason}`);
+          console.log(`      source: ${e.sourceStatement}`);
         }
+        const injected = store.readCore();
+        if (injected) console.log(`\n--- injected into every run (within the 2000-token budget) ---\n${injected}`);
       }
       return 0;
     }
     if (sub === "list") {
-      const records = store.list();
+      const status = flags.all === true ? undefined : "active";
+      const records = status ? store.list(status) : [...store.list("active"), ...store.list("archive")];
       if (records.length === 0) {
-        console.log("(no memory yet — runs are distilled automatically unless --no-distill)");
+        console.log("(no memory yet — runs are reflected automatically unless --no-distill)");
         return 0;
       }
       for (const m of records) {
-        console.log(`[${m.taskType}] ${m.outcome} ×${m.confirmations} — ${m.summaryZh}`);
-        console.log(`    ${path.relative(process.cwd(), store.pathOf(m.id))}`);
+        console.log(`${m.id} [${m.status}] rev ${m.revision} reads=${m.accessCount} — ${m.title}`);
+        console.log(`    ${m.summary}`);
+        console.log(`    ${path.relative(process.cwd(), store.pathOf(m.id, m.status))}`);
       }
       return 0;
     }
     if (sub === "search") {
       const query = positional.slice(1).join(" ").trim();
       if (!query) {
-        console.error("usage: agent-harness memory search <query> [--limit <n>] [--hybrid]");
+        console.error("usage: agent-harness memory search <query> [--limit <n>]");
         return 2;
       }
       const db = openDatabase(dbPath);
       try {
         const index = new MemorySearchIndex(db);
-        const limit = typeof flags.limit === "string" ? Number(flags.limit) : 3;
-        const capped = Number.isFinite(limit) && limit > 0 ? limit : 3;
-        const hits =
-          flags.hybrid === true
-            ? await index.searchHybrid(query, capped, localEmbedder())
-            : index.searchFts(query, capped);
+        const limit = typeof flags.limit === "string" ? Number(flags.limit) : 5;
+        const capped = Number.isFinite(limit) && limit > 0 ? limit : 5;
+        // HYBRID with the documented degrade chain — mode/degrade_reason are
+        // part of the result, not a CLI flag (memory-design.md §7.5).
+        const hits = await index.search(store, query, { limit: capped, embedder: localEmbedder() });
         if (hits.length === 0) {
           console.log("(no matching memory — try `memory rebuild` if you edited the .md files)");
           return 0;
         }
-        if (flags.hybrid === true) console.log("(hybrid: FTS5 + local embeddings, fused with RRF)");
+        console.log(`(mode: ${hits[0]?.mode}${hits[0]?.degradeReason ? ` — ${hits[0].degradeReason}` : ""})`);
         hits.forEach((h, i) => {
-          console.log(`#${i + 1} [${h.taskType}] ${h.outcome} ×${h.confirmations} — ${h.summaryZh}`);
-          console.log(`    approach: ${h.approach}`);
-          console.log(`    pitfalls: ${h.pitfalls}`);
-          console.log(`    file: ${path.relative(process.cwd(), store.pathOf(h.id))} (run ${h.runId})`);
+          console.log(`#${i + 1} ${h.record.id} (rev ${h.record.revision}) ${h.record.title}`);
+          console.log(`    ${h.record.summary}`);
+          console.log(`    ${h.snippet.replace(/\n/g, " ").slice(0, 200)}`);
+          console.log(
+            `    file: ${path.relative(process.cwd(), store.pathOf(h.record.id, h.record.status))} (run ${h.record.sourceRunId ?? "?"})`,
+          );
         });
       } finally {
         db.close();
@@ -256,9 +264,14 @@ async function main(): Promise<number> {
       try {
         const index = new MemorySearchIndex(db);
         const n = index.rebuild(store);
+        store.rebuildIndex();
         let vectors = 0;
         if (flags.vector === true) {
-          vectors = await index.rebuildVectors(store, localEmbedder());
+          // Synchronous embed on the CLI path; startup uses the background backfill.
+          const embedder = localEmbedder();
+          const live = store.list("active");
+          for (const record of live) await index.embedRecord(record, embedder, "multilingual-e5-small");
+          vectors = index.vectorCount();
         }
         console.log(
           `index rebuilt from ${n} memory file(s)${flags.vector === true ? `, ${vectors} vector(s) embedded` : ""}`,
@@ -268,23 +281,42 @@ async function main(): Promise<number> {
       }
       return 0;
     }
+    if (sub === "status") {
+      const db = openDatabase(dbPath);
+      try {
+        const index = new MemorySearchIndex(db);
+        const diag = index.diagnostics("multilingual-e5-small");
+        console.log(`memory dir: ${store.dir}`);
+        console.log(
+          `active: ${store.activeCount()} (cap ${MAX_ACTIVE_MEMORIES}) | archive: ${store.list("archive").length}`,
+        );
+        for (const [key, value] of Object.entries(diag)) {
+          if (value !== "") console.log(`${key}: ${value}`);
+        }
+      } finally {
+        db.close();
+      }
+      return 0;
+    }
     if (sub === "distill") {
       const id = positional[1];
       if (!id) {
-        console.error("usage: agent-harness memory distill <runId>");
+        console.error("usage: agent-harness memory distill <runId> [--force]");
         return 2;
       }
-      const outcome = await distillRunById(id);
-      console.log(
-        outcome.merged
-          ? `memory: confirmed existing ${outcome.record.id} (×${outcome.record.confirmations})`
-          : `memory: created ${outcome.record.id} (${outcome.record.taskType}, ${outcome.record.outcome})`,
-      );
-      console.log(`    ${outcome.file}`);
+      const outcome = await reflectRunById(id, { force: flags.force === true });
+      if (outcome.action === "created" || outcome.action === "updated") {
+        console.log(
+          `memory: ${outcome.action} ${outcome.record.id} (rev ${outcome.record.revision}) — ${outcome.reason}`,
+        );
+        console.log(`    ${outcome.file}`);
+      } else {
+        console.log(`memory: ${outcome.action} — ${outcome.reason}`);
+      }
       return 0;
     }
     console.error(
-      "usage: agent-harness memory core | memory list | memory search <query> | memory rebuild | memory distill <runId>",
+      "usage: agent-harness memory core | memory list [--all] | memory search <query> | memory rebuild [--vector] | memory status | memory distill <runId> [--force]",
     );
     return 2;
   }
@@ -820,7 +852,8 @@ async function main(): Promise<number> {
     const result = await manager.resume(targetId, {
       reporter: new ConsoleReporter(),
       // 阶段 13: recovered tool executions go through the same approval gate AND
-      // the same toolset — resume with --tools coding when the crashed run used it.
+      // the same toolset — the toolset persisted on the run row (migration 012)
+      // is restored automatically; --tools overrides it.
       tools: toolsFlag as ToolsetSpec | undefined,
       approval: {
         mode:
@@ -843,14 +876,16 @@ async function main(): Promise<number> {
     if (record.error) console.error(`error: ${record.error}`);
     if (flags["no-distill"] !== true) {
       try {
-        const outcome = await distillRunById(record.id);
-        console.log(
-          outcome.merged
-            ? `memory: confirmed existing ${outcome.record.id} (×${outcome.record.confirmations})`
-            : `memory: created (${outcome.record.taskType}, ${outcome.record.outcome}) — ${outcome.record.summaryZh}`,
-        );
+        const outcome = await reflectRunById(record.id);
+        if (outcome.action === "created" || outcome.action === "updated") {
+          console.log(
+            `memory: ${outcome.action} ${outcome.record.id} (rev ${outcome.record.revision}) — ${outcome.reason}`,
+          );
+        } else {
+          console.log(`memory: ${outcome.action} — ${outcome.reason}`);
+        }
       } catch (err) {
-        console.error(`memory: distill failed (${err instanceof Error ? err.message : err})`);
+        console.error(`memory: reflection failed (${err instanceof Error ? err.message : err})`);
       }
     }
     manager.close();
@@ -953,14 +988,16 @@ async function main(): Promise<number> {
     console.log("memory: skipped (--no-distill)");
   } else {
     try {
-      const outcome = await distillRunById(record.id);
-      console.log(
-        outcome.merged
-          ? `memory: confirmed existing ${outcome.record.id} (×${outcome.record.confirmations})`
-          : `memory: created (${outcome.record.taskType}, ${outcome.record.outcome}) — ${outcome.record.summaryZh}`,
-      );
+      const outcome = await reflectRunById(record.id);
+      if (outcome.action === "created" || outcome.action === "updated") {
+        console.log(
+          `memory: ${outcome.action} ${outcome.record.id} (rev ${outcome.record.revision}) — ${outcome.reason}`,
+        );
+      } else {
+        console.log(`memory: ${outcome.action} — ${outcome.reason}`);
+      }
     } catch (err) {
-      console.error(`memory: distill failed (${err instanceof Error ? err.message : err})`);
+      console.error(`memory: reflection failed (${err instanceof Error ? err.message : err})`);
     }
   }
   manager.close();

@@ -1,4 +1,4 @@
-import type { AgentOptions } from "@earendil-works/pi-agent-core";
+import type { BeforeToolCallResult } from "@earendil-works/pi-agent-core";
 import type { HarnessAuditEvent } from "../trace/schema.js";
 import {
   assessRisk,
@@ -9,6 +9,20 @@ import {
 } from "./permissions.js";
 
 export type ApprovalMode = "auto-approve" | "auto-deny" | "interactive";
+
+/**
+ * Narrow view of pi's `BeforeToolCallContext` containing only what harness
+ * gates actually read. Gates are declared against THIS type, not pi's full
+ * context: pi's callback satisfies it (BeforeToolCallContext is structurally
+ * assignable), and the recovery path can call the gate with a hand-built
+ * `{ toolCall, args }` — no structural casts anywhere.
+ */
+export interface GateContext {
+  toolCall: { id: string; name: string };
+  args: unknown;
+}
+
+export type Gate = (context: GateContext) => Promise<BeforeToolCallResult | undefined>;
 
 export interface ApprovalRequest {
   toolName: string;
@@ -67,7 +81,7 @@ export function defaultApproveFn(): ApproveFn {
 export function createPermissionGate(
   options: ApprovalOptions | undefined,
   audit: (event: HarnessAuditEvent) => void,
-): NonNullable<AgentOptions["beforeToolCall"]> {
+): Gate {
   const mode = options?.mode ?? "auto-approve";
   const granted: readonly Capability[] = options?.capabilities ?? ALL_CAPABILITIES;
   const approver = options?.approveFn ?? defaultApproveFn();

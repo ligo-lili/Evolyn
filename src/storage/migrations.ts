@@ -245,6 +245,62 @@ export const MIGRATIONS: Migration[] = [
     name: "baselines-protocol-sha",
     sql: `ALTER TABLE eval_baselines ADD COLUMN protocol_sha256 TEXT;`,
   },
+  {
+    // The toolset is part of a run's identity: resume must rebuild the SAME
+    // toolset, or every unresolved coding-tool call degrades to "not registered
+    // in this session" and the run limps on with mismatched tools. Nullable —
+    // runs seeded with explicit tool arrays cannot be persisted; NULL falls
+    // back to the demo default on resume.
+    id: 12,
+    name: "runs-toolset",
+    sql: `ALTER TABLE runs ADD COLUMN toolset TEXT;`,
+  },
+  {
+    // Memory search v3 (memory-design.md §7): chunk-level index with content
+    // identity (text_sha256) + revision + embedding provenance, a search_meta
+    // registry (schema version + FTS tokenizer; structural mismatch drops and
+    // rebuilds the projections), and memory_access — the audit trail backing
+    // the UPDATE authorization whitelist (only ids the model actually READ
+    // this run may be updated by the reflector). The v1/v2 experiences
+    // projections are superseded and dropped — they were rebuildable by
+    // design, and the .harness/memory Markdown files remain the authority.
+    // memory_fts is created with the default tokenizer; the search layer
+    // probes trigram support at runtime and recreates it when available.
+    id: 13,
+    name: "memory-search-v3",
+    sql: `
+      DROP TABLE IF EXISTS memory_vectors;
+      DROP TABLE IF EXISTS experiences_fts;
+      DROP TABLE IF EXISTS experiences;
+
+      CREATE TABLE memory_chunks (
+        memory_id TEXT NOT NULL,
+        chunk_index INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        text_sha256 TEXT NOT NULL,
+        revision INTEGER NOT NULL,
+        embedding_model TEXT,
+        embedding_dim INTEGER,
+        vec BLOB,
+        PRIMARY KEY (memory_id, chunk_index)
+      );
+      CREATE INDEX idx_chunks_memory ON memory_chunks(memory_id);
+
+      CREATE VIRTUAL TABLE memory_fts USING fts5(memory_id UNINDEXED, chunk_index UNINDEXED, text);
+
+      CREATE TABLE search_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+
+      CREATE TABLE memory_access (
+        run_id TEXT NOT NULL,
+        memory_id TEXT NOT NULL,
+        accessed_at TEXT NOT NULL,
+        PRIMARY KEY (run_id, memory_id)
+      );
+    `,
+  },
 ];
 
 export function migrate(db: DatabaseSync): void {

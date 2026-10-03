@@ -208,4 +208,53 @@ describe("crash recovery (阶段 5/6)", () => {
     expect(manager.listInterrupted(dbPath).map((r) => r.id)).toEqual([runId]);
     manager.close();
   });
+
+  it("resume restores the stored toolset: an unresolved coding call is recovered, not synthesized away", async () => {
+    fs.writeFileSync(path.join(tmp.dir, "note.txt"), "hello from the workspace\n", "utf8");
+    const dbPath = path.join(tmp.dir, "toolset-restore", "harness.db");
+    const seeder = new RunManager();
+    const seed = await seeder.run({
+      task: "read the note",
+      model: FAKE_MODEL,
+      streamFn: scriptedStreamFn([
+        assistantMessage(
+          [{ type: "toolCall", id: "call_read", name: "read", arguments: { path: "note.txt" } }],
+          "toolUse",
+        ),
+        assistantMessage([{ type: "text", text: "read done" }], "stop"),
+      ]),
+      reporter: new CollectingReporter(),
+      database: dbPath,
+      tools: "coding",
+    });
+    seeder.close();
+    expect(seed.record.status).toBe("completed");
+    expect(seed.record.toolset).toBe("coding");
+    crashAround(dbPath, seed.record.id, "tool_execution_start", "through");
+
+    // No `tools` option here: the run row's "coding" spec must be restored
+    // (migration 012). With the old demo default, recovery would synthesize a
+    // "not registered in this session" error for the read call instead.
+    const manager = new RunManager();
+    const result = await manager.resume(seed.record.id, {
+      model: FAKE_MODEL,
+      streamFn: scriptedStreamFn([assistantMessage([{ type: "text", text: "resumed fine" }], "stop")]),
+      reporter: new CollectingReporter(),
+      database: dbPath,
+    });
+    manager.close();
+
+    expect(result.record.status).toBe("completed");
+    const toolResults = result.messages.filter((m) => m.role === "toolResult");
+    expect(toolResults).toHaveLength(1);
+    if (toolResults[0]?.role === "toolResult") {
+      expect(toolResults[0].isError).toBe(false);
+      expect(toolResults[0].content.some((b) => b.type === "text" && b.text.includes("hello from the workspace"))).toBe(
+        true,
+      );
+    }
+    const trace = readTraceFile(result.tracePath as string);
+    expect(trace.events.some((e) => e.type === "recovery_action" && e.action === "synthesize_error")).toBe(false);
+    expect(trace.events.some((e) => e.type === "recovery_action" && e.action === "reexecute")).toBe(true);
+  });
 });

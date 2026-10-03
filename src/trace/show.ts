@@ -87,6 +87,19 @@ export function renderTimeline(parsed: ParsedTrace, options: { all?: boolean } =
           `  ${stamp(ev)}  compaction (${ev.trigger}) tokens=${ev.tokensBefore} cut=@${ev.cutIndex} summary=${ev.summaryChars} chars`,
         );
         continue;
+      case "context_decision":
+        lines.push(
+          `  ${stamp(ev)}  context ${ev.decision} est=${ev.estimatedTokens} soft=${ev.budget.triggerTokens} forced=${ev.budget.compactCeiling} blocks(c=${ev.blocks.conversation}/t=${ev.blocks.toolRound}/m=${ev.blocks.malformed})${ev.summarized ? ` summarized=${ev.summaryChars}c` : ""} — ${clip(ev.reason, 100)}`,
+        );
+        continue;
+      case "subagent_start":
+        lines.push(`  ${stamp(ev)}  subagent start ${clip(ev.task, 80)}`);
+        continue;
+      case "subagent_end":
+        lines.push(
+          `  ${stamp(ev)}  subagent end ${ev.status} turns=${ev.turns} tokens=${ev.tokens} ${(ev.durationMs / 1000).toFixed(1)}s${ev.error ? ` "${clip(ev.error, 60)}"` : ""}`,
+        );
+        continue;
       default:
         if (options.all) lines.push(`  ${stamp(ev)}  ${ev.type}`);
     }

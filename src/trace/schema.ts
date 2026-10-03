@@ -1,6 +1,7 @@
 import type { AgentEvent } from "@earendil-works/pi-agent-core";
 import type { RunStatus } from "../runtime/run-manager.js";
 import type { RiskClass } from "../runtime/permissions.js";
+import type { ContextDecision } from "../context/decision.js";
 
 /**
  * Trace schema: a run's full execution log. Envelope fields ride on every
@@ -43,6 +44,17 @@ export type HarnessAuditEvent =
       tokensBefore: number;
       summaryChars: number;
       cutIndex: number;
+    }
+  | ({ type: "context_decision" } & ContextDecision)
+  | { type: "subagent_start"; callId: string; task: string; tools: readonly string[] }
+  | {
+      type: "subagent_end";
+      callId: string;
+      status: "completed" | "failed";
+      turns: number;
+      tokens: number;
+      durationMs: number;
+      error?: string;
     }
   | { type: "tool_retry"; toolCallId: string; toolName: string; attempt: number; error: string }
   | {

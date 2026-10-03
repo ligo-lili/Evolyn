@@ -43,7 +43,12 @@ export function localEmbedder(options: LocalEmbedderOptions = {}): PassageEmbedd
       if (remoteHost) tf.env.remoteHost = remoteHost.endsWith("/") ? remoteHost : `${remoteHost}/`;
       // q8 quantization: ~4x smaller download than fp32, plenty for recall.
       return (await tf.pipeline("feature-extraction", model, { dtype: "q8" })) as never;
-    })();
+    })().catch((err) => {
+      // 下载/加载失败不缓存 rejected promise——否则首败之后向量路永久失效；
+      // 复位后下一次调用可重试（检索侧本来就有 FTS 降级兜底）。
+      extractor = undefined;
+      throw err;
+    });
     return extractor;
   };
 

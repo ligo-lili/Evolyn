@@ -16,11 +16,13 @@ import { createCodingToolset } from "../src/runtime/tools/coding.js";
 import { permissionsFor } from "../src/runtime/permissions.js";
 import { createPermissionGate } from "../src/runtime/approval.js";
 import { writeFileTool } from "../src/runtime/tools/write-file.js";
-import { findCutIndex } from "../src/context/compaction.js";
+import { partitionMessages, blockMessages } from "../src/context/blocks.js";
+import { summaryCutoffBlockIndex } from "../src/context/reducers/conversation.js";
+import { reduceToolResults } from "../src/context/reducers/tool.js";
 import { buildWorkspaceTree } from "../src/context/workspace.js";
 import { MemoryStore } from "../src/memory/store.js";
-import { parseMemory, MEMORY_ID_PATTERN } from "../src/memory/model.js";
-import { distillRunById } from "../src/memory/distiller.js";
+import { parseMemory } from "../src/memory/model.js";
+import { reflectRunById } from "../src/memory/reflection.js";
 import { promoteCandidate } from "../src/skills/promote.js";
 import { SkillIndex } from "../src/skills/retrieve.js";
 import { serializeSkillMd } from "../src/skills/format.js";
@@ -329,11 +331,7 @@ describe("P1-3 resume gating (阶段 13)", () => {
     } finally {
       db.close();
     }
-    fs.writeFileSync(
-      path.join(ws, ".harness", "traces", `${runId}.jsonl`),
-      "",
-      "utf8",
-    );
+    fs.writeFileSync(path.join(ws, ".harness", "traces", `${runId}.jsonl`), "", "utf8");
     // The JSONL was truncated away by a between_sinks reconcile (SQLite is the
     // authority) — resume must drive the task via continue() without
     // appending the user message twice.
@@ -552,7 +550,12 @@ describe("trace summary machine-readable output", () => {
       const summary = summarize(new TraceEventRepo(db).getByRun("run-json-1"));
       const json = JSON.stringify(summary, null, 2);
       expect(json).toContain("run-json-1");
-      const parsed = JSON.parse(json) as { runId: string; status?: string; eventCount: number; tokens: { cost: number } };
+      const parsed = JSON.parse(json) as {
+        runId: string;
+        status?: string;
+        eventCount: number;
+        tokens: { cost: number };
+      };
       expect(parsed.runId).toBe("run-json-1");
       expect(parsed.status).toBe("completed");
       expect(parsed.eventCount).toBe(3);
@@ -569,9 +572,9 @@ describe("trace summary machine-readable output", () => {
   });
 });
 
-// ---------- P1-5: compaction fallback never orphans a toolResult ----------
+// ---------- P1-5: 块级不变量（原"cut 点永不孤立 toolResult"的结构化保证） ----------
 
-describe("P1-5 compaction cut points (阶段 13)", () => {
+describe("P1-5 block invariants (阶段 13)", () => {
   const toolResult = (id: string, text: string) =>
     ({
       role: "toolResult",
@@ -580,98 +583,120 @@ describe("P1-5 compaction cut points (阶段 13)", () => {
       content: [{ type: "text", text }],
       isError: false,
       timestamp: 1,
-    }) as never;
+    }) as never as AgentMessage;
+  const assistantWithCalls = (ids: string[]) =>
+    ({
+      role: "assistant",
+      content: ids.map((id) => ({ type: "toolCall", id, name: "write_file", arguments: {} })),
+      timestamp: 2,
+    }) as never as AgentMessage;
 
-  it("cut boundary inside a multi-result block: slice never starts with an orphaned toolResult", () => {
-    // assistant with TWO calls, then trA (large) and trB (small); a budget that
-    // lands the boundary on trA — the old fallback cut after trA, orphaning trB.
-    const messages = [
+  it("multi-result round: partition never splits an assistant from its toolResults", () => {
+    // assistant 带两个调用，结果一大一小——块模型把整轮收进一个 ToolRoundBlock，
+    // 压缩以块为单位，trA 与 trB 之间不存在任何切点。
+    const messages: AgentMessage[] = [
       { role: "user", content: "go", timestamp: 1 } as never,
-      {
-        role: "assistant",
-        content: [
-          { type: "toolCall", id: "cA", name: "write_file", arguments: {} },
-          { type: "toolCall", id: "cB", name: "write_file", arguments: {} },
-        ],
-        timestamp: 2,
-      } as never,
+      assistantWithCalls(["cA", "cB"]),
       toolResult("cA", "a".repeat(2000)),
       toolResult("cB", "b".repeat(10)),
     ];
-    const cut = findCutIndex(messages, 200);
-    expect(cut).toBe(messages.length); // after the whole block — empty tail, no orphan
+    const blocks = partitionMessages(messages);
+    expect(blocks.map((b) => b.kind)).toEqual(["conversation", "toolRound"]);
+    const round = blocks[1]!;
+    expect(round.end - round.start).toBe(3); // assistant + 两个结果整块保留
+    expect(blockMessages(round).length).toBe(3);
   });
 
-  it("block mid-array: cut after the LAST toolResult of the block", () => {
-    const messages = [
+  it("tool reducer removes whole rounds only — a partial round is impossible", () => {
+    const messages: AgentMessage[] = [
       { role: "user", content: "go", timestamp: 1 } as never,
-      {
-        role: "assistant",
-        content: [
-          { type: "toolCall", id: "cA", name: "write_file", arguments: {} },
-          { type: "toolCall", id: "cB", name: "write_file", arguments: {} },
-        ],
-        timestamp: 2,
-      } as never,
-      toolResult("cA", "a".repeat(2000)),
-      toolResult("cB", "b".repeat(10)),
-      { role: "assistant", content: [{ type: "text", text: "both writes done" }], timestamp: 5 } as never,
+      assistantWithCalls(["c1"]),
+      toolResult("c1", "r1".padEnd(2000, "x")),
+      { role: "user", content: "turn2", timestamp: 5 } as never,
+      assistantWithCalls(["c2"]),
+      toolResult("c2", "r2".padEnd(2000, "x")),
+      { role: "user", content: "turn3", timestamp: 9 } as never,
+      assistantWithCalls(["c3"]),
+      toolResult("c3", "r3".padEnd(2000, "x")),
     ];
-    const cut = findCutIndex(messages, 200);
-    expect(cut).toBe(4); // after cB, before the follow-up assistant
-    const first = (messages[cut] as { role: string }).role;
-    expect(first).not.toBe("toolResult");
+    const out = reduceToolResults(
+      messages,
+      1,
+      { budgetTokens: 10, headChars: 5, tailChars: 2 },
+      { protectedRefs: new Set() },
+    );
+    // 每条残留的 assistant 工具调用消息，其结果必然紧随其后（同块同进退）
+    const blocks = partitionMessages(out.messages);
+    for (const b of blocks) {
+      if (b.kind !== "toolRound") continue;
+      expect(b.results.map((r) => (r as { toolCallId: string }).toolCallId).sort()).toEqual([...b.toolCallIds].sort());
+    }
+    expect(out.messages.some((msg) => JSON.stringify(msg).includes("c1"))).toBe(false); // 最旧整轮消失
+  });
+
+  it("mismatched protocol degrades to MalformedToolBlock and is never compressed", () => {
+    // 重复结果：Counter 不配对 → 整块降级保守保留
+    const messages: AgentMessage[] = [
+      { role: "user", content: "go", timestamp: 1 } as never,
+      assistantWithCalls(["cA"]),
+      toolResult("cA", "a"),
+      toolResult("cA", "b"),
+    ];
+    const blocks = partitionMessages(messages);
+    expect(blocks.map((b) => b.kind)).toEqual(["conversation", "malformed"]);
   });
 });
 
 // ---------- P1-1: memory path fence + id validation ----------
 
-describe("P1-1 memory id fence (阶段 13)", () => {
-  it("hostile ids cannot escape the memory dir; parse rejects invalid frontmatter ids", () => {
+describe("memory id fence (阶段 13, v3 layout)", () => {
+  it("hostile ids cannot reach the filesystem; parse rejects invalid frontmatter ids", () => {
     tmp.enter();
     const store = new MemoryStore(path.join(tmp.dir, "mem"));
     expect(() => store.pathOf("../../evil")).toThrow();
     expect(() => store.pathOf("..\\evil")).toThrow();
-    // ".." alone becomes the file "...md" INSIDE the dir (".md" is appended) —
-    // not an escape; the fence still refuses real climbs.
-    expect(store.pathOf("..")).toBe(path.join(tmp.dir, "mem", "ordinary", "...md"));
+    expect(() => store.pathOf("mem-a")).toThrow(); // v3 ids are M### only
+    expect(store.pathOf("M001")).toBe(path.join(tmp.dir, "mem", "active", "M001.md"));
+    expect(store.pathOf("M001", "archive")).toBe(path.join(tmp.dir, "mem", "archive", "M001.md"));
     expect(store.get("../../evil")).toBeUndefined();
-    const hostile = `---\nid: ../../../evil\nrunId: r\ntaskType: t\noutcome: success\nkeywords: []\nconfirmations: 0\ncreated: now\nupdated: now\n---\n# x`;
+    const hostile = `---\nid: ../../../evil\ntitle: t\nsummary: s\nrevision: 1\nstatus: active\ncreated: now\nupdated: now\n---\nx`;
     expect(() => parseMemory(hostile, "test")).toThrow(/invalid id/);
-    expect(MEMORY_ID_PATTERN.test("mem-a")).toBe(true);
-    expect(MEMORY_ID_PATTERN.test("../evil")).toBe(false);
     tmp.leave();
   });
 
-  it("distiller ignores a hostile updateOf instead of merging through the fence", async () => {
+  it("reflector rejects an update targeting an id the run never READ (whitelist beats the model)", async () => {
     tmp.enter();
     const dbPath = path.join(tmp.dir, "memfence", "harness.db");
     const manager = new RunManager();
     const result = await manager.run({
       task: "organize reports",
       model: FAKE_MODEL,
-      streamFn: scriptedStreamFn([assistantMessage([{ type: "text", text: "done" }], "stop")]),
+      streamFn: scriptedStreamFn([
+        assistantMessage([{ type: "toolCall", id: "c1", name: "read_file", arguments: { path: "a.txt" } }], "toolUse"),
+        assistantMessage([{ type: "text", text: "done" }], "stop"),
+      ]),
       reporter: new CollectingReporter(),
       database: dbPath,
       tools: [],
     });
     manager.close();
 
-    const outcome = await distillRunById(result.record.id, {
+    // The reflector is forced past the gate, then tries to update a hostile id —
+    // the whitelist (no memory_read happened) must reject it, no file touched.
+    const outcome = await reflectRunById(result.record.id, {
       database: dbPath,
+      force: true,
       complete: async () =>
         JSON.stringify({
-          updateOf: "../../evil",
-          taskType: "t",
-          summaryEn: "hostile updateOf ignored",
-          summaryZh: "敌意 updateOf 被忽略",
-          approach: "n/a",
-          pitfalls: "n/a",
-          outcome: "success",
-          keywordsEn: ["fence"],
+          action: "update",
+          id: "../../evil",
+          title: "hostile",
+          summary: "敌意 update",
+          content: "hostile replacement",
+          reason: "hostile update attempt",
         }),
     });
-    expect(outcome.merged).toBe(false); // treated as a NEW record, not a merge
+    expect(outcome.action).toBe("rejected");
     expect(fs.existsSync(path.join(tmp.dir, "evil.md"))).toBe(false);
     tmp.leave();
   });
@@ -1231,7 +1256,7 @@ describe("加固期: compaction single-turn shapes", () => {
   const tr = (id: string): AgentMessage =>
     ({ role: "toolResult", toolCallId: id, content: [{ type: "text", text: "r" }] }) as never;
 
-  it("single turn, many tool calls: the cut never separates an assistant from its toolResults", () => {
+  it("single turn, many tool calls: every round stays whole; only the oldest round is summarizable", () => {
     const msgs = [
       system,
       user,
@@ -1242,21 +1267,25 @@ describe("加固期: compaction single-turn shapes", () => {
       { role: "assistant", content: toolCall("c3"), usage: USAGE, stopReason: "toolUse" } as never,
       tr("c3"),
     ];
-    const cut = findCutIndex(msgs, Number.POSITIVE_INFINITY);
-    expect(cut).toBe(msgs.length); // empty tail is the only safe cut without a user boundary
+    const blocks = partitionMessages(msgs as AgentMessage[]);
+    expect(blocks.map((b) => b.kind)).toEqual(["system", "conversation", "toolRound", "toolRound", "toolRound"]);
+    // 对话块稀缺 → 工具轮回退：保护最近 2 轮，材料 = system + user + 第 1 轮。
+    // 旧语义的"空尾是唯一安全切点"在块模型下变成结构性保证：任何压缩都以
+    // 整轮为单位，assistant 与 toolResults 永不分离。
+    const cutoff = summaryCutoffBlockIndex(blocks);
+    expect(cutoff).toBe(3); // 第 2 轮的块下标（材料不含它及之后的轮次）
   });
 
-  it("final fallback never returns a tail that starts with a toolResult", () => {
+  it("malformed tool protocol is kept whole (never compressed)", () => {
     const msgs = [
       system,
       user,
       { role: "assistant", content: toolCall("c1"), usage: USAGE, stopReason: "toolUse" } as never,
       tr("c1"),
+      tr("c1"), // 重复结果 → Counter 不配对
     ];
-    const cut = findCutIndex(msgs, Number.POSITIVE_INFINITY);
-    expect(cut).toBe(msgs.length); // guarded — the old code returned length-1 (orphaned toolResult)
-    const asstTail = [system, user, { role: "assistant", content: [{ type: "text", text: "t" }] } as never];
-    expect(findCutIndex(asstTail, Number.POSITIVE_INFINITY)).toBe(asstTail.length - 1);
+    const blocks = partitionMessages(msgs as AgentMessage[]);
+    expect(blocks.map((b) => b.kind)).toEqual(["system", "conversation", "malformed"]);
   });
 });
 

@@ -25,7 +25,10 @@ export interface SchemaTool {
   parameters: TSchema;
 }
 
-export type ChatFn = (messages: readonly ChatTurn[], opts?: { schemaTool?: SchemaTool }) => Promise<string>;
+export type ChatFn = (
+  messages: readonly ChatTurn[],
+  opts?: { schemaTool?: SchemaTool; signal?: AbortSignal },
+) => Promise<string>;
 
 export interface StructuredOptions<T> {
   prompt: string;
@@ -35,6 +38,8 @@ export interface StructuredOptions<T> {
   maxReprompts?: number;
   /** Optional constrained-decoding fallback tool. */
   schemaTool?: SchemaTool;
+  /** Abort signal forwarded to every model call (callers own cancellation). */
+  signal?: AbortSignal;
 }
 
 export interface StructuredResult<T> {
@@ -62,7 +67,11 @@ export function defaultChat(model: Model<Api>, opts: { models?: Models; systemPr
           ]
         : undefined,
     };
-    const assistant = await registry.completeSimple(model, context);
+    const assistant = await registry.completeSimple(
+      model,
+      context,
+      chatOpts?.signal ? { signal: chatOpts.signal } : undefined,
+    );
     // Constrained path: the payload may arrive as a tool call — its arguments
     // ARE the JSON, and they must not be lost to text extraction.
     const schemaTool = chatOpts?.schemaTool;
@@ -85,7 +94,7 @@ export async function completeStructured<T>(options: StructuredOptions<T>): Prom
 
   for (let i = 0; i <= maxReprompts; i++) {
     attempts++;
-    const raw = await options.complete(messages);
+    const raw = await options.complete(messages, { signal: options.signal });
     try {
       return { value: options.parse(raw), attempts, method: i === 0 ? "direct" : "reprompt" };
     } catch (err) {
@@ -100,7 +109,7 @@ export async function completeStructured<T>(options: StructuredOptions<T>): Prom
 
   if (options.schemaTool) {
     attempts++;
-    const raw = await options.complete(messages, { schemaTool: options.schemaTool });
+    const raw = await options.complete(messages, { schemaTool: options.schemaTool, signal: options.signal });
     // The model answers by calling the schema tool; its arguments ARE the payload.
     const start = raw.indexOf("{");
     const end = raw.lastIndexOf("}");

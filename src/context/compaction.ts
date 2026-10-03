@@ -1,212 +1,331 @@
-import {
-  DEFAULT_COMPACTION_SETTINGS,
-  estimateContextTokens,
-  estimateTokens,
-  shouldCompact,
-  type AgentMessage,
-  type CompactionSettings,
-} from "@earendil-works/pi-agent-core";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { Api, Model, Models } from "@earendil-works/pi-ai";
-import { getModelRegistry } from "../providers.js";
+import { blockStats, partitionMessages } from "./blocks.js";
+import { computeContextBudget, type BudgetOptions, type ContextBudget } from "./budget.js";
+import { estimateContextTokens, estimateMessagesTokens, tokenCoefficientFor } from "./tokens.js";
+import { reduceToolResults, DEFAULT_TOOL_REDUCER_OPTIONS, type ToolReducerOptions } from "./reducers/tool.js";
+import {
+  advanceWatermark,
+  buildSummaryCandidate,
+  countUnsummarizedConversationBlocks,
+  coveredBoundaryIndex,
+  replaceCoveredPrefix,
+  summaryCutoffBlockIndex,
+  type SummaryWatermark,
+} from "./reducers/conversation.js";
+import {
+  generateRollingSummary,
+  renderSummaryText,
+  SummaryGenerationError,
+  type RollingConversationSummary,
+} from "./summarizer.js";
+import type { ContextDecision, PrefixDecisionKind } from "./decision.js";
 import type { HarnessAuditEvent } from "../trace/schema.js";
+import type { ChatFn } from "../llm/structured.js";
 
-// pi keeps SUMMARIZATION_SYSTEM_PROMPT internal to its harness compaction
-// module, so the harness carries its own equivalent. The structure pins the
-// current goal and key state so rolling summaries never lose the thread.
-const SUMMARIZATION_SYSTEM_PROMPT =
-  "You are a context summarization assistant. Read the conversation material and produce a " +
-  "structured summary with EXACTLY these sections: Goal (the user's current objective), Done " +
-  "(completed steps and their outcomes), Pending (unresolved threads and next actions), Key facts " +
-  "(file paths, decisions, constraints worth keeping). Do NOT continue the conversation — ONLY output the summary.";
+/**
+ * 上下文管理编排器——transformContext 钩子的实现。
+ *
+ * 总体数据流：
+ *   原始消息序列（不可变）→ partition_messages 切块 → TokenEstimator 估算
+ *   → ContextBudgetPolicy 六条预算线 → 第一层 ToolReducer（确定性，便宜）
+ *   → 仍越硬边界？ → 第二层 ConversationReducer（模型摘要，贵）
+ *   → ContextDecision（决策即数据）→ Trace / 前端。
+ *
+ * 三个贯穿始终的原则：
+ *   1. 原始历史永不修改——prepare 只产出投影；
+ *   2. 决策即数据——每次决策可解释、可进 Trace；
+ *   3. 前缀缓存优先——压缩时机为 prompt cache 让路：每次请求产出一个
+ *      prefix_decision（reuse 纯续用 / defer 越软线但缓存前缀可复用，继续
+ *      追加 / compact 真压缩 / rebuild 前缀断裂）。越软线不立即压缩，先把
+ *      prompt cache 吃干净；只有预估超 input_budget、越过强制线、未摘要块
+ *      数超限三条硬边界才强制压；前缀断裂（缓存已丢）时才深压到 target。
+ */
 
-export interface CompactionOptions {
-  contextWindow: number;
-  /** Summarization model. Defaults to the run's own model. */
+export interface ContextManagementOptions {
   model: Model<Api>;
-  /** Models registry used by the default summary function. */
-  models?: Models;
-  settings?: Partial<CompactionSettings>;
+  /** 六条预算线的覆盖项。 */
+  budget?: BudgetOptions;
+  /** 第一层 Reducer 覆盖项（budgetTokens 由预算线的 toolResultBudget 派生）。 */
+  tool?: Omit<Partial<ToolReducerOptions>, "budgetTokens">;
+  /** 未摘要普通对话块的强制压缩阈值。默认 12。 */
+  maxUnsummarizedBlocks?: number;
+  /** 切割点保护的最近普通对话块数。默认 4。 */
+  keepConversationBlocks?: number;
   /**
-   * Injectable summarizer for tests. previousSummary is set when rolling:
-   * the new summary must fold it together with the new material.
+   * resume 场景：恢复出的持久化转录长度。其后的消息属于当前 Run——第一层
+   * 永不触碰、摘要水位线也不会覆盖它们。fresh run 不传。
    */
-  summaryFn?: (prefix: readonly AgentMessage[], previousSummary?: string) => Promise<string>;
+  historyCount?: number;
+  /** Evidence 目录（相对路径），截短标记里的全文回查指针。 */
+  evidenceBase?: string;
+  /** 注入的摘要 chat 函数（测试/独立摘要模型路由）。 */
+  summaryChat?: ChatFn;
+  models?: Models;
   onEvent?: (event: HarnessAuditEvent) => void;
-  /** Per-request tidy: condense old tool results, pointing at their evidence files. */
-  tidy?: { evidenceBase?: string; keepChars?: number };
+  /** 每次请求的完整决策记录（前端/测试消费）。 */
+  onDecision?: (decision: ContextDecision) => void;
 }
 
-const SUMMARY_WRAPPER = (summary: string) =>
-  `<context-summary>\nThe earlier conversation was compacted into the following summary to stay within the context window:\n${summary}\n</context-summary>\nContinue the task from here.`;
+const DEFAULT_MAX_UNSUMMARIZED_BLOCKS = 12;
+const DEFAULT_KEEP_CONVERSATION_BLOCKS = 4;
 
-function textOf(content: readonly { type: string; text?: string }[]): string {
-  return content
-    .filter((b): b is { type: "text"; text: string } => b.type === "text")
-    .map((b) => b.text)
-    .join("");
+interface PrefixState {
+  watermark?: SummaryWatermark;
+  /** 上次请求看到的原始转录消息引用（append-only 检查 = 缓存前缀完整性）。 */
+  lastRefs: readonly object[] | undefined;
+  /** 上次第二层失败的原因：唯一重试机会携带的更严格提示。 */
+  lastSummaryFailure?: string;
 }
 
-function serializePrefix(messages: readonly AgentMessage[]): string {
-  return messages
-    .map((m) =>
-      JSON.stringify(m, (_, v) => (typeof v === "string" && v.length > 2_000 ? v.slice(0, 2_000) + "…(truncated)" : v)),
-    )
-    .join("\n");
-}
-
-async function defaultSummary(
-  options: CompactionOptions,
-  prefix: readonly AgentMessage[],
-  previousSummary?: string,
-): Promise<string> {
-  const models = options.models ?? getModelRegistry();
-  const material = [
-    previousSummary
-      ? `<previous_summary>\n${previousSummary}\n</previous_summary>\nFold the material below into it, keeping every section current.`
-      : "",
-    `Summarize this conversation material (JSON lines, one per message):\n${serializePrefix(prefix)}`,
-  ]
-    .filter(Boolean)
-    .join("\n\n");
-  const assistant = await models.completeSimple(options.model, {
-    systemPrompt: SUMMARIZATION_SYSTEM_PROMPT,
-    messages: [{ role: "user", content: material, timestamp: Date.now() } as never],
-  });
-  const text = textOf(assistant.content).trim();
-  return text || "(empty summary)";
+function prefixIntact(messages: readonly AgentMessage[], lastRefs: readonly object[] | undefined): boolean {
+  if (!lastRefs) return false; // 首个请求：缓存本就是空的
+  if (messages.length < lastRefs.length) return false;
+  for (let i = 0; i < lastRefs.length; i++) {
+    if (messages[i] !== lastRefs[i]) return false;
+  }
+  return true;
 }
 
 /**
- * 阶段 9.5 tidy: condense tool results from earlier turns to keepChars with a
- * pointer to the evidence file (full output captured at execution time). The
- * current turn's results stay verbatim — the model is actively using them.
- * Model-view only: the transcript and trace are untouched.
- */
-export function tidyToolResults(
-  messages: readonly AgentMessage[],
-  opts: { evidenceBase?: string; keepChars?: number } = {},
-): AgentMessage[] {
-  const keep = opts.keepChars ?? 200;
-  let lastUser = -1;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]?.role === "user") {
-      lastUser = i;
-      break;
-    }
-  }
-  return messages.map((m, i) => {
-    if (m.role !== "toolResult" || i >= lastUser) return m;
-    const text = textOf(m.content);
-    if (text.length <= keep) return m;
-    const pointer = opts.evidenceBase ? `; full output: ${opts.evidenceBase}/${m.toolCallId}.md` : "";
-    return {
-      ...m,
-      content: [{ type: "text", text: `${text.slice(0, keep)}…(truncated${pointer})` }],
-    } as AgentMessage;
-  });
-}
-
-/**
- * Index of the message where the compacted transcript should start. Preferred
- * cut: a user message (always begins a turn). Mid-turn fallback: just after
- * the last toolResult before the token-budget boundary — an assistant and its
- * toolResults are never separated, and the tail keeps the toolResult the
- * pending request must answer.
- */
-export function findCutIndex(messages: readonly AgentMessage[], keepRecentTokens: number): number {
-  let acc = 0;
-  let boundary = messages.length - 1;
-  while (boundary > 1) {
-    acc += estimateTokens(messages[boundary]!);
-    if (acc >= keepRecentTokens) break;
-    boundary--;
-  }
-  let cut = boundary;
-  while (cut > 1 && messages[cut]?.role !== "user") cut--;
-  if (cut > 1) return cut;
-  // Mid-turn fallback: the slice must never START with a toolResult whose
-  // assistant caller is above the cut (an orphaned toolResult gets the next
-  // request rejected). Find the LAST toolResult of the contiguous block and
-  // cut after it — an assistant keeps all of its toolResults together. When
-  // the block reaches the transcript end, the cut is the array length (empty
-  // tail is legal; capping it back into the block would orphan its head).
-  for (let j = boundary; j > 1; j--) {
-    if (messages[j]?.role === "toolResult") {
-      let end = j;
-      while (end + 1 < messages.length && messages[end + 1]?.role === "toolResult") end++;
-      return end + 1;
-    }
-  }
-  // Final fallback (加固期 P1): no user message, no toolResult inside the
-  // window. Keep the last message ONLY if it is not a toolResult — a tail
-  // starting with a toolResult whose assistant is summarized away is exactly
-  // the orphan this function exists to prevent. An empty tail is always legal.
-  if (messages[messages.length - 1]?.role === "toolResult") return messages.length;
-  return messages.length - 1;
-}
-
-function splice(messages: readonly AgentMessage[], cutIndex: number, summary: string): AgentMessage[] {
-  const head = messages[0]?.role === "system" ? [messages[0]!] : [];
-  const summaryMessage = { role: "user", content: SUMMARY_WRAPPER(summary), timestamp: Date.now() } as AgentMessage;
-  return [...head, summaryMessage, ...messages.slice(cutIndex)];
-}
-
-/**
- * Builds a pi `transformContext` hook implementing 阶段 9.5 context management:
- * per-request tidy of old tool results, threshold compaction with structured
- * goal-preserving summaries, and ROLLING re-summarization when the tail grows
- * past the budget again (folding the previous summary). The in-memory
- * transcript and the trace are never rewritten — this only shapes what the
- * model sees, and every summary generation emits a compaction audit event.
+ * 构造 pi transformContext 钩子。同一实例跨整个 Run 持有水位线与前缀状态；
+ * 每次调用是纯函数式的投影重建——原始转录永不修改。
  */
 export function createContextTransformer(
-  options: CompactionOptions,
-): (messages: AgentMessage[]) => Promise<AgentMessage[]> {
-  const settings: CompactionSettings = { ...DEFAULT_COMPACTION_SETTINGS, ...options.settings };
-  let cache: { forLength: number; summary: string; cutIndex: number } | undefined;
-  const summarize: (prefix: readonly AgentMessage[], previous?: string) => Promise<string> = options.summaryFn
-    ? (prefix, previous) => options.summaryFn!(prefix, previous)
-    : (prefix, previous) => defaultSummary(options, prefix, previous);
+  options: ContextManagementOptions,
+): (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]> {
+  const coeff = tokenCoefficientFor(options.model);
+  const budget = computeContextBudget(options.model, options.budget);
+  const maxUnsummarized = options.maxUnsummarizedBlocks ?? DEFAULT_MAX_UNSUMMARIZED_BLOCKS;
+  const keepConversationBlocks = options.keepConversationBlocks ?? DEFAULT_KEEP_CONVERSATION_BLOCKS;
+  const toolOptions: ToolReducerOptions = {
+    ...DEFAULT_TOOL_REDUCER_OPTIONS,
+    ...options.tool,
+    budgetTokens: budget.toolResultBudget,
+    evidenceBase: options.evidenceBase ?? options.tool?.evidenceBase,
+  };
+  const state: PrefixState = { lastRefs: undefined };
 
-  return async (messages) => {
-    if (messages.length <= 2) return messages;
-    const view = tidyToolResults(messages, options.tidy);
-    const estimate = estimateContextTokens(view);
-    if (!shouldCompact(estimate.tokens, options.contextWindow, settings)) return view;
+  // pi 以 (messages, signal) 调用本钩子并 await 其结果——run 被 abort 时
+  // 按其"必须不抛、返回安全回退"的契约原样返回，不再发起摘要模型调用。
+  return async (messages: AgentMessage[], signal?: AbortSignal): Promise<AgentMessage[]> => {
+    if (signal?.aborted) return messages;
+    const started = Date.now();
+    const blocks = partitionMessages(messages);
+    const stats = blockStats(blocks);
+    const transcriptEstimate = estimateContextTokens(messages, coeff).tokens;
+    const watermark = state.watermark;
 
-    // Transcript only grows within a run: a cached summary stays positionally valid.
-    if (cache && view.length >= cache.forLength) {
-      const spliced = splice(view, cache.cutIndex, cache.summary);
-      const after = estimateContextTokens(spliced);
-      if (!shouldCompact(after.tokens, options.contextWindow, settings)) return spliced;
-      // Rolling: the tail outgrew the budget again — fold it into the previous summary.
-      const newCut = Math.max(cache.cutIndex + 1, findCutIndex(view, settings.keepRecentTokens));
-      if (newCut <= cache.cutIndex || newCut >= view.length) return spliced;
-      const material = view.slice(cache.cutIndex, newCut);
-      const summary = await summarize(material, cache.summary);
-      cache = { forLength: view.length, summary, cutIndex: newCut };
-      options.onEvent?.({
-        type: "compaction",
-        trigger: "rolling",
-        tokensBefore: after.tokens,
-        summaryChars: summary.length,
-        cutIndex: newCut,
-      });
-      return splice(view, newCut, summary);
+    // resume 边界按对象引用传递：投影重建会平移下标，身份不会。当前 Run
+    // 新增的消息在两层都不可触碰（第一层不截短、第二层不折叠）。
+    const persistedEnd = options.historyCount ?? messages.length;
+    const protectedRefs: ReadonlySet<object> = new Set(messages.slice(persistedEnd) as object[]);
+
+    // —— 第一层（确定性，零模型成本）：对候选投影跑工具结果整理 ——
+    const candidate = watermark ? buildSummaryCandidate(messages, watermark) : messages;
+    const reduction = reduceToolResults(candidate, coeff, toolOptions, { protectedRefs });
+    const estimate = estimateContextTokens(reduction.messages, coeff);
+    const boundary = coveredBoundaryIndex(messages, watermark?.coveredCount ?? 0);
+    const unsummarized = countUnsummarizedConversationBlocks(blocks, boundary);
+
+    const overSoft = estimate.tokens > budget.triggerTokens;
+    const overForced = estimate.tokens > budget.compactCeiling;
+    const overInput = estimate.tokens > budget.inputBudget;
+    const overBlocks = unsummarized > maxUnsummarized;
+    const intact = prefixIntact(messages, state.lastRefs);
+
+    let decision: PrefixDecisionKind;
+    let reason: string;
+    let projection: readonly AgentMessage[] = reduction.messages;
+    let summaryChars: number | undefined;
+    let cutIndex: number | undefined;
+    let summaryAttempts: number | undefined;
+    let tokensAfter: number | undefined;
+    let summarized = false;
+
+    if (!overSoft && !overBlocks) {
+      decision = "reuse";
+      reason = `estimate ${estimate.tokens} ≤ soft line ${budget.triggerTokens}`;
+    } else if (overSoft && !overForced && !overInput && !overBlocks) {
+      decision = "defer";
+      reason = `estimate ${estimate.tokens} over soft line ${budget.triggerTokens} but under forced line ${budget.compactCeiling} — keep appending`;
+    } else {
+      const hard = overInput
+        ? `estimate ${estimate.tokens} exceeds input budget ${budget.inputBudget}`
+        : overForced
+          ? `estimate ${estimate.tokens} exceeds forced line ${budget.compactCeiling}`
+          : `unsummarized conversation blocks ${unsummarized} exceed limit ${maxUnsummarized}`;
+      decision = intact ? "compact" : "rebuild";
+      reason = intact
+        ? `${hard}; prefix intact — compact back to forced target`
+        : `${hard}; no reusable cached prefix — deep compact to target`;
+
+      if (signal?.aborted) {
+        // abort 落在决策之后：跳过摘要模型调用（其结果永远不会被消费），
+        // 第一层投影原样返回——原始历史仍然未被触碰。
+        reason += "; run aborted — summarization skipped, layer-1 projection returned";
+      } else {
+        const compacted = await compactOnce(messages, blocks, watermark, {
+          deep: !intact,
+          budget,
+          keepConversationBlocks,
+          toolOptions,
+          persistedEnd,
+          protectedRefs,
+          coeff,
+          failureHint: state.lastSummaryFailure,
+          model: options.model,
+          models: options.models,
+          summaryChat: options.summaryChat,
+          signal,
+        });
+        if (compacted.ok) {
+          projection = compacted.projection;
+          state.watermark = compacted.watermark;
+          state.lastSummaryFailure = undefined;
+          summarized = true;
+          summaryChars = compacted.summaryChars;
+          cutIndex = compacted.cutIndex;
+          summaryAttempts = compacted.attempts;
+          tokensAfter = compacted.tokensAfter;
+          options.onEvent?.({
+            type: "compaction",
+            trigger: watermark ? "rolling" : "threshold",
+            tokensBefore: estimate.tokens,
+            summaryChars: compacted.summaryChars,
+            cutIndex: compacted.cutIndex,
+          });
+        } else {
+          // 闸门①：摘要失败 → 原样返回投影，绝不动原始消息。
+          state.lastSummaryFailure = compacted.error;
+          reason += `; summarization failed (${compacted.error}) — projection returned unchanged`;
+        }
+      }
     }
 
-    const cutIndex = findCutIndex(view, settings.keepRecentTokens);
-    if (cutIndex <= 1) return view;
-    const prefix = view.slice(1, cutIndex); // exclude the system message
-    const summary = await summarize(prefix);
-    cache = { forLength: view.length, summary, cutIndex };
-    options.onEvent?.({
-      type: "compaction",
-      trigger: "threshold",
-      tokensBefore: estimate.tokens,
-      summaryChars: summary.length,
+    state.lastRefs = [...messages];
+    const record: ContextDecision = {
+      decision,
+      reason,
+      estimatedTokens: estimate.tokens,
+      transcriptEstimate,
+      usageTokens: estimate.usageTokens,
+      budget,
+      blocks: stats,
+      unsummarizedConversationBlocks: unsummarized,
+      unsummarizedLimit: maxUnsummarized,
+      toolRoundsTrimmed: reduction.trimmedRounds,
+      toolRoundsRemoved: reduction.removedRounds,
+      toolResultSavedTokens: reduction.savedTokens,
+      summarized,
+      summaryAttempts,
+      summaryChars,
       cutIndex,
-    });
-    return splice(view, cutIndex, summary);
+      coveredMessageCount: state.watermark?.coveredCount ?? 0,
+      cachePrefixIntact: intact,
+      historyCount: options.historyCount ?? 0,
+      tokensAfter,
+      durationMs: Date.now() - started,
+    };
+    options.onEvent?.({ type: "context_decision", ...record });
+    options.onDecision?.(record);
+    // 投影数组本身可变（我们构造的）或就是调用方传入的原数组（快速路径）——
+    // readonly 只是让"不得修改输入"在类型上显式化。
+    return projection as AgentMessage[];
   };
+
+  async function compactOnce(
+    messages: readonly AgentMessage[],
+    blocks: ReturnType<typeof partitionMessages>,
+    watermark: SummaryWatermark | undefined,
+    ctx: {
+      deep: boolean;
+      budget: ContextBudget;
+      keepConversationBlocks: number;
+      toolOptions: ToolReducerOptions;
+      persistedEnd: number;
+      protectedRefs: ReadonlySet<object>;
+      coeff: number;
+      failureHint?: string;
+      model: Model<Api>;
+      models?: Models;
+      summaryChat?: ChatFn;
+      signal?: AbortSignal;
+    },
+  ): Promise<
+    | {
+        ok: true;
+        projection: readonly AgentMessage[];
+        watermark: SummaryWatermark;
+        tokensAfter: number;
+        summaryChars: number;
+        cutIndex: number;
+        attempts: number;
+      }
+    | { ok: false; error: string }
+  > {
+    const cutoff = summaryCutoffBlockIndex(blocks, { keepConversationBlocks: ctx.keepConversationBlocks });
+    if (cutoff === null) return { ok: false, error: "no summarizable conversation blocks" };
+    const cutoffEnd = blocks[cutoff]!.start;
+    // 当前 Run 新增的消息（resume 边界之后）不进材料——水位线永不覆盖它们。
+    const materialEnd = Math.min(cutoffEnd, ctx.persistedEnd);
+    const boundary = coveredBoundaryIndex(messages, watermark?.coveredCount ?? 0);
+    if (materialEnd <= boundary) return { ok: false, error: "material is empty (all covered or protected)" };
+    const material = messages.slice(boundary, materialEnd).filter((m) => m.role !== "system");
+    if (material.length === 0) return { ok: false, error: "material is empty (system-only)" };
+    const materialEstimate = estimateMessagesTokens(material, ctx.coeff);
+    const target = ctx.deep ? ctx.budget.targetTokens : ctx.budget.forcedTarget;
+    const span = Math.max(materialEstimate - target, 0);
+
+    let generated: RollingConversationSummary;
+    let attempts: number;
+    try {
+      const result = await generateRollingSummary({
+        material,
+        previous: watermark?.summary,
+        spanTokens: span,
+        model: ctx.model,
+        models: ctx.models,
+        chat: ctx.summaryChat,
+        failureHint: ctx.failureHint,
+        signal: ctx.signal,
+      });
+      generated = result.summary;
+      attempts = result.attempts;
+    } catch (err) {
+      return {
+        ok: false,
+        error: err instanceof SummaryGenerationError ? err.message : err instanceof Error ? err.message : String(err),
+      };
+    }
+
+    // 闸门③：摘要必须真的更小，否则视为失败。
+    const rendered = renderSummaryText(generated);
+    const summaryEstimate = estimateMessagesTokens(
+      [{ role: "user", content: rendered, timestamp: Date.now() } as AgentMessage],
+      ctx.coeff,
+    );
+    if (summaryEstimate >= materialEstimate) {
+      return {
+        ok: false,
+        error: `summary (${summaryEstimate} tokens) is not smaller than material (${materialEstimate} tokens)`,
+      };
+    }
+
+    const next = advanceWatermark(watermark, messages, material, generated);
+    // 投影从原始历史 + 新水位线整体重建，再过一遍第一层（protectedRefs 按
+    // 身份匹配，跨投影重建依然有效）。
+    const rebuilt = replaceCoveredPrefix(messages, next);
+    const reduced = reduceToolResults(rebuilt, ctx.coeff, ctx.toolOptions, { protectedRefs: ctx.protectedRefs });
+    const tokensAfter = estimateContextTokens(reduced.messages, ctx.coeff).tokens;
+    return {
+      ok: true,
+      projection: reduced.messages,
+      watermark: next,
+      tokensAfter,
+      summaryChars: rendered.length,
+      cutIndex: next.cutIndex,
+      attempts,
+    };
+  }
 }

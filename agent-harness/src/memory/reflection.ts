@@ -12,7 +12,7 @@ import { MemorySearchIndex } from "./search.js";
 import type { MemoryRecord } from "./model.js";
 
 /**
- * 写入流程三道闸——普通记忆稀疏，默认动作 NONE（不变量 P4）：
+ * 写入流程三道闸——普通记忆稀疏，默认动作 NONE：
  *
  *   Run 结束 → ReflectionGate（确定性，零成本）
  *                │ 闲聊/能力询问/临时查询 ──▶ 跳过

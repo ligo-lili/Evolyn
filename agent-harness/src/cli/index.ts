@@ -240,7 +240,7 @@ async function main(): Promise<number> {
         const limit = typeof flags.limit === "string" ? Number(flags.limit) : 5;
         const capped = Number.isFinite(limit) && limit > 0 ? limit : 5;
         // HYBRID with the documented degrade chain — mode/degrade_reason are
-        // part of the result, not a CLI flag (设计 §7.5 降级链).
+        // part of the result, not a CLI flag.
         const hits = await index.search(store, query, { limit: capped, embedder: localEmbedder() });
         if (hits.length === 0) {
           console.log("(no matching memory — try `memory rebuild` if you edited the .md files)");

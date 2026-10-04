@@ -16,7 +16,7 @@ import type { MemoryStore } from "./store.js";
  * - memory_access: which run READ which memory (the UPDATE authorization
  *   whitelist's audit trail, §6.3 / §8).
  *
- * Retrieval ranks at the MEMORY level (设计 §7.4): a long memory with many
+ * Retrieval ranks at the MEMORY level: a long memory with many
  * chunk hits contributes ONE ranking entry per path — chunk count can never
  * inflate a score. Fusion is RRF (k=60); every result carries mode +
  * degrade_reason so callers can explain why only one path fired.
@@ -38,7 +38,7 @@ export interface MemoryHit {
   record: MemoryRecord;
   /** The most relevant chunk text, ≤ SNIPPET_CHARS (title|summary header kept). */
   snippet: string;
-  /** Which paths fired and why the others did not (可观测性，设计 §13). */
+  /** Which paths fired and why the others did not (可观测性). */
   mode: SearchMode;
   degradeReason?: string;
   /** 融合分（RRF；单路时 1/(k+rank)），已经过 accessCount 有界乘性提升。 */

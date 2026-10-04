@@ -256,7 +256,7 @@ export const MIGRATIONS: Migration[] = [
     sql: `ALTER TABLE runs ADD COLUMN toolset TEXT;`,
   },
   {
-    // Memory search v3 (记忆设计 §7): chunk-level index with content
+    // Memory search v3: chunk-level index with content
     // identity (text_sha256) + revision + embedding provenance, a search_meta
     // registry (schema version + FTS tokenizer; structural mismatch drops and
     // rebuilds the projections), and memory_access — the audit trail backing

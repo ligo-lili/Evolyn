@@ -15,18 +15,19 @@ import {
 import { parseMemory, serializeMemory, isValidMemoryId, type MemoryRecord, type MemoryStatus } from "./model.js";
 
 /**
- * MemoryStore（设计 §4.3 / §10）— Markdown 是唯一权威存储（P1）。
+ * MemoryStore — Markdown 是唯一权威存储。
  *
  * 布局（.harness/memory/）:
  *   CORE.md           — Core Memory（结构化 entries，见 core.ts）
  *   INDEX.md          — active 记忆索引（投影，每次写操作后重建）
  *   active/M001.md    — 普通记忆（带 frontmatter）
  *   archive/M001.md   — 归档，默认不可检索
+ *   history/M###/     — 版本快照 rev{n}.md，每条记忆保留最近 5 版
  *   legacy/           — v2 布局（ordinary/<slug>.md）一次性导入后的原件留存
  *
  * 写入全部采用 临时文件 + fsync + rename 原子替换（atomic.ts，CORE.md 共用）；
  * 单文件上限 512KB；并发经进程内互斥（promise 队列）串行——Windows 无 fcntl，
- * 跨进程文件锁是已知边界（设计 §14.1）。
+ * 跨进程文件锁是已知边界。
  */
 
 export const MAX_ACTIVE_MEMORIES = 25;
@@ -56,7 +57,8 @@ export class MemoryNotFoundError extends HarnessError {
   }
 }
 
-/** 进程内互斥（P6）：写操作串行化。跨进程锁见设计 §14.1 已知边界。 */
+/** 进程内互斥：写操作串行化。跨进程文件锁不存在（Windows 无 fcntl），
+ * 跨进程写一致性因此是已知边界——见 create() 的原子认领说明。 */
 class MutationGuard {
   private tail: Promise<unknown> = Promise.resolve();
 

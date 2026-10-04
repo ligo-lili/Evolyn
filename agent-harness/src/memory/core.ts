@@ -3,7 +3,7 @@ import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { writeFileAtomic } from "./atomic.js";
 
 /**
- * Core Memory（设计 §5）: 用户身份、稳定偏好、全局约束——每 Run 常驻
+ * Core Memory: 用户身份、稳定偏好、全局约束——每 Run 常驻
  * system prompt。
  *
  * - CORE.md 是权威文件：frontmatter 里的 `entries` 是结构化条目，正文是
@@ -84,7 +84,7 @@ export function serializeCore(file: CoreFile): string {
 
 /**
  * 按 key upsert 单条（禁整份覆盖）。reason 与 source_statement 必填——
- * 程序硬校验，不信任调用方自觉（设计 §5 / P5）。
+ * 程序硬校验，不信任调用方自觉。
  */
 export function upsertCoreEntry(file: CoreFile, entry: Omit<CoreEntry, "updated">): CoreFile {
   const key = entryKey(entry.key);

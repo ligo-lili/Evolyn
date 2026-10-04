@@ -38,7 +38,7 @@ function mkRecord(overrides: Partial<MemoryRecord> = {}): MemoryRecord {
 }
 
 // ---------------------------------------------------------------------------
-// 数据模型（设计 §4.2 / §7.2）
+// 数据模型：记录结构 + 切块
 // ---------------------------------------------------------------------------
 
 describe("memory model v3 (§4.2)", () => {
@@ -73,7 +73,7 @@ describe("memory model v3 (§4.2)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 存储层（设计 §4.3 / §6.5 / §10）
+// 存储层：布局 / 容量 / 原子写
 // ---------------------------------------------------------------------------
 
 describe("memory store v3 (markdown authority)", () => {
@@ -110,7 +110,7 @@ describe("memory store v3 (markdown authority)", () => {
     tmp.leave();
   });
 
-  it("capacity hard cap: the 26th create is rejected (设计 §6.5, max_active=25)", async () => {
+  it("capacity hard cap: the 26th create is rejected (max_active=25)", async () => {
     tmp.enter();
     const store = new MemoryStore(path.join(tmp.dir, "cap"));
     for (let i = 1; i <= MAX_ACTIVE_MEMORIES; i++) {
@@ -140,7 +140,7 @@ describe("memory store v3 (markdown authority)", () => {
     tmp.leave();
   });
 
-  it("recordAccess: 显式读取计 access_count / last_accessed_at（设计 §8）", async () => {
+  it("recordAccess: 显式读取计 access_count / last_accessed_at", async () => {
     tmp.enter();
     const store = new MemoryStore(path.join(tmp.dir, "acc"));
     const created = await store.create({ title: "T", summary: "s", content: "b", keywords: [] });
@@ -173,7 +173,7 @@ describe("memory store v3 (markdown authority)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Core Memory（设计 §5）
+// Core Memory（结构化条目 + 证据字段）
 // ---------------------------------------------------------------------------
 
 describe("core memory (structured entries, evidence-backed)", () => {
@@ -235,7 +235,7 @@ describe("core memory (structured entries, evidence-backed)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 检索 v3（设计 §7）：chunk 投影、RRF、降级链、对账
+// 检索 v3：chunk 投影、RRF、降级链、对账
 // ---------------------------------------------------------------------------
 
 describe("memory search v3 (chunk index + degrade chain)", () => {
@@ -392,7 +392,7 @@ describe("memory search v3 (chunk index + degrade chain)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 写入三道闸（设计 §6）：gate → reflector → 授权写入
+// 写入三道闸：gate → reflector → 授权写入
 // ---------------------------------------------------------------------------
 
 describe("reflection gate (deterministic, zero-cost)", () => {

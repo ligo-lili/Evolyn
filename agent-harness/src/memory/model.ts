@@ -35,7 +35,7 @@ export interface MemoryRecord {
   accessCount: number;
 }
 
-/** 设计 §4.2: 自增 id（M001…）— the only legal memory id shape. */
+/** 自增 id（M001…）— the only legal memory id shape. */
 export const MEMORY_ID_PATTERN = /^M\d{3,}$/;
 
 export const MEMORY_FIELDS = [
@@ -117,7 +117,7 @@ export function parseMemory(raw: string, source: string): MemoryRecord {
 }
 
 // ---------------------------------------------------------------------------
-// 切块（设计 §7.2）: 段落累积切块，每块携带 title|summary 语义头部，块计算
+// 切块: 段落累积切块，每块携带 title|summary 语义头部，块计算
 // sha256 作为内容身份。900 字符/块、180 字符重叠、每记忆 ≤16 块。
 // ---------------------------------------------------------------------------
 
@@ -125,7 +125,7 @@ export const CHUNK_CHARS = 900;
 export const CHUNK_OVERLAP = 180;
 export const MAX_CHUNKS_PER_MEMORY = 16;
 
-/** sha256 content identity of one chunk (设计 §7.1 text_sha256). */
+/** sha256 content identity of one chunk (text_sha256). */
 export function chunkSha256(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex");
 }

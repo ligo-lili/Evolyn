@@ -53,7 +53,7 @@ export function renderSkillBlock(skills: readonly SkillEntry[]): string {
   );
 }
 
-/** Pointer entry for Ordinary Memory recall (设计 §8 自动召回): cue-only —
+/** Pointer entry for Ordinary Memory recall (自动召回): cue-only —
  * id/title/revision/summary/snippet, no side effects, no update authorization. */
 export interface ExperienceEntry {
   id: string;

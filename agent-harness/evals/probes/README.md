@@ -15,6 +15,7 @@ adoption headroom either. For this model+domain the skill is redundant at ~+18%
 tokens/run (SKILL.md read).
 
 Skill gating therefore needs a domain/model with failure mass:
+
 - a weaker/cheaper eval model (e.g. qwen-flash via DashScope) — skill as
   ring weak models up to strong-model behavior\;
 - multi-file consistency and long-horizon tasks (needs multi-file judging);

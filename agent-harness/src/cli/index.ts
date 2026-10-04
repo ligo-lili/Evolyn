@@ -21,7 +21,7 @@ import type { TraceEvent } from "../trace/schema.js";
 import { reflectRunById } from "../memory/reflection.js";
 import { MAX_ACTIVE_MEMORIES, MemoryStore } from "../memory/store.js";
 import { MemorySearchIndex } from "../memory/search.js";
-import { localEmbedder } from "../memory/embedding.js";
+import { EMBEDDING_MODEL_ID, localEmbedder } from "../memory/embedding.js";
 import { minePatternsFromDb } from "../learning/miner.js";
 import { draftSkillFromPattern } from "../learning/candidate.js";
 import {
@@ -59,6 +59,7 @@ Usage:
   agent-harness memory search <query> [--limit <n>]   hybrid FTS5+vector with the documented degrade chain
   agent-harness memory rebuild [--vector]      reconcile/rebuild indexes from the .md files (--vector embeds)
   agent-harness memory status            index diagnostics: tokenizer, schema, backfill state, capacity
+  agent-harness memory history <id>       list the version snapshots of one memory (restore = copy back)
   agent-harness memory distill <runId> [--force]   reflect a run into memory (gate skipped with --force)
   agent-harness skill mine [--min-support <n>]
                                            mine tool-sequence / error-repair patterns from finished runs
@@ -239,7 +240,7 @@ async function main(): Promise<number> {
         const limit = typeof flags.limit === "string" ? Number(flags.limit) : 5;
         const capped = Number.isFinite(limit) && limit > 0 ? limit : 5;
         // HYBRID with the documented degrade chain — mode/degrade_reason are
-        // part of the result, not a CLI flag (memory-design.md §7.5).
+        // part of the result, not a CLI flag (设计 §7.5 降级链).
         const hits = await index.search(store, query, { limit: capped, embedder: localEmbedder() });
         if (hits.length === 0) {
           console.log("(no matching memory — try `memory rebuild` if you edited the .md files)");
@@ -247,7 +248,9 @@ async function main(): Promise<number> {
         }
         console.log(`(mode: ${hits[0]?.mode}${hits[0]?.degradeReason ? ` — ${hits[0].degradeReason}` : ""})`);
         hits.forEach((h, i) => {
-          console.log(`#${i + 1} ${h.record.id} (rev ${h.record.revision}) ${h.record.title}`);
+          console.log(
+            `#${i + 1} ${h.record.id} (rev ${h.record.revision}) ${h.record.title} [score ${h.score.toFixed(5)} ×${h.boost.toFixed(2)}]`,
+          );
           console.log(`    ${h.record.summary}`);
           console.log(`    ${h.snippet.replace(/\n/g, " ").slice(0, 200)}`);
           console.log(
@@ -270,7 +273,7 @@ async function main(): Promise<number> {
           // Synchronous embed on the CLI path; startup uses the background backfill.
           const embedder = localEmbedder();
           const live = store.list("active");
-          for (const record of live) await index.embedRecord(record, embedder, "multilingual-e5-small");
+          for (const record of live) await index.embedRecord(record, embedder, EMBEDDING_MODEL_ID);
           vectors = index.vectorCount();
         }
         console.log(
@@ -281,11 +284,30 @@ async function main(): Promise<number> {
       }
       return 0;
     }
+    if (sub === "history") {
+      const id = positional[1];
+      if (!id) {
+        console.error("usage: agent-harness memory history <id>");
+        return 2;
+      }
+      const versions = store.history(id);
+      if (versions.length === 0) {
+        console.log(`(no history for ${id} — snapshots start at the first update/archive)`);
+        return 0;
+      }
+      for (const v of versions) {
+        console.log(`rev ${v.revision} (${v.updated}) — ${v.title}`);
+        console.log(`    ${v.summary}`);
+        console.log(`    ${path.relative(process.cwd(), store.historyPath(id, v.revision))}`);
+      }
+      console.log(`\nrestore = copy the file back to active/ (no restore command by design).`);
+      return 0;
+    }
     if (sub === "status") {
       const db = openDatabase(dbPath);
       try {
         const index = new MemorySearchIndex(db);
-        const diag = index.diagnostics("multilingual-e5-small");
+        const diag = index.diagnostics(EMBEDDING_MODEL_ID);
         console.log(`memory dir: ${store.dir}`);
         console.log(
           `active: ${store.activeCount()} (cap ${MAX_ACTIVE_MEMORIES}) | archive: ${store.list("archive").length}`,
@@ -316,7 +338,7 @@ async function main(): Promise<number> {
       return 0;
     }
     console.error(
-      "usage: agent-harness memory core | memory list [--all] | memory search <query> | memory rebuild [--vector] | memory status | memory distill <runId> [--force]",
+      "usage: agent-harness memory core | memory list [--all] | memory search <query> | memory history <id> | memory rebuild [--vector] | memory status | memory distill <runId> [--force]",
     );
     return 2;
   }
@@ -888,6 +910,10 @@ async function main(): Promise<number> {
         console.error(`memory: reflection failed (${err instanceof Error ? err.message : err})`);
       }
     }
+    // Run 结束 + reflect 之后的向量补全：CLI 短生命周期，退出前 drain 完成。
+    if (await manager.drainMemoryBackfill()) {
+      console.log("memory: embedding backfill complete (vector recall now effective)");
+    }
     manager.close();
     return record.status === "completed" ? 0 : 1;
   }
@@ -999,6 +1025,10 @@ async function main(): Promise<number> {
     } catch (err) {
       console.error(`memory: reflection failed (${err instanceof Error ? err.message : err})`);
     }
+  }
+  // Run 结束 + reflect 之后的向量补全：CLI 短生命周期，退出前 drain 完成。
+  if (await manager.drainMemoryBackfill()) {
+    console.log("memory: embedding backfill complete (vector recall now effective)");
   }
   manager.close();
   return record.status === "completed" ? 0 : 1;

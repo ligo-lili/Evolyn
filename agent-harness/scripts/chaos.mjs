@@ -142,7 +142,9 @@ function spawnDriver(args, cwd) {
           clearTimeout(timer);
           // An exit before READY is an infra flake too (import crash) — same
           // signature, same retry semantics.
-          reject(new Error(`driver never became READY (exited with code ${code}; stderr: ${state.stderr.slice(0, 200)})`));
+          reject(
+            new Error(`driver never became READY (exited with code ${code}; stderr: ${state.stderr.slice(0, 200)})`),
+          );
         });
       });
     },

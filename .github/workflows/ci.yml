@@ -29,3 +29,5 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test
+      # offline retrieval-quality gate (FTS mode): recall@5 + blind-spot check
+      - run: npm run eval:memory

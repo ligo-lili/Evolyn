@@ -27,9 +27,7 @@ const promotedRoot = arg("--promoted", path.join(process.cwd(), ".harness", "ski
 const db = harness.openDatabase(dbPath);
 try {
   const rows = db
-    .prepare(
-      "SELECT s.name, s.dir_path, f.description, f.body FROM skills s JOIN skills_fts f ON f.skill_id = s.id",
-    )
+    .prepare("SELECT s.name, s.dir_path, f.description, f.body FROM skills s JOIN skills_fts f ON f.skill_id = s.id")
     .all();
   let restored = 0;
   let present = 0;

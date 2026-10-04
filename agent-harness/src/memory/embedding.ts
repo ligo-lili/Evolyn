@@ -15,6 +15,25 @@ export type PassageEmbedder = {
 
 export const E5_PREFIXES = { passage: "passage: ", query: "query: " } as const;
 
+/**
+ * 规范 embedding 模型 id：写入 memory_chunks.embedding_model 的唯一取值。
+ * 运行时 backfill 与 CLI rebuild --vector 必须用同一个 id，否则彼此建的
+ * 向量都会被当作过期模型重新计算。
+ */
+export const EMBEDDING_MODEL_ID = "Xenova/multilingual-e5-small";
+
+let shared: PassageEmbedder | undefined;
+
+/**
+ * 进程级单例：模型每进程至多加载一次，工厂本身零成本——加载是惰性
+ * Promise，且检索路在 vectorCount() === 0 时根本不会触到它（run 启动
+ * 零开销；建过向量才付一次 query embedding 的代价）。
+ */
+export function sharedEmbedder(options: LocalEmbedderOptions = {}): PassageEmbedder {
+  shared ??= localEmbedder(options);
+  return shared;
+}
+
 export interface LocalEmbedderOptions {
   model?: string;
   /** Where the model files are downloaded on first use. */

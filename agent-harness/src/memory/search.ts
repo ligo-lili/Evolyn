@@ -4,8 +4,8 @@ import { chunkMemory, chunkSha256, type MemoryRecord } from "./model.js";
 import type { MemoryStore } from "./store.js";
 
 /**
- * MemorySearchIndex v3 — the derived, rebuildable search projection
- * (memory-design.md §7). The Markdown files are the authority (P1); every
+ * MemorySearchIndex v3 — the derived, rebuildable search projection (§7).
+ * The Markdown files are the authority (P1); every
  * failure here only degrades retrieval quality, never correctness (P2).
  *
  * - memory_chunks: chunk text + text_sha256 (content identity) + revision +
@@ -28,6 +28,9 @@ export const MIN_VECTOR_SIMILARITY = 0.12;
 export const SNIPPET_CHARS = 360;
 export const FTS_MAX_TERMS = 12;
 export const CANDIDATE_MULTIPLIER = 8;
+/** accessCount 排序加成：boost = 1 + 0.15 × min(log2(1 + accessCount), 2)。 */
+export const ACCESS_BOOST_WEIGHT = 0.15;
+export const ACCESS_BOOST_CAP = 2;
 
 export type SearchMode = "hybrid" | "fts" | "vector" | "unavailable";
 
@@ -35,9 +38,13 @@ export interface MemoryHit {
   record: MemoryRecord;
   /** The most relevant chunk text, ≤ SNIPPET_CHARS (title|summary header kept). */
   snippet: string;
-  /** Which paths fired and why the others did not (可观测性, 设计 §13). */
+  /** Which paths fired and why the others did not (可观测性，设计 §13). */
   mode: SearchMode;
   degradeReason?: string;
+  /** 融合分（RRF；单路时 1/(k+rank)），已经过 accessCount 有界乘性提升。 */
+  score: number;
+  /** 本次排序应用的提升乘数（accessCount=0 → 1；封顶 1.30）。决策即数据。 */
+  boost: number;
 }
 
 export interface BackfillStatus {
@@ -480,21 +487,33 @@ export class MemorySearchIndex {
       if (mode === "unavailable") degradeReason = "fts unavailable";
     }
 
-    const fusedIds =
+    // 融合分：双路 RRF；单路退化为同一公式 1/(k+rank)，保证两case分数量纲一致。
+    const fusedScores: Array<{ id: string; score: number }> =
       memoryFts.length > 0 && vectorRanking.length > 0
-        ? rrfCombine([memoryFts, vectorRanking], RRF_K).map((r) => r.id)
-        : (memoryFts.length > 0 ? memoryFts : vectorRanking).map((r) => r.id);
+        ? rrfCombine([memoryFts, vectorRanking], RRF_K)
+        : (memoryFts.length > 0 ? memoryFts : vectorRanking).map((r) => ({ id: r.id, score: 1 / (RRF_K + r.rank) }));
+
+    // 有界乘性提升：accessCount 高的记忆在融合分之上获得 log 阻尼、硬封顶
+    // （≤ +45%）的加成。accessCount 是 query 无关量——做成 RRF 第三路会
+    // 系统性偏向热门记忆（富者愈富）；乘性有界只重排边缘、不固化榜单。
+    // 权威回填同时在这里完成：陈旧索引行（已不在 active 集合）直接剔除。
+    const boosted: Array<{ id: string; score: number; boost: number }> = [];
+    for (const fused of fusedScores) {
+      const record = store.get(fused.id);
+      if (!record || record.status !== "active") continue;
+      const boost = 1 + ACCESS_BOOST_WEIGHT * Math.min(Math.log2(1 + record.accessCount), ACCESS_BOOST_CAP);
+      boosted.push({ id: fused.id, score: fused.score * boost, boost });
+    }
+    boosted.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
 
     const hits: MemoryHit[] = [];
     const chunkTextById = this.chunkLookup();
-    for (const id of fusedIds.slice(0, limit)) {
-      // 权威回填：陈旧索引行（已不在 active 集合）直接剔除（§7.4.2）。
-      const record = store.get(id);
-      if (!record || record.status !== "active") continue;
-      const bestIndex = bestChunkByMemory.get(id);
-      const bestText = bestIndex !== undefined ? chunkTextById.get(id)?.get(bestIndex) : undefined;
+    for (const entry of boosted.slice(0, limit)) {
+      const record = store.get(entry.id)!; // 上一循环已验证存在且 active
+      const bestIndex = bestChunkByMemory.get(entry.id);
+      const bestText = bestIndex !== undefined ? chunkTextById.get(entry.id)?.get(bestIndex) : undefined;
       const snippet = (bestText ?? record.content).slice(0, SNIPPET_CHARS);
-      hits.push({ record, snippet, mode, degradeReason });
+      hits.push({ record, snippet, mode, degradeReason, score: entry.score, boost: entry.boost });
     }
     return hits;
   }

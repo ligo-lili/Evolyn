@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
 /**
- * Memory v3 — the memory-design.md data model (设计 §4.2):
+ * Memory v3 数据模型（§4.2）：
  *
  * One Ordinary Memory = one Markdown file with YAML frontmatter:
  *   id (M001…), title, summary, keywords, revision, status, provenance and

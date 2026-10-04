@@ -12,7 +12,7 @@ import { MemorySearchIndex } from "./search.js";
 import type { MemoryRecord } from "./model.js";
 
 /**
- * 写入流程三道闸（memory-design.md §6）——普通记忆稀疏，默认动作 NONE（P4）：
+ * 写入流程三道闸——普通记忆稀疏，默认动作 NONE（不变量 P4）：
  *
  *   Run 结束 → ReflectionGate（确定性，零成本）
  *                │ 闲聊/能力询问/临时查询 ──▶ 跳过
@@ -53,18 +53,23 @@ export function buildRunDigest(
   messages: readonly AgentMessage[],
 ): RunDigest {
   const toolCalls: RunDigest["toolCalls"] = [];
+  const callById = new Map<string, RunDigest["toolCalls"][number]>();
   let finalAssistantText: string | undefined;
   for (const m of messages) {
     if (m.role === "assistant") {
       for (const block of m.content) {
         if (block.type === "toolCall") {
-          toolCalls.push({ toolName: block.name, args: block.arguments });
+          const call = { toolName: block.name, args: block.arguments };
+          toolCalls.push(call);
+          // 消息里本来就有精确 id——按 toolCallId 配对；按名字反扫在同名
+          // 并行调用上会张冠李戴。
+          callById.set(block.id, call);
         }
       }
       const text = textOf(m.content);
       if (text.trim()) finalAssistantText = text;
     } else if (m.role === "toolResult") {
-      const call = [...toolCalls].reverse().find((c) => c.toolName === m.toolName && c.isError === undefined);
+      const call = callById.get(m.toolCallId);
       if (call) call.isError = m.isError;
     }
   }

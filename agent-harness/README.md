@@ -10,7 +10,7 @@ English | [简体中文](README.zh-CN.md)
 git clone https://github.com/ligo-lili/Evolyn
 cd Evolyn\agent-harness
 npm install
-npm test          # 219 tests — every one runs without an API key
+npm test          # 229 tests — every one runs without an API key
 npm run harness -- run "<task>" --model deepseek/deepseek-flash --tools coding --yolo
 ```
 
@@ -75,21 +75,27 @@ environment. Tool calls default to **interactive approval**; `--yolo` opts out.
   child's usage lands on the parent's cost/token fuses, its audit events
   (`subagent_start/end`) land in the trace, and its full transcript lands in
   the evidence directory.
-- **Experience memory** (per `memory-design.md`) — dual-layer: structured
+- **Experience memory** — dual-layer: structured
   **Core Memory** (key upserts only, every entry carries `reason` +
   `source_statement` evidence, 2000-token injection budget) and **ordinary
   memories** (one Markdown file each, `M001…` ids, optimistic-lock
   `revision`, active/archive with a hard 25-active cap, atomic writes,
+  version snapshots under `history/` (last 5, FIFO),
   `INDEX.md` projection). Writes go through **three gates**: a deterministic
   reflection gate → a strict-JSON `{action: none|create|update}` reflector →
   an authorized write (updates allowed only for ids the run actually READ —
   mechanism, not prompt). Retrieval is chunk-level FTS (trigram-probed) +
   local `e5` vectors fused by memory-level RRF with an explicit degrade chain
-  (`mode` + `degrade_reason` on every result); startup reconciles from the
+  (`mode` + `degrade_reason` on every result) and a bounded accessCount
+  ranking boost. The vector path takes effect once the background backfill
+  completes — until then every search honestly reports FTS-only; runs with
+  no vectors never load the model at all. Startup reconciles from the
   Markdown authority, embeddings backfill in the background with bounded
-  backoff. The model gets `memory_read / memory_search / memory_create /
+  backoff (CLI drains it before exit; `memory: { hybrid: false }` opts out).
+  The model gets `memory_read / memory_search / memory_create /
   memory_update / memory_archive / core_memory_update` (coding toolset by
-  default).
+  default). Retrieval quality is gated in CI by `npm run eval:memory`
+  (recall@5 + blind-spot check over `evals/memory-retrieval.json`).
 - **Skill self-evolution** — recurring patterns are mined from traces
   (support ≥ 3 hard gate), distilled into pi-compatible `SKILL.md` files,
   verified with Pi's own loader, and injected as `<available_skills>` into

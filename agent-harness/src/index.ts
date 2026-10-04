@@ -136,7 +136,9 @@ export {
   cosineSimilarity,
   localEmbedder,
   rrfCombine,
+  sharedEmbedder,
   E5_PREFIXES,
+  EMBEDDING_MODEL_ID,
   type LocalEmbedderOptions,
   type PassageEmbedder,
 } from "./memory/embedding.js";

@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import type { DatabaseSync } from "node:sqlite";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { openDatabase } from "../src/storage/db.js";
 import { MAX_ACTIVE_MEMORIES, MemoryConflictError, MemoryStore } from "../src/memory/store.js";
@@ -7,6 +8,7 @@ import { MemorySearchIndex } from "../src/memory/search.js";
 import { chunkMemory, parseMemory, serializeMemory, type MemoryRecord } from "../src/memory/model.js";
 import { parseCore, renderCore, serializeCore, upsertCoreEntry, type CoreFile } from "../src/memory/core.js";
 import { buildRunDigest, parseReflectionDecision, reflectRunById, shouldReflect } from "../src/memory/reflection.js";
+import { EMBEDDING_MODEL_ID } from "../src/memory/embedding.js";
 import { RunManager } from "../src/runtime/run-manager.js";
 import { CollectingReporter } from "../src/runtime/reporter.js";
 import { assistantMessage, FAKE_MODEL, makeTempCwd, scriptedStreamFn } from "./helpers.js";
@@ -39,7 +41,7 @@ function mkRecord(overrides: Partial<MemoryRecord> = {}): MemoryRecord {
 // 数据模型（设计 §4.2 / §7.2）
 // ---------------------------------------------------------------------------
 
-describe("memory model v3 (memory-design.md §4.2)", () => {
+describe("memory model v3 (§4.2)", () => {
   it("serializes to markdown with frontmatter and parses back losslessly", () => {
     const record = mkRecord();
     const raw = serializeMemory(record);
@@ -814,6 +816,332 @@ describe("memory injection + model tool surface", () => {
       .map((f) => fs.readFileSync(path.join(evidenceDir, f), "utf8"))
       .find((text) => text.includes("the full body content marker"));
     expect(evidence).toBeDefined();
+    tmp.leave();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// P0-1/P1-3/P1-4/P2-5 批次：向量路接通、boost 排序、版本历史、原子认领
+// ---------------------------------------------------------------------------
+
+describe("hybrid recall wired into runs (向量路接通)", () => {
+  it("(a) with vectors, the run-start recall fires the vector path (hybrid)", async () => {
+    tmp.enter();
+    const dbPath = path.join(tmp.dir, "hybrid-run", "harness.db");
+    const store = new MemoryStore(path.join(path.dirname(dbPath), "memory"));
+    const seeded = await store.create({
+      title: "gem protocol",
+      summary: "gem evaluation notes",
+      content: "gem evaluation protocol details",
+      keywords: ["gem"],
+    });
+
+    const db = openDatabase(dbPath);
+    const index = new MemorySearchIndex(db);
+    index.reconcile(store);
+    // deterministic embedder: the chunk vector matches the QUERY vector —
+    // the lexical path matches too (title carries "gem"), so both fire.
+    let queryEmbeds = 0;
+    const fake = {
+      embedPassages: async (texts: readonly string[]) => texts.map(() => [0, 1]),
+      embedQuery: async () => {
+        queryEmbeds++;
+        return [0, 1];
+      },
+    };
+    await index.embedRecord(seeded, fake, "fake-e5");
+    db.close();
+
+    const captured: string[] = [];
+    const manager = new RunManager();
+    const result = await manager.run({
+      task: "gem evaluation",
+      model: FAKE_MODEL,
+      streamFn: (model, context) => {
+        captured.push(JSON.stringify(context));
+        return scriptedStreamFn([assistantMessage([{ type: "text", text: "ok" }], "stop")])(model, context);
+      },
+      reporter: new CollectingReporter(),
+      database: dbPath,
+      tools: [],
+      memory: { embedder: fake },
+    });
+    manager.close();
+
+    expect(result.record.status).toBe("completed");
+    expect(queryEmbeds).toBe(1); // the vector path actually fired (exactly one query embedding)
+    expect(captured.some((c) => c.includes("<relevant_experience>") && c.includes(seeded.id))).toBe(true);
+  });
+
+  it("(b) without vectors the retrieval path costs zero model calls; backfill runs after the run", async () => {
+    tmp.enter();
+    const dbPath = path.join(tmp.dir, "no-vec", "harness.db");
+    const store = new MemoryStore(path.join(path.dirname(dbPath), "memory"));
+    await store.create({ title: "T", summary: "s", content: "dedupe csv rows", keywords: [] });
+
+    const db = openDatabase(dbPath);
+    const index = new MemorySearchIndex(db);
+    index.reconcile(store);
+    expect(index.vectorCount()).toBe(0);
+    db.close();
+
+    let queryEmbeds = 0;
+    const counting = {
+      embedPassages: async (texts: readonly string[]) => texts.map(() => [1, 0]),
+      embedQuery: async () => {
+        queryEmbeds++;
+        return [1, 0];
+      },
+    };
+    const manager = new RunManager();
+    const result = await manager.run({
+      task: "dedupe csv rows",
+      model: FAKE_MODEL,
+      streamFn: scriptedStreamFn([assistantMessage([{ type: "text", text: "ok" }], "stop")]),
+      reporter: new CollectingReporter(),
+      database: dbPath,
+      tools: [],
+      memory: { embedder: counting },
+    });
+    expect(result.record.status).toBe("completed");
+    expect(queryEmbeds).toBe(0); // 检索路零成本：无向量时从不触碰模型
+
+    // run 结束后的 backfill 触发点：drain 后向量就绪（下一次 run 召回 hybrid）
+    await manager.drainMemoryBackfill();
+    const db2 = openDatabase(dbPath);
+    try {
+      const index2 = new MemorySearchIndex(db2);
+      expect(index2.vectorCount()).toBe(1);
+      expect(index2.backfillPending(EMBEDDING_MODEL_ID)).toBe(0);
+    } finally {
+      db2.close();
+    }
+    tmp.leave();
+  });
+
+  it("(c) memory_search walks the vector path with no degrade reason", async () => {
+    tmp.enter();
+    const dbPath = path.join(tmp.dir, "tool-hybrid", "harness.db");
+    const store = new MemoryStore(path.join(path.dirname(dbPath), "memory"));
+    const created = await store.create({
+      title: "gem protocol",
+      summary: "gem evaluation",
+      content: "gem evaluation protocol",
+      keywords: ["gem"],
+    });
+    const db = openDatabase(dbPath);
+    try {
+      const index = new MemorySearchIndex(db);
+      index.reconcile(store);
+      const fake = {
+        embedPassages: async (texts: readonly string[]) => texts.map(() => [0, 1]),
+        embedQuery: async () => [0, 1],
+      };
+      await index.embedRecord(created, fake, "fake-e5");
+
+      const { createMemoryTools } = await import("../src/memory/tools.js");
+      const tools = createMemoryTools({ store, index, runId: "run-x", embedder: () => fake });
+      const search = tools.find((t) => t.name === "memory_search")!;
+      const out = await search.execute("c1", { query: "gem evaluation" });
+      expect(out.details).toMatchObject({ mode: "hybrid", degradeReason: undefined });
+    } finally {
+      db.close();
+    }
+    tmp.leave();
+  });
+
+  it("(d) a throwing embedder degrades to FTS — the run is unaffected", async () => {
+    tmp.enter();
+    const dbPath = path.join(tmp.dir, "throw-embed", "harness.db");
+    const store = new MemoryStore(path.join(path.dirname(dbPath), "memory"));
+    const seeded = await store.create({
+      title: "organize reports",
+      summary: "整理 quarterly reports 前先去重。",
+      content: "dedupe quarterly reports before merging",
+      keywords: ["reports"],
+    });
+    const db = openDatabase(dbPath);
+    {
+      const index = new MemorySearchIndex(db);
+      index.reconcile(store);
+    }
+    db.close();
+
+    const throwing = {
+      embedPassages: async () => {
+        throw new Error("embedding service down");
+      },
+      embedQuery: async () => {
+        throw new Error("embedding service down");
+      },
+    };
+    const captured: string[] = [];
+    const manager = new RunManager();
+    const result = await manager.run({
+      task: "organize quarterly reports",
+      model: FAKE_MODEL,
+      streamFn: (model, context) => {
+        captured.push(JSON.stringify(context));
+        return scriptedStreamFn([assistantMessage([{ type: "text", text: "ok" }], "stop")])(model, context);
+      },
+      reporter: new CollectingReporter(),
+      database: dbPath,
+      tools: [],
+      memory: { embedder: throwing },
+    });
+    manager.close();
+    expect(result.record.status).toBe("completed"); // 降级而非失败
+    expect(captured.some((c) => c.includes("<relevant_experience>") && c.includes(seeded.id))).toBe(true);
+  });
+});
+
+describe("digest error attribution by toolCallId", () => {
+  it("same tool called twice: only the FAILED call is flagged, even out of order", () => {
+    const messages = [
+      { role: "user", content: "go", timestamp: 1 },
+      {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "c1", name: "read_file", arguments: { path: "a" } },
+          { type: "toolCall", id: "c2", name: "read_file", arguments: { path: "b" } },
+        ],
+        timestamp: 2,
+      },
+      // results arrive in REVERSE order — id pairing must not care
+      {
+        role: "toolResult",
+        toolCallId: "c2",
+        toolName: "read_file",
+        content: [{ type: "text", text: "boom" }],
+        isError: true,
+        timestamp: 3,
+      },
+      {
+        role: "toolResult",
+        toolCallId: "c1",
+        toolName: "read_file",
+        content: [{ type: "text", text: "fine" }],
+        isError: false,
+        timestamp: 4,
+      },
+    ] as never[];
+    const digest = buildRunDigest({ id: "r", task: "go", modelSpec: "m", status: "completed" }, messages);
+    expect(digest.toolCalls[0]).toMatchObject({ toolName: "read_file", isError: false }); // c1
+    expect(digest.toolCalls[1]).toMatchObject({ toolName: "read_file", isError: true }); // c2
+  });
+});
+
+describe("accessCount ranking boost (bounded multiplicative)", () => {
+  async function seededPair(
+    dbPath: string,
+  ): Promise<{ store: MemoryStore; a: string; b: string; db: DatabaseSync; index: MemorySearchIndex }> {
+    const store = new MemoryStore(path.join(path.dirname(dbPath), "memory"));
+    // identical-length bodies, same term frequency → bm25 tie on the shared term
+    const a = await store.create({
+      title: "tie-a",
+      summary: "s",
+      content: "memory-aaa target words align here",
+      keywords: ["target"],
+    });
+    const b = await store.create({
+      title: "tie-b",
+      summary: "s",
+      content: "memory-bbb target words align here",
+      keywords: ["target"],
+    });
+    const db = openDatabase(dbPath);
+    const index = new MemorySearchIndex(db);
+    index.reconcile(store);
+    return { store, a: a.id, b: b.id, db, index };
+  }
+
+  it("accessCount=0 → boost 1.0 and the original tie order stands", async () => {
+    tmp.enter();
+    const { store, a, b, db, index } = await seededPair(path.join(tmp.dir, "boost0", "harness.db"));
+    try {
+      const hits = await index.search(store, "target", { limit: 5 });
+      expect(hits.map((h) => h.record.id)).toEqual([a, b]);
+      expect(hits.every((h) => h.boost === 1)).toBe(true);
+    } finally {
+      db.close();
+    }
+    tmp.leave();
+  });
+
+  it("higher accessCount outranks an equal-FTS memory; the boost is capped at 1.30", async () => {
+    tmp.enter();
+    const { store, a, b, db, index } = await seededPair(path.join(tmp.dir, "boost1", "harness.db"));
+    try {
+      for (let i = 0; i < 100; i++) await store.recordAccess(b); // log2(101) > cap
+      const hits = await index.search(store, "target", { limit: 5 });
+      expect(hits[0]!.record.id).toBe(b); // 热门者排前
+      expect(hits[0]!.boost).toBe(1.3); // 硬封顶：1 + 0.15 × 2
+      expect(hits[1]!.record.id).toBe(a);
+      expect(hits[1]!.boost).toBe(1);
+    } finally {
+      db.close();
+    }
+    tmp.leave();
+  });
+});
+
+describe("memory version history (last 5, FIFO)", () => {
+  it("7 consecutive updates leave exactly the latest 5 revisions, all parseable", async () => {
+    tmp.enter();
+    const store = new MemoryStore(path.join(tmp.dir, "hist", "memory"));
+    const created = await store.create({ title: "v0", summary: "s", content: "body 0", keywords: [] });
+    for (let i = 1; i <= 7; i++) {
+      await store.updateIfRevision(created.id, i, {
+        title: `v${i}`,
+        summary: "s",
+        content: `body ${i}`,
+        keywords: [],
+      });
+    }
+    const files = fs.readdirSync(path.join(tmp.dir, "hist", "memory", "history", created.id)).sort();
+    expect(files).toEqual(["rev3.md", "rev4.md", "rev5.md", "rev6.md", "rev7.md"]);
+    const versions = store.history(created.id);
+    expect(versions.map((v) => v.revision)).toEqual([7, 6, 5, 4, 3]); // 降序
+    // rev{n} 快照的是第 n 次替换前的内容：rev7 = 第 7 次 update 之前的 body 6
+    expect(versions[0]!.content).toBe("body 6");
+    expect(versions[4]!.content).toBe("body 2");
+    // 历史文件可被 parseMemory 完整解析（store.history 走同一解析路径）
+    // 当前版本仍在 active：第 7 次替换后 = rev8 = "body 7"
+    expect(store.get(created.id)?.revision).toBe(8);
+    expect(store.get(created.id)?.content).toBe("body 7");
+    tmp.leave();
+  });
+
+  it("archive snapshots the pre-archive version into history too", async () => {
+    tmp.enter();
+    const store = new MemoryStore(path.join(tmp.dir, "hist-arch", "memory"));
+    const created = await store.create({ title: "T", summary: "s", content: "pre-archive body", keywords: [] });
+    await store.archiveIfUnchanged(created.id, 1);
+    const versions = store.history(created.id);
+    expect(versions).toHaveLength(1);
+    expect(versions[0]!.revision).toBe(1);
+    expect(versions[0]!.content).toBe("pre-archive body");
+    tmp.leave();
+  });
+});
+
+describe("cross-process atomic id claim", () => {
+  it("a claimed placeholder id is skipped (EEXIST retry) and left untouched", async () => {
+    tmp.enter();
+    const dir = path.join(tmp.dir, "claim", "memory");
+    const store = new MemoryStore(dir);
+    // Simulate another process's crashed/claimed M001: a 0-byte placeholder.
+    fs.mkdirSync(path.join(dir, "active"), { recursive: true });
+    fs.closeSync(fs.openSync(path.join(dir, "active", "M001.md"), "w"));
+
+    const record = await store.create({ title: "T", summary: "s", content: "b", keywords: [] });
+    expect(record.id).toBe("M002"); // EEXIST → nextId+1 retry
+    // the placeholder is still there, unmodified, and reads as absent
+    expect(fs.statSync(path.join(dir, "active", "M001.md")).size).toBe(0);
+    expect(store.get("M001")).toBeUndefined();
+    expect(store.get("M002")?.title).toBe("T");
+    // the next create continues after the claimed max
+    expect((await store.create({ title: "U", summary: "s", content: "b", keywords: [] })).id).toBe("M003");
     tmp.leave();
   });
 });

@@ -34,38 +34,19 @@
         "pantry.txt": "flour\nsugar\nrice\nbeans\n"
       },
       "expectFile": "pantry.txt",
-      "expectLinesExact": [
-        "flour",
-        "sugar",
-        "rice",
-        "beans",
-        "salt",
-        "pepper",
-        "oil"
-      ]
+      "expectLinesExact": ["flour", "sugar", "rice", "beans", "salt", "pepper", "oil"]
     },
     {
       "id": "precision-format",
       "task": "Create a file version.txt whose entire content is exactly one line: version: 1.0.0",
       "expectFile": "version.txt",
-      "expectLinesExact": [
-        "version: 1.0.0"
-      ]
+      "expectLinesExact": ["version: 1.0.0"]
     },
     {
       "id": "ordered-domain-list",
       "task": "Create a file planets.txt listing the 8 planets of the solar system, one per line, ordered from closest to the sun to farthest, each name capitalized (e.g. Mercury).",
       "expectFile": "planets.txt",
-      "expectLinesExact": [
-        "Mercury",
-        "Venus",
-        "Earth",
-        "Mars",
-        "Jupiter",
-        "Saturn",
-        "Uranus",
-        "Neptune"
-      ]
+      "expectLinesExact": ["Mercury", "Venus", "Earth", "Mars", "Jupiter", "Saturn", "Uranus", "Neptune"]
     },
     {
       "id": "arith-transform",

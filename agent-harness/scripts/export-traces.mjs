@@ -38,11 +38,7 @@ try {
       if (eventsForRun.length === 0) continue;
       fs.mkdirSync(tracesDir, { recursive: true });
       const file = path.join(tracesDir, `${run.id}.jsonl`);
-      fs.writeFileSync(
-        file,
-        eventsForRun.map((e) => JSON.stringify(e)).join("\n") + "\n",
-        "utf8",
-      );
+      fs.writeFileSync(file, eventsForRun.map((e) => JSON.stringify(e)).join("\n") + "\n", "utf8");
       // 加固期复核: interrupted runs (status=running, no run_end) are EXPECTED
       // in a crash-recovery repo — the full bracket check would abort the
       // export on exactly the runs this tool exists to recover. Validate seq

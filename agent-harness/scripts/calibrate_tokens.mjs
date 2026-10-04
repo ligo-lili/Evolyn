@@ -101,7 +101,9 @@ function collectSamples(tracesDir) {
       const message = event.message;
       if (message.role === "assistant" && message.usage && message.stopReason !== "error") {
         const estimated = transcript.reduce((acc, m) => acc + estimateTokens(m), 0);
-        const actual = message.usage.totalTokens || message.usage.input + message.usage.output + message.usage.cacheRead + message.usage.cacheWrite;
+        const actual =
+          message.usage.totalTokens ||
+          message.usage.input + message.usage.output + message.usage.cacheRead + message.usage.cacheWrite;
         if (actual > 0 && estimated > 0) {
           samples.push({ runId, provider, modelId, family, estimated, actual, ratio: estimated / actual });
         }
@@ -155,7 +157,9 @@ function main() {
   }
   console.log(
     `calibration over ${samples.length} usable sample(s) from ${args.traces}` +
-      (excluded > 0 ? ` (${excluded} excluded: transcript < ${DOMINATED * 100}% of actual — dominated by missing system+tools)` : ""),
+      (excluded > 0
+        ? ` (${excluded} excluded: transcript < ${DOMINATED * 100}% of actual — dominated by missing system+tools)`
+        : ""),
   );
   console.log("ratio = baseline estimate (chars/4, coefficient 1) / actual usage");
   console.log("");

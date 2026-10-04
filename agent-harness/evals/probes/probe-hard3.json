@@ -1,39 +1,31 @@
 {
- "name": "probe-hard3",
- "tasks": [
-  {
-   "id": "repair",
-   "task": "The file probe-fix.txt has problems: it contains duplicate lines and the lines are not alphabetically sorted. Fix it: remove duplicates (keep each distinct item exactly once), sort the lines A to Z, and do not add or remove any distinct items.",
-   "setupFiles": {
-    "probe-fix.txt": "mango\napple\npear\napple\nkiwi\nbanana\norange\nlemon\n"
-   },
-   "expectFile": "probe-fix.txt",
-   "expectLinesExact": [
-    "apple",
-    "banana",
-    "kiwi",
-    "lemon",
-    "mango",
-    "orange",
-    "pear"
-   ]
-  },
-  {
-   "id": "compound",
-   "task": "Create a file probe-langs.txt with exactly 14 programming language names, one per line, in REVERSE alphabetical order (Z to A), no duplicates, and none of the names may contain the letter q (upper or lower case).",
-   "expectFile": "probe-langs.txt",
-   "expectLines": 14,
-   "expectSorted": "desc",
-   "expectUnique": true,
-   "expectLineRegex": "^[^Qq]*$"
-  },
-  {
-   "id": "count-30",
-   "task": "Create a file probe-trees30.txt with exactly 30 tree species names, one per line, alphabetically sorted (A to Z), no duplicates.",
-   "expectFile": "probe-trees30.txt",
-   "expectLines": 30,
-   "expectSorted": true,
-   "expectUnique": true
-  }
- ]
+  "name": "probe-hard3",
+  "tasks": [
+    {
+      "id": "repair",
+      "task": "The file probe-fix.txt has problems: it contains duplicate lines and the lines are not alphabetically sorted. Fix it: remove duplicates (keep each distinct item exactly once), sort the lines A to Z, and do not add or remove any distinct items.",
+      "setupFiles": {
+        "probe-fix.txt": "mango\napple\npear\napple\nkiwi\nbanana\norange\nlemon\n"
+      },
+      "expectFile": "probe-fix.txt",
+      "expectLinesExact": ["apple", "banana", "kiwi", "lemon", "mango", "orange", "pear"]
+    },
+    {
+      "id": "compound",
+      "task": "Create a file probe-langs.txt with exactly 14 programming language names, one per line, in REVERSE alphabetical order (Z to A), no duplicates, and none of the names may contain the letter q (upper or lower case).",
+      "expectFile": "probe-langs.txt",
+      "expectLines": 14,
+      "expectSorted": "desc",
+      "expectUnique": true,
+      "expectLineRegex": "^[^Qq]*$"
+    },
+    {
+      "id": "count-30",
+      "task": "Create a file probe-trees30.txt with exactly 30 tree species names, one per line, alphabetically sorted (A to Z), no duplicates.",
+      "expectFile": "probe-trees30.txt",
+      "expectLines": 30,
+      "expectSorted": true,
+      "expectUnique": true
+    }
+  ]
 }

@@ -10,7 +10,7 @@
 git clone https://github.com/ligo-lili/Evolyn
 cd Evolyn\agent-harness
 npm install
-npm test          # 219 个测试——全部无需 API key
+npm test          # 229 个测试——全部无需 API key
 npm run harness -- run "<task>" --model deepseek/deepseek-flash --tools coding --yolo
 ```
 
@@ -25,7 +25,7 @@ npm run harness -- run "<task>" --model deepseek/deepseek-flash --tools coding -
 - **失控护栏**——回合数、工具调用数、同参重复调用、成本预算、token 预算（对上报零成本的模型是可靠兜底）、工具级超时（超时不重试——第一次执行可能还在后台跑）；违规即把 run 降级为 `failed` 并附原因。
 - **可扩展的上下文**——上下文管理围绕块模型重建（system / conversation / tool-round / malformed 四类块；tool_call id 用 Counter 精确配对，不合法整轮降级保守保留），六条预算线（输入硬上界 → 64k 偏好工作集 → 0.80 软线 → 强制线 → 0.45 深压目标 → 工具结果独立小账本），校准的 token 估算（chars/4 × 模型族系数，`scripts/calibrate_tokens.mjs` 用真实 Trace 再校准），以及服务 prompt cache 的决策循环：每次模型调用产出一条 `prefix_decision`——reuse 纯续用 / defer 越软线但缓存前缀可复用继续追加 / compact 真压缩 / rebuild 前缀断裂深压到位。第一层确定性整理旧工具结果（头尾截断附 evidence 指针、最旧优先整轮移除、注册工具的语义 JSON 裁剪）；第二层把前缀折叠成严格 JSON 的滚动摘要（硬校验、"必须更小"闸门、带失败原因的唯一重试、大折叠放宽）。全部只改模型视图：转录与 trace 保持 append-only，每次决策作为 `context_decision` 事件落入 trace。
 - **只读子代理（上下文隔离）**——`explore` 工具（coding 工具集）派生一个完整的子 Agent：独立上下文窗口、受限只读工具集（read/grep/ls/find——无 shell、无递归）、自己更紧的限额与上下文管理。子代理的最终回答作为工具结果返回，中间的读取永不进入父对话。子代理是 (任务, 工作区) 的纯函数：父调用声明 `replay: "safe"`，崩溃在子代理中间 = 恢复时经普通恢复路径整体重跑——不做嵌套 checkpoint。子代理用量计入父 run 的成本/token 熔断，审计事件（`subagent_start/end`）落入 trace，完整转录落入 evidence 目录。
-- **经验记忆**（按 `memory-design.md` 实现）——双层：结构化 **Core Memory**（只能按 key upsert 单条，每条强制携带 `reason` + `source_statement` 证据，注入按 2000 token 预算裁剪）与**普通记忆**（一条一个 Markdown 文件，`M001…` 自增 id，乐观锁 `revision`，active/archive 且 active 硬顶 25 条，原子写，`INDEX.md` 投影）。写入过**三道闸**：确定性反思门控 → 严格 JSON `{action: none|create|update}` 反思器 → 授权写入（只允许更新本轮 `memory_read` 过全文的记忆——用机制而非提示词）。检索为 chunk 级 FTS（tokenizer 探测 trigram→unicode61）+ 本地 `e5` 向量，按 memory 为单位做 RRF 融合，降级链显式（每个结果带 `mode` + `degrade_reason`）；启动以 Markdown 为权威对账，embedding 后台有界退避补全（条件写防旧向量覆盖）。模型工具面：`memory_read / memory_search / memory_create / memory_update / memory_archive / core_memory_update`（coding 工具集默认带）。
+- **经验记忆**——双层：结构化 **Core Memory**（只能按 key upsert 单条，每条强制携带 `reason` + `source_statement` 证据，注入按 2000 token 预算裁剪）与**普通记忆**（一条一个 Markdown 文件，`M001…` 自增 id，乐观锁 `revision`，active/archive 且 active 硬顶 25 条，原子写，`history/` 版本快照最近 5 版 FIFO，`INDEX.md` 投影）。写入过**三道闸**：确定性反思门控 → 严格 JSON `{action: none|create|update}` 反思器 → 授权写入（只允许更新本轮 `memory_read` 过全文的记忆——用机制而非提示词）。检索为 chunk 级 FTS（tokenizer 探测 trigram→unicode61）+ 本地 `e5` 向量，按 memory 为单位做 RRF 融合 + accessCount 有界乘性提升，降级链显式（每个结果带 `mode` + `degrade_reason`）。**向量路在后台补全完成后生效**——没建过向量的 run 零模型开销，CLI 在退出前 drain 补全；`memory: { hybrid: false }` 可关。启动以 Markdown 为权威对账，embedding 后台有界退避补全（条件写防旧向量覆盖）。模型工具面：`memory_read / memory_search / memory_create / memory_update / memory_archive / core_memory_update`（coding 工具集默认带）。检索质量由 `npm run eval:memory` 在 CI 门控（recall@5 + 盲区检查，fixture 见 `evals/memory-retrieval.json`）。
 - **技能自进化**——从 trace 挖重复模式（support ≥ 3 硬门槛），蒸馏成 pi 兼容的 `SKILL.md`，用 Pi 自己的 loader 校验，作为 `<available_skills>` 注入后续 run——注入内容带溯源标记（"挖自本工作区自己的运行记录，当数据看"）并做结构标记转义，挖出来的内容永远无法冒充系统指令；`--force` 覆盖已有技能需要确认过 diff 才放行。
 - **评测框架**——确定性判分（coding 任务由仓库自己的测试裁决）、回归基线、Wilson 置信区间、门控评测的最小 repeats 下限、基础设施失败防线（被污染的报告标记 INVALID，进不了门控）。
 - **数据保留**——`harness prune` 清理已完成 run 的 checkpoint（恢复只读中断的 run）与超出保留窗口的 trace/evidence。

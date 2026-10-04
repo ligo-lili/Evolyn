@@ -64,7 +64,7 @@ export const TOOL_PERMISSIONS: Readonly<Record<string, ToolPermissions>> = {
   // read-only subagent (Phase 1): the child runs inside the tool call and can
   // only touch fs:read tools itself, so the parent call is readonly too.
   explore: { capabilities: ["fs:read"], risk: "readonly" },
-  // memory tool surface (memory-design.md §8): reads/searches are readonly;
+  // memory tool surface: reads/searches are readonly;
   // every mutation touches .harness/memory/*.md → fs:write mutating.
   memory_read: { capabilities: ["fs:read"], risk: "readonly" },
   memory_search: { capabilities: ["fs:read"], risk: "readonly" },

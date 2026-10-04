@@ -30,6 +30,8 @@ import { parseMemory, serializeMemory, isValidMemoryId, type MemoryRecord, type 
  */
 
 export const MAX_ACTIVE_MEMORIES = 25;
+/** 每条记忆保留的历史版本数（FIFO 淘汰）。 */
+export const MEMORY_HISTORY_KEEP = 5;
 export { MAX_MEMORY_FILE_BYTES } from "./atomic.js";
 
 /** 乐观锁冲突（设计 P6）：调用方据此降级或重读。 */
@@ -219,7 +221,15 @@ export class MemoryStore {
     return this.list("active").length;
   }
 
-  /** Full replacement create. Capacity: active 满 25 条拒绝（P4 / §6.5）。 */
+  /**
+   * Full replacement create. Capacity: active 满 25 条拒绝。
+   *
+   * id 认领跨进程原子化：写盘前先用 `fs.openSync(target, "wx")` 独占创建
+   * 占位文件——EEXIST 表示另一个进程已认领该 id，换下一个重试（上限 5 次）。
+   * 不引入跨进程锁：用原子创建原语把竞态变成重试循环。已知的自愈边界：
+   * 崩溃在认领与完整写入之间会留一个空占位文件——nextId 仍计数它、
+   * list/get 跳过它，下一个 create 认领下一个 id（操作员可手动删除）。
+   */
   async create(input: {
     title: string;
     summary: string;
@@ -231,9 +241,22 @@ export class MemoryStore {
     return this.guard.run(() => {
       const active = this.activeCount();
       if (active >= MAX_ACTIVE_MEMORIES) throw new MemoryCapacityError(MAX_ACTIVE_MEMORIES);
+      let claimed: string | undefined;
+      for (let attempt = 0; attempt < 5 && !claimed; attempt++) {
+        const candidate = this.nextId();
+        try {
+          fs.closeSync(fs.openSync(this.pathOf(candidate, "active"), "wx"));
+          claimed = candidate;
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+        }
+      }
+      if (!claimed) {
+        throw new HarnessError("could not claim a memory id after 5 attempts — active set is churning");
+      }
       const now = new Date().toISOString();
       const record: MemoryRecord = {
-        id: this.nextId(),
+        id: claimed,
         title: input.title.trim(),
         summary: input.summary.trim(),
         content: input.content.trim(),
@@ -246,15 +269,17 @@ export class MemoryStore {
         updated: now,
         accessCount: 0,
       };
-      writeFileAtomic(this.pathOf(record.id, "active"), serializeMemory(record));
+      writeFileAtomic(this.pathOf(record.id, "active"), serializeMemory(record)); // rename 覆盖占位文件
       this.rebuildIndex();
       return record;
     });
   }
 
   /**
-   * 完整替换 + 乐观锁校验（P6 update_if_revision）：revision 不符抛冲突，
+   * 完整替换 + 乐观锁校验（乐观锁 update_if_revision）：revision 不符抛冲突，
    * 永不盲目覆盖。归档条目不可更新（先恢复语义上不成立——调用方应重建）。
+   * 替换前把当前版本快照进 history/（保留最近 5 版 FIFO）——恢复语义就是
+   * 手拷历史文件，不做 restore 命令。
    */
   async updateIfRevision(
     id: string,
@@ -266,6 +291,7 @@ export class MemoryStore {
       if (!record) throw new MemoryNotFoundError(id);
       if (record.revision !== expectedRevision) throw new MemoryConflictError(id, expectedRevision);
       if (record.status !== "active") throw new HarnessError(`memory "${id}" is archived and cannot be updated`);
+      this.snapshotHistory(record);
       const next: MemoryRecord = {
         ...record,
         title: patch.title.trim(),
@@ -281,13 +307,14 @@ export class MemoryStore {
     });
   }
 
-  /** 归档必须基于最新快照（P6 archive_if_unchanged）。 */
+  /** 归档必须基于最新快照（archive_if_unchanged）；归档前同样留 history 快照。 */
   async archiveIfUnchanged(id: string, expectedRevision: number): Promise<MemoryRecord> {
     return this.guard.run(() => {
       const record = this.get(id);
       if (!record) throw new MemoryNotFoundError(id);
       if (record.status === "archive") return record;
       if (record.revision !== expectedRevision) throw new MemoryConflictError(id, expectedRevision);
+      this.snapshotHistory(record);
       const next: MemoryRecord = {
         ...record,
         status: "archive",
@@ -299,6 +326,59 @@ export class MemoryStore {
       this.rebuildIndex();
       return next;
     });
+  }
+
+  /**
+   * 完整替换前的版本快照：当前内容拷到 history/M###/rev{n}.md（原子写），
+   * 每条记忆只保留最近 MEMORY_HISTORY_KEEP 版（FIFO）。尽力而为——历史
+   * 写失败绝不阻断主写路径（降级而非失败）。
+   */
+  private snapshotHistory(record: MemoryRecord): void {
+    try {
+      writeFileAtomic(this.historyPath(record.id, record.revision), serializeMemory(record));
+    } catch (err) {
+      process.stderr.write(
+        `[memory] history snapshot failed for ${record.id}: ${err instanceof Error ? err.message : err}\n`,
+      );
+      return;
+    }
+    try {
+      const dir = path.join(this.dir, "history", record.id);
+      const revs = fs
+        .readdirSync(dir)
+        .map((f) => /^rev(\d+)\.md$/.exec(f))
+        .filter((m): m is RegExpExecArray => m !== null)
+        .map((m) => ({ n: Number(m[1]), file: m[0] }))
+        .sort((a, b) => a.n - b.n);
+      for (const stale of revs.slice(0, Math.max(0, revs.length - MEMORY_HISTORY_KEEP))) {
+        fs.rmSync(path.join(dir, stale.file), { force: true });
+      }
+    } catch {
+      // FIFO 淘汰是尽力而为；超限只是多占几个文件
+    }
+  }
+
+  /** history/M###/rev{n}.md 的路径（public：CLI `memory history` 展示用）。 */
+  historyPath(id: string, revision: number): string {
+    if (!isValidMemoryId(id)) throw new HarnessError(`invalid memory id: ${id}`);
+    return path.join(this.dir, "history", id, `rev${revision}.md`);
+  }
+
+  /** 某条记忆的历史版本（revision 降序）；parseMemory 已校验完整性。 */
+  history(id: string): MemoryRecord[] {
+    if (!isValidMemoryId(id)) return [];
+    let files: string[];
+    try {
+      files = fs.readdirSync(path.join(this.dir, "history", id)).filter((f) => f.endsWith(".md"));
+    } catch {
+      return [];
+    }
+    const records: MemoryRecord[] = [];
+    for (const f of files) {
+      const record = this.readAt(path.join(this.dir, "history", id, f));
+      if (record) records.push(record);
+    }
+    return records.sort((a, b) => b.revision - a.revision);
   }
 
   /** 显式读取的副作用（§8）：计入 access_count / last_accessed_at。 */

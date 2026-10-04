@@ -7,7 +7,7 @@ import { MemorySearchIndex } from "./search.js";
 import type { AnyAgentTool } from "../runtime/tools/index.js";
 
 /**
- * 模型工具面（memory-design.md §8）——信任分层在工具层的落实：
+ * 模型工具面——信任分层在工具层的落实：
  *
  *   memory_read     显式读取：返回完整正文，计入 access_count，并把 id 记入
  *                   本 run 的授权白名单（读过的 id 才可被 update / 反思 update）。

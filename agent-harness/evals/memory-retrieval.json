@@ -1,0 +1,110 @@
+{
+  "name": "memory-retrieval-v1",
+  "description": "Retrieval quality fixture for the memory search index: 12 bilingual ordinary memories + 16 queries with expected id sets. FTS mode runs offline in CI behind a recall@5 gate (default 0.7) and a blind-spot check (every query must surface at least one expected id in the top-5 — a load-bearing keyword going missing turns the gate red). The --hybrid variant needs the local embedding model and writes to the .harness/evals ledger instead of gating CI. Chinese queries quote the FULL contiguous CJK run from the memory text so both the trigram and unicode61 tokenizers match them.",
+  "memories": [
+    {
+      "id": "M001",
+      "title": "csv dedupe before merge",
+      "summary": "整理季度报告前先去重。",
+      "content": "dedupe csv rows before merging quarterly reports; never merge blind.\n\n整理季度报告前先去重，绝不盲并。",
+      "keywords": ["csv", "dedupe", "reports"]
+    },
+    {
+      "id": "M002",
+      "title": "deploy notification to ops",
+      "summary": "每次发布后通知运维。",
+      "content": "send the deployment notification to the ops channel after every release.\n\n每次发布后向运维频道发送部署通知。",
+      "keywords": ["deploy", "notification", "ops"]
+    },
+    {
+      "id": "M003",
+      "title": "virtualenv before pip install",
+      "summary": "装依赖前先建虚拟环境。",
+      "content": "always create a virtualenv before pip install; freeze the resolved versions into requirements.txt.\n\n装依赖前先建虚拟环境，冻结版本。",
+      "keywords": ["virtualenv", "pip", "python"]
+    },
+    {
+      "id": "M004",
+      "title": "powershell UTF8 output encoding",
+      "summary": "脚本必须设置 UTF8 输出编码。",
+      "content": "powershell scripts must set UTF8 output encoding, otherwise Chinese output garbles.\n\nPowerShell 脚本必须设置 UTF8 输出编码，否则中文乱码。",
+      "keywords": ["powershell", "encoding", "utf8"]
+    },
+    {
+      "id": "M005",
+      "title": "rebase feature branches",
+      "summary": "特性分支优先变基。",
+      "content": "prefer git rebase over merge for feature branches; never force push the main branch.\n\n特性分支优先变基，绝不强推主干。",
+      "keywords": ["git", "rebase", "branch"]
+    },
+    {
+      "id": "M006",
+      "title": "enable WAL journal mode",
+      "summary": "SQLite 开启 WAL 模式。",
+      "content": "enable WAL journal mode for the embedded sqlite database so a hard process kill never corrupts it.\n\n内嵌数据库开启 WAL 模式，硬杀进程也不会损坏。",
+      "keywords": ["sqlite", "wal", "journal"]
+    },
+    {
+      "id": "M007",
+      "title": "failing test first",
+      "summary": "先写失败的测试再修代码。",
+      "content": "write the failing test first, then change the code until the suite passes.\n\n先写一个失败的测试，再改代码直到通过。",
+      "keywords": ["test", "failing", "first"]
+    },
+    {
+      "id": "M008",
+      "title": "truncate tool output with evidence pointer",
+      "summary": "截断工具输出并保留证据指针。",
+      "content": "truncate long tool output head and tail, and keep an evidence pointer so the full text stays recoverable.\n\n超长工具输出头尾截断，保留证据指针以便回查全文。",
+      "keywords": ["truncate", "evidence", "output"]
+    },
+    {
+      "id": "M009",
+      "title": "docker compose volumes are destructive",
+      "summary": "清理卷之前必须确认。",
+      "content": "docker compose down with -v wipes the volumes; always confirm before running it.\n\ncompose 清理会连同卷一起删除，运行前必须确认。",
+      "keywords": ["docker", "compose", "volumes"]
+    },
+    {
+      "id": "M010",
+      "title": "excel serial dates via openpyxl",
+      "summary": "excel 日期是序列号需转换。",
+      "content": "import excel with openpyxl; dates arrive as serial numbers, convert them on read.\n\n用 openpyxl 导入 excel，日期是序列号，读取时需要转换。",
+      "keywords": ["openpyxl", "excel", "dates"]
+    },
+    {
+      "id": "M011",
+      "title": "cursor pagination on list apis",
+      "summary": "列表接口按游标翻页。",
+      "content": "the list api paginates at 100 items per page; follow the cursor until it comes back empty.\n\n列表接口每页 100 条，跟游标翻页直到为空。",
+      "keywords": ["cursor", "pagination", "api"]
+    },
+    {
+      "id": "M012",
+      "title": "back up before forward-only migrations",
+      "summary": "迁移前先备份数据库。",
+      "content": "back up the database file before running forward-only migrations; there is no rollback path.\n\n迁移前先备份数据库，正向迁移没有回滚路径。",
+      "keywords": ["backup", "migration", "database"]
+    }
+  ],
+  "queries": [
+    { "query": "dedupe csv rows", "expected": ["M001"] },
+    { "query": "整理季度报告前先去重", "expected": ["M001"] },
+    { "query": "deployment notification ops", "expected": ["M002"] },
+    { "query": "每次发布后向运维频道发送部署通知", "expected": ["M002"] },
+    { "query": "virtualenv pip install", "expected": ["M003"] },
+    { "query": "powershell UTF8 encoding", "expected": ["M004"] },
+    { "query": "git rebase force push", "expected": ["M005"] },
+    { "query": "wal journal hard kill", "expected": ["M006"] },
+    { "query": "failing test first", "expected": ["M007"] },
+    { "query": "truncate output evidence pointer", "expected": ["M008"] },
+    { "query": "docker compose volumes", "expected": ["M009"] },
+    { "query": "openpyxl excel serial dates", "expected": ["M010"] },
+    { "query": "cursor pagination list", "expected": ["M011"] },
+    { "query": "backup before migrations", "expected": ["M012"] },
+    { "query": "迁移前先备份数据库", "expected": ["M012"] },
+    { "query": "csv quarterly reports merging", "expected": ["M001"] },
+    { "query": "openpyxl", "expected": ["M010"] },
+    { "query": "virtualenv", "expected": ["M003"] }
+  ]
+}

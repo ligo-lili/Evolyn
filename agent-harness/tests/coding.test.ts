@@ -115,9 +115,9 @@ describe("coding toolset (阶段 13)", () => {
     // The default shell tool is platform-selected (powershell on win32, bash
     // elsewhere — see createCodingToolset); assert the actual one.
     const shellTool = process.platform === "win32" ? "powershell" : "bash";
-    expect(
-      captured.some((c) => c.includes(`"${shellTool}"`) && c.includes('"read"') && c.includes('"edit"')),
-    ).toBe(true);
+    expect(captured.some((c) => c.includes(`"${shellTool}"`) && c.includes('"read"') && c.includes('"edit"'))).toBe(
+      true,
+    );
     expect(result.record.systemPrompt).toContain("durable coding agent");
     expect(result.record.systemPrompt).toContain("<workspace>");
     expect(result.record.systemPrompt).toContain("app.ts");

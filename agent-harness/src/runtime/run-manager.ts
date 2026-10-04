@@ -29,6 +29,7 @@ import { composeRuntime, sumAgentUsage } from "./compose.js";
 import { MemorySearchIndex } from "../memory/search.js";
 import { MemoryStore } from "../memory/store.js";
 import { createMemoryTools } from "../memory/tools.js";
+import { EMBEDDING_MODEL_ID, sharedEmbedder, type PassageEmbedder } from "../memory/embedding.js";
 import { TraceRecorder, JsonlTraceSink, type TraceSink } from "../trace/recorder.js";
 import { reconcileJsonlTrace } from "../trace/reconcile.js";
 import { FaultController, formatFaultSpec, parseFaultSpec } from "../execution/fault.js";
@@ -133,13 +134,16 @@ export interface RunOptions {
    */
   context?: Omit<ContextManagementOptions, "model" | "onEvent" | "historyCount" | "evidenceBase">;
   /**
-   * Ordinary-memory recall + tool surface (memory-design.md §8). Default: 5
-   * cue hits injected at run start (snapshot, no side effects). `tools` adds
-   * the model tool surface (memory_read/search/create/update/archive +
-   * core_memory_update) — default true for the coding toolset, opt-in
-   * otherwise; memory_read arms the run's update whitelist.
+   * Ordinary-memory recall + tool surface (记忆设计 v3：召回是 cue、显式读取
+   * 才授权更新). Default: 5 cue hits injected at run start (snapshot, no side
+   * effects). `tools` adds the model tool surface (memory_read/search/create/
+   * update/archive + core_memory_update) — default true for the coding
+   * toolset, opt-in otherwise. `hybrid` (default true) enables the vector
+   * retrieval path; `embedder` injects a fake for tests — the production
+   * default is the process-wide sharedEmbedder, zero-cost until vectors
+   * actually exist (vectorCount() === 0 never touches the model).
    */
-  memory?: { limit?: number; tools?: boolean };
+  memory?: { limit?: number; tools?: boolean; hybrid?: boolean; embedder?: PassageEmbedder };
   /**
    * 阶段 10 skill injection for <available_skills>. Default: FTS top-2 from
    * the promoted skill index when a database is attached; `false` disables
@@ -169,8 +173,8 @@ export interface ResumeOptions {
   limits?: RunLimits;
   /** Tiered retry policy for the resumed run. */
   retry?: RetryPolicy;
-  /** Memory tool surface for the resumed segment (same default as run). */
-  memory?: { tools?: boolean };
+  /** Memory tool surface + hybrid flag for the resumed segment (same default as run). */
+  memory?: { tools?: boolean; hybrid?: boolean; embedder?: PassageEmbedder };
   /**
    * 加固期 (P2): fault injection for the RECOVERY segment — e.g.
    * "mid_recovery:1" kills with one call already resolved, "between_sinks"
@@ -194,6 +198,8 @@ function lastAssistant(messages: readonly AgentMessage[]): AssistantMessage | un
 export class RunManager {
   private readonly runs = new Map<string, RunRecord>();
   private db?: DatabaseSync;
+  /** 在途的记忆向量补全（fire-and-forget）；CLI 在退出前 drain。 */
+  private memoryBackfill?: Promise<void>;
 
   private ensureDatabase(spec: string | false | undefined): DatabaseSync | undefined {
     if (spec === false) return undefined;
@@ -220,17 +226,20 @@ export class RunManager {
     const database = this.ensureDatabase(options.database);
     const runRepo = database ? new RunRepo(database) : undefined;
 
-    // Memory (memory-design.md §8/§9): Core 常驻注入；自动召回每 Run 一次、
-    // 是 cue 快照（id/title/revision/summary/snippet）——无副作用、不授权更新。
-    // 启动对账以 Markdown 为权威同步文本投影（关键路径不做 embedding）。
-    // 权威目录与 reflect/CLI 同源：自定义 database 时用其所在目录下的 memory/，
-    // 默认（或 database:false）回落 .harness/memory。
+    // Memory（记忆设计 v3）：Core 常驻注入；自动召回每 Run 一次、是 cue
+    // 快照（id/title/revision/summary/snippet）——无副作用、不授权更新。
+    // 启动对账以 Markdown 为权威同步文本投影（关键路径不做 embedding——
+    // 向量路在 vectorCount() === 0 时零成本直返，建过向量才付一次 query
+    // embedding）。权威目录与 reflect/CLI 同源：自定义 database 时用其所在
+    // 目录下的 memory/，默认（或 database:false）回落 .harness/memory。
     const memoryDir =
       typeof options.database === "string"
         ? path.join(path.dirname(options.database), "memory")
         : path.join(harnessDataDir(process.cwd()), "memory");
     const memoryStore = new MemoryStore(memoryDir);
     const core = memoryStore.readCore();
+    const memoryHybrid = options.memory?.hybrid ?? true;
+    const memoryEmbedder = memoryHybrid ? (options.memory?.embedder ?? sharedEmbedder()) : undefined;
     let memoryIndex: MemorySearchIndex | undefined;
     let experienceBlock: string | undefined;
     if (database) {
@@ -238,6 +247,7 @@ export class RunManager {
       memoryIndex.reconcile(memoryStore);
       const hits = await memoryIndex.search(memoryStore, options.task.slice(0, 1600), {
         limit: options.memory?.limit ?? 5,
+        embedder: memoryEmbedder,
       });
       if (hits.length > 0) {
         experienceBlock = renderExperienceBlock(
@@ -252,14 +262,19 @@ export class RunManager {
         );
       }
     }
-    // Memory tool surface (§8): coding runs get it by default; explicit opt-in
-    // via memory.tools for any toolset. Created BEFORE composeRuntime so the
-    // tools go through the SAME wrapper chain (evidence capture / timeout /
-    // retry) — a memory_read result trimmed by compaction must have a real
-    // evidence file behind its pointer.
+    // Memory tool surface: coding runs get it by default; explicit opt-in via
+    // memory.tools for any toolset. Created BEFORE composeRuntime so the tools
+    // go through the SAME wrapper chain (evidence capture / timeout / retry) —
+    // a memory_read result trimmed by compaction must have a real evidence
+    // file behind its pointer.
     const memoryTools =
       memoryIndex && (options.memory?.tools ?? options.tools === "coding")
-        ? createMemoryTools({ store: memoryStore, index: memoryIndex, runId: record.id })
+        ? createMemoryTools({
+            store: memoryStore,
+            index: memoryIndex,
+            runId: record.id,
+            embedder: memoryEmbedder ? () => memoryEmbedder : undefined,
+          })
         : [];
     // 阶段 10 skill injection: promoted skills enter as <available_skills> —
     // the model reads the SKILL.md body on demand, mirroring pi's mechanism.
@@ -418,6 +433,9 @@ export class RunManager {
         // must not mask that. Surface loudly, decide policy in 加固 (阶段 14).
         process.stderr.write(`[harness] failed to persist run status: ${err instanceof Error ? err.message : err}\n`);
       }
+      // 向量补全触发点：run 结束后 fire-and-forget（宿主经 drainMemoryBackfill
+      // 决定是否等待——CLI 在 reflect 之后 drain，长驻宿主可以不理会）。
+      this.beginMemoryBackfill(memoryStore, memoryIndex, memoryEmbedder);
     }
 
     return { record, messages, usage: sumAgentUsage(messages), tracePath: traceFile };
@@ -520,7 +538,7 @@ export class RunManager {
             summaryChat: options.context?.summaryChat,
           }
         : undefined;
-    // Memory tool surface for the resumed segment (§8) — same default as run(),
+    // Memory tool surface for the resumed segment — same default as run(),
     // same authoritative dir convention (dirname(database)/memory), and resume
     // is a startup too: reconcile before anything resolves tools. Tools are
     // created BEFORE loadCrashedRun/composeRuntime so an interrupted memory_read
@@ -530,11 +548,18 @@ export class RunManager {
         ? path.join(path.dirname(options.database), "memory")
         : path.join(path.dirname(defaultDbPath()), "memory");
     const memoryStore = new MemoryStore(memoryDir);
+    const memoryEmbedder =
+      (options.memory?.hybrid ?? true) ? (options.memory?.embedder ?? sharedEmbedder()) : undefined;
     const memoryIndex = new MemorySearchIndex(database);
     memoryIndex.reconcile(memoryStore);
     const memoryTools =
       (options.memory?.tools ?? toolsetSpec === "coding")
-        ? createMemoryTools({ store: memoryStore, index: memoryIndex, runId })
+        ? createMemoryTools({
+            store: memoryStore,
+            index: memoryIndex,
+            runId,
+            embedder: memoryEmbedder ? () => memoryEmbedder : undefined,
+          })
         : [];
     const resolvedTools = resolveTools(toolsetSpec, exploreDeps);
     const crashed = loadCrashedRun(database, runId, [...resolvedTools, ...memoryTools]);
@@ -766,9 +791,38 @@ export class RunManager {
           `[harness] failed to persist resumed run status: ${err instanceof Error ? err.message : err}\n`,
         );
       }
+      this.beginMemoryBackfill(memoryStore, memoryIndex, memoryEmbedder);
     }
 
     return { record, messages, usage: sumAgentUsage(messages), tracePath: traceFile };
+  }
+
+  /**
+   * Run 结束后的记忆向量补全触发点：有 pending 且尚未在跑时才启动，
+   * fire-and-forget——补全自身带有限退避并把失败写进 search_meta/stderr。
+   * 没有检索 index、hybrid 关闭、或全部向量都已就绪时是零成本 no-op。
+   */
+  private beginMemoryBackfill(
+    store: MemoryStore,
+    index: MemorySearchIndex | undefined,
+    embedder: PassageEmbedder | undefined,
+  ): void {
+    if (this.memoryBackfill || !index || !embedder) return;
+    if (index.backfillPending(EMBEDDING_MODEL_ID) === 0) return;
+    const handle = index.startBackfill(store, embedder, EMBEDDING_MODEL_ID);
+    this.memoryBackfill = handle.promise;
+  }
+
+  /**
+   * 等待在途的记忆向量补全（没有则立即返回）。短生命周期宿主（CLI）在
+   * reflect 之后调用，让补全在进程退出前完成；返回是否真的等待了一次。
+   */
+  async drainMemoryBackfill(): Promise<boolean> {
+    const task = this.memoryBackfill;
+    if (!task) return false;
+    this.memoryBackfill = undefined;
+    await task.catch(() => undefined); // 失败已进 search_meta / stderr
+    return true;
   }
 
   close(): void {

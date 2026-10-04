@@ -10,8 +10,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Linux runs the WAL / SIGKILL / path semantics for the first time —
-        # findings feed the hardening punch list (PLAN.md §33).
+        # Linux exercises the WAL / SIGKILL / path semantics for the first
+        # time; findings feed the hardening punch list.
         os: [windows-latest, ubuntu-latest]
         node: [22, 24]
     runs-on: ${{ matrix.os }}

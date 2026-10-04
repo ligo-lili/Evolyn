@@ -1,3 +1,8 @@
-# workspace-local tooling and design docs — never commit
-.zcodeignore
-memory-design.md
+# OS / editor junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# local environment files
+.env
+.env.*

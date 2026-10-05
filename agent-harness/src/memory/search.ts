@@ -494,9 +494,10 @@ export class MemorySearchIndex {
         : (memoryFts.length > 0 ? memoryFts : vectorRanking).map((r) => ({ id: r.id, score: 1 / (RRF_K + r.rank) }));
 
     // 有界乘性提升：accessCount 高的记忆在融合分之上获得 log 阻尼、硬封顶
-    // （≤ +45%）的加成。accessCount 是 query 无关量——做成 RRF 第三路会
-    // 系统性偏向热门记忆（富者愈富）；乘性有界只重排边缘、不固化榜单。
-    // 权威回填同时在这里完成：陈旧索引行（已不在 active 集合）直接剔除。
+    // （封顶 1 + 0.15×2 = 1.30，即 ≤ +30%）的加成。accessCount 是 query 无关
+    // 量——做成 RRF 第三路会系统性偏向热门记忆（富者愈富）；乘性有界只重排
+    // 边缘、不固化榜单。权威回填同时在这里完成：陈旧索引行（已不在 active
+    // 集合）直接剔除。
     const boosted: Array<{ id: string; score: number; boost: number }> = [];
     for (const fused of fusedScores) {
       const record = store.get(fused.id);

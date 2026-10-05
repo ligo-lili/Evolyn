@@ -8,6 +8,10 @@
  *     (b) NO blind spots: every query must surface ≥1 expected id in the top-5
  *   A load-bearing keyword going missing turns (b) red immediately; broad
  *   degradation trips (a).
+ * - precision@5 (plus the out-of-expected hit count, "noise") is REPORTED per
+ *   query and in aggregate but NOT gated: FTS OR semantics naturally pull
+ *   distractors, and the noise numbers are ledger data for future fixture /
+ *   distractor tuning ("low scores are data").
  * - --hybrid: adds the vector path (local embedding model, ~30MB first
  *   download) — not for CI; results go to the .harness/evals ledger.
  *
@@ -83,6 +87,9 @@ for (const q of fixture.queries) {
   const hitSet = new Set(retrieved.slice(0, limit));
   const relevantInTop = expected.filter((id) => hitSet.has(id)).length;
   const recall = expected.length > 0 ? relevantInTop / expected.length : 1;
+  // precision@5：top-5 里期望集内的占比；noise = 期望集外的命中数。
+  const precision = retrieved.length > 0 ? relevantInTop / retrieved.length : 0;
+  const noise = retrieved.length - relevantInTop;
   const firstRank = retrieved.findIndex((id) => expected.includes(id));
   const mrr = firstRank === -1 ? 0 : 1 / (firstRank + 1);
   perQuery.push({
@@ -90,6 +97,8 @@ for (const q of fixture.queries) {
     expected,
     retrieved,
     recall,
+    precisionAt5: precision,
+    noise,
     reciprocalRank: mrr,
     mode: hits[0]?.mode ?? "unavailable",
     degradeReason: hits[0]?.degradeReason,
@@ -101,17 +110,19 @@ fs.rmSync(ws, { recursive: true, force: true });
 // ---- metrics + gates --------------------------------------------------------
 const mean = (xs) => xs.reduce((a, b) => a + b, 0) / Math.max(xs.length, 1);
 const recallAt5 = mean(perQuery.map((r) => r.recall));
+const precisionAt5 = mean(perQuery.map((r) => r.precisionAt5));
+const noiseTotal = perQuery.reduce((a, r) => a + r.noise, 0);
 const mrr = mean(perQuery.map((r) => r.reciprocalRank));
 const blindSpots = perQuery.filter((r) => r.reciprocalRank === 0);
 
 console.log(`eval:memory — fixture=${path.basename(fixturePath)} mode=${hybrid ? "hybrid" : "fts"}`);
 console.log(
-  `recall@${limit}: ${recallAt5.toFixed(3)} (gate ≥ ${minRecall}) | MRR: ${mrr.toFixed(3)} | blind spots: ${blindSpots.length}/${perQuery.length}`,
+  `recall@${limit}: ${recallAt5.toFixed(3)} (gate ≥ ${minRecall}) | precision@${limit}: ${precisionAt5.toFixed(3)} (report-only) | noise: ${noiseTotal} | MRR: ${mrr.toFixed(3)} | blind spots: ${blindSpots.length}/${perQuery.length}`,
 );
 for (const r of perQuery) {
   const mark = r.reciprocalRank === 0 ? "MISS" : r.recall < 1 ? "part" : "ok  ";
   console.log(
-    `  [${mark}] recall=${r.recall.toFixed(2)} rr=${r.reciprocalRank.toFixed(2)} ${JSON.stringify(r.query)} → ${r.retrieved.join(",") || "(none)"} (want ${r.expected.join(",")})`,
+    `  [${mark}] recall=${r.recall.toFixed(2)} p@${limit}=${r.precisionAt5.toFixed(2)} noise=${r.noise} rr=${r.reciprocalRank.toFixed(2)} ${JSON.stringify(r.query)} → ${r.retrieved.join(",") || "(none)"} (want ${r.expected.join(",")})`,
   );
 }
 
@@ -138,7 +149,7 @@ const report = {
     minRecall,
   },
   protocolSha256: protocolSha,
-  metrics: { recallAt5, mrr, blindSpots: blindSpots.length },
+  metrics: { recallAt5, precisionAt5, noiseTotal, mrr, blindSpots: blindSpots.length },
   gates: { minRecall: recallAt5 >= minRecall, noBlindSpots: blindSpots.length === 0 },
   queries: perQuery,
   verdict,

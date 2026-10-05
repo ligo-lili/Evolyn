@@ -1,0 +1,4 @@
+{
+  "description": "rule (4): forbid post-write confirmation rounds",
+  "target": "system_prompt"
+}

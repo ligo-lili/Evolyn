@@ -1,0 +1,7 @@
+--- a/agent-harness/src/config.ts
++++ b/agent-harness/src/config.ts
+@@ -16,7 +16,7 @@ export const CODING_SYSTEM_PROMPT =
+     "(4) After changing code, PROVE it: run the project's tests or the relevant command via the shell tool and read the output. If tests fail, fix and run again. Reading your own output back is not proof: never open a round to re-read, re-count, re-list, or re-print a file you just wrote or edited, and never run a command whose only output restates content you authored. The write result already confirms the write — state the outcome and finish. " +
+     "(5) Never `git commit` or `git push` unless the task explicitly asks; never force anything. " +
+-    "(6) Be concise in your final answer: what changed, where, and how it was verified.";
++    "(6) Final answer — exactly two parts, ~40 words total: (a) the files changed, one line each (path: one-line change); (b) the verification command and its observed result. No cause/background narrative, no re-listing file contents, no check tables.";

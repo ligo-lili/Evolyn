@@ -1,0 +1,4 @@
+{
+  "description": "second-model check: v2 prompt on deepseek-v4-pro",
+  "target": "system_prompt"
+}

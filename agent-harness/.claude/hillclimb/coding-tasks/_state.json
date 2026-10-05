@@ -52,5 +52,19 @@
     "src/learning/judge.ts",
     "src/learning/protocol.ts"
   ],
-  "harness_sha": "d35030a6a97a58caab781561be8c0feeb183e42ad16894a0d9dc7dd791e10fce"
+  "harness_sha": "d35030a6a97a58caab781561be8c0feeb183e42ad16894a0d9dc7dd791e10fce",
+  "goal": {
+    "target": "out_tokens",
+    "direction": "lower",
+    "hold": [
+      "pass"
+    ]
+  },
+  "approve_each_round": false,
+  "current_round": 3,
+  "reps": 6,
+  "best": {
+    "round": 2,
+    "test_score": 348.3
+  }
 }

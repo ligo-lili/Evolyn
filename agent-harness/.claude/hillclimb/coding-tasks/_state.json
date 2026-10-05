@@ -52,5 +52,5 @@
     "src/learning/judge.ts",
     "src/learning/protocol.ts"
   ],
-  "harness_sha": "c80e884211a64a6f9457ca2ee86d13da619cb0f567367034898666408726e3bd"
+  "harness_sha": "d35030a6a97a58caab781561be8c0feeb183e42ad16894a0d9dc7dd791e10fce"
 }

@@ -587,6 +587,30 @@ describe("P1-2 trace reconciliation (阶段 13)", () => {
     expect(fs.readFileSync(file, "utf8").trim().split("\n")).toHaveLength(2);
     tmp.leave();
   });
+
+  it("加固期第二轮: a lone seq-1 event (first-event kill window) is cleared, not refused", () => {
+    tmp.enter();
+    const file = path.join(tmp.dir, "recon-first-event", "trace.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const first = {
+      v: 1,
+      seq: 1,
+      ts: new Date().toISOString(),
+      runId: "r1",
+      type: "run_start",
+      task: "t",
+      modelSpec: "m",
+    };
+    fs.writeFileSync(file, JSON.stringify(first) + "\n", "utf8");
+    // The process died between run_start's JSONL append and its SQLite insert:
+    // nothing can have executed, the resume restarts the task under the same
+    // run id and re-emits an equivalent run_start — the remnant is a duplicate,
+    // so clearing is the documented path (the ≥2-event shape above still refuses).
+    const result = reconcileJsonlTrace(file, [] as never);
+    expect(result).toEqual({ truncated: 1, rebuilt: false, backfilled: 0 });
+    expect(fs.readFileSync(file, "utf8")).toBe("");
+    tmp.leave();
+  });
 });
 
 // ---------- trace summary --json ----------
@@ -1286,6 +1310,51 @@ describe("加固期: tool path fence", () => {
     }
     await fenced[0]!.execute("t2", { path: "." }); // the root itself is inside, not an escape
     expect(calls).toEqual(["."]);
+    tmp.leave();
+  });
+
+  it("加固期第二轮: structured writers cannot target the harness state dir — readers and shell-class tools are unaffected", async () => {
+    tmp.enter();
+    const root = path.join(tmp.dir, "state-fence");
+    fs.mkdirSync(path.join(root, ".harness", "memory", "active"), { recursive: true });
+    fs.writeFileSync(path.join(root, ".harness", "memory", "INDEX.md"), "index", "utf8");
+    const calls: string[] = [];
+    const probe = (name: string) =>
+      ({
+        name,
+        label: name,
+        description: "probe",
+        parameters: {} as never,
+        replay: "safe" as const,
+        execute: async (_id: string, params: { path: string }) => {
+          calls.push(`${name}:${params.path}`);
+          return { content: [{ type: "text", text: "ok" }], details: undefined };
+        },
+      }) as never;
+    const fenced = withPathFence([probe("write_file"), probe("read_file"), probe("exec")], root);
+    // fs:write without process:exec — the harness state dir (memory store,
+    // traces, ledger) is write-protected: a plain write tool must not bypass
+    // the store's locks, history snapshots and INDEX projection.
+    await expect(fenced[0]!.execute("t1", { path: ".harness/memory/active/M001.md" })).rejects.toThrow(
+      /harness state directory/,
+    );
+    // a junction alias into .harness cannot dodge the realpath-based check
+    fs.symlinkSync(path.join(root, ".harness"), path.join(root, "alias"), "junction");
+    await expect(fenced[0]!.execute("t2", { path: "alias/memory/INDEX.md" })).rejects.toThrow(
+      /harness state directory/,
+    );
+    // normal workspace writes, and paths that normalize out of the prefix, stay allowed
+    await fenced[0]!.execute("t3", { path: "src/app.ts" });
+    await fenced[0]!.execute("t4", { path: ".harness/../note.txt" });
+    // readers (fs:read) and shell-class tools (process:exec, documented non-goal) are unaffected
+    await fenced[1]!.execute("t5", { path: ".harness/memory/INDEX.md" });
+    await fenced[2]!.execute("t6", { path: ".harness" });
+    expect(calls).toEqual([
+      "write_file:src/app.ts",
+      "write_file:.harness/../note.txt",
+      "read_file:.harness/memory/INDEX.md",
+      "exec:.harness",
+    ]);
     tmp.leave();
   });
 

@@ -30,6 +30,9 @@ import type { TraceEvent } from "./schema.js";
  * parseable event still reaches the backfill. And when SQLite is empty while
  * the JSONL holds complete events, reconcile refuses outright — the ledger
  * may be partially lost and truncating would destroy the only audit copy.
+ * 加固期第二轮: the lone-seq-1 shape (the first-event kill window, where the
+ * resume restarts the task and re-emits an equivalent run_start) is exempt —
+ * cleared like any other tail remnant instead of refusing.
  */
 
 export interface ReconcileResult {
@@ -75,17 +78,22 @@ export function reconcileJsonlTrace(
     }
   }
 
-  // SQLite empty + JSONL holding complete events = the ledger was partially
-  // lost (the runs row survived, trace_events did not). Refuse: reconciling
-  // here would irreversibly destroy the only audit copy before recovery even
-  // starts. (A lone unparseable line with SQLite empty is the
-  // crash-before-first-sink case — nothing parseable to lose, truncation below.)
+  // SQLite holds nothing for this run: either the process died between the
+  // FIRST event's JSONL append and its SQLite insert — a lone seq-1 event (the
+  // benign first-event window; nothing was ever executed, and the resume
+  // restarts the task, re-emitting an equivalent run_start) — or the SQLite
+  // ledger was partially lost while the JSONL kept real history. Only the
+  // first shape may be cleared; with two or more events the JSONL is the sole
+  // surviving copy — refuse and let a human repair the ledger.
   if (sqliteEvents.length === 0 && events.length > 0) {
-    throw new HarnessError(
-      `refusing to reconcile ${jsonlPath}: SQLite holds no events for this run but the JSONL has ` +
-        `${events.length} complete event(s) — the ledger may be partially lost; recover it manually before resuming ` +
-        `(if you are certain this was a crash before the first event reached SQLite, clearing the JSONL by hand unblocks the resume)`,
-    );
+    const benignFirstWindow = events.length === 1 && events[0]?.seq === 1;
+    if (!benignFirstWindow) {
+      throw new HarnessError(
+        `refusing to reconcile ${jsonlPath}: SQLite holds no events for this run but the JSONL holds ` +
+          `${events.length} complete event(s) — the ledger may be partially lost; back up the JSONL and repair ` +
+          `the database by hand before resuming`,
+      );
+    }
   }
 
   // Mid-log holes: JSONL events below SQLite's max that SQLite lacks — the

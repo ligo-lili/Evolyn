@@ -22,8 +22,10 @@ export interface CheckpointState {
  *
  * Ordering invariant: the dispatcher calls this AFTER the trace recorder, so a
  * checkpoint never claims state the log doesn't yet contain — the checkpoint
- * always lags the log, and recovery reconciles by replaying trace events past
- * the checkpoint (the safe direction, like a WAL).
+ * always lags the log (the safe direction, like a WAL). 加固期第二轮: recovery
+ * replays the log in full and CROSS-CHECKS this checkpoint for contradictions
+ * (message count, seq horizon, pending tool calls) — disagreements surface as
+ * degradation warnings, never silent repair.
  */
 export class CheckpointWriter {
   private messages: number;

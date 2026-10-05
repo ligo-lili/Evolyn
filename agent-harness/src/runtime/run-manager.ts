@@ -583,6 +583,9 @@ export class RunManager {
         : [];
     const resolvedTools = resolveTools(toolsetSpec, exploreDeps);
     const crashed = loadCrashedRun(database, runId, [...resolvedTools, ...memoryTools]);
+    // 加固期第二轮: durable-record contradictions (checkpoint vs trace) and the
+    // empty-ledger restart are surfaced loudly — never silently repaired.
+    for (const note of crashed.degradations) process.stderr.write(`[harness] recovery: ${note}\n`);
 
     const record: RunRecord = { ...crashed.record, status: "running", finishedAt: undefined, error: undefined };
     this.runs.set(record.id, record);
@@ -595,6 +598,18 @@ export class RunManager {
       onSinkBoundary: faultController ? (event) => faultController.onSinkBoundary(event) : undefined,
     });
     auditBridge.record = (event) => recorder.record(event);
+    // 加固期第二轮: an empty ledger means the run was killed before ITS OWN
+    // run_start (the restart path) — open the bracket here, or readTraceFile's
+    // "first event must be run_start" invariant breaks. A normal resume
+    // continues the existing bracket and must NOT re-emit run_start.
+    if (crashed.lastSeq === 0) {
+      recorder.runStart(
+        record.task,
+        record.modelSpec,
+        faultSpec ? formatFaultSpec(faultSpec) : undefined,
+        options.approval?.capabilities ?? ALL_CAPABILITIES,
+      );
+    }
 
     const composed = composeRuntime({
       tools: [...resolvedTools, ...memoryTools],
@@ -728,7 +743,13 @@ export class RunManager {
       }),
     });
     const checkpointWriter = new CheckpointWriter(new CheckpointRepo(database), record.id, () => recorder.lastSeq, {
-      messages: transcript.length + synthetic.length,
+      // transcript.length only (加固期第二轮): pi emits message_end for every
+      // message passed to prompt() (agent-loop emits per initial message), so
+      // counting the synthetic results here AS WELL double-counted them once
+      // the prompt emission landed. The count must mirror "message_end events
+      // seen so far" exactly — the checkpoint cross-check compares it to the
+      // trace's message count.
+      messages: transcript.length,
       toolCalls: [],
     });
     const reporter = options.reporter ?? new ConsoleReporter();

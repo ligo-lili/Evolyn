@@ -1,12 +1,16 @@
+import fs from "node:fs";
+import path from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { TextContent, ImageContent } from "@earendil-works/pi-ai";
 import type { DatabaseSync } from "node:sqlite";
 import { HarnessError } from "../errors.js";
+import { harnessDataDir } from "../runtime/paths.js";
 import type { RunRecord } from "../runtime/run-manager.js";
 import type { AnyAgentTool } from "../runtime/tools/index.js";
 import { CheckpointRepo, type CheckpointRow } from "../storage/repos/checkpoints.js";
 import { RunRepo } from "../storage/repos/runs.js";
 import { TraceEventRepo } from "../storage/repos/trace-events.js";
+import type { CheckpointState, TrackedToolCall } from "./checkpoint.js";
 
 export type UnresolvedState = "planned" | "executing" | "executed-no-result";
 
@@ -32,12 +36,24 @@ export interface CrashedRun {
   unresolved: UnresolvedToolCall[];
   /** seq of the last recorded trace event — resume continues numbering from here. */
   lastSeq: number;
+  /** Latest checkpoint row — the lagging, independent copy of the state machine. */
   checkpoint?: CheckpointRow;
+  /**
+   * 加固期第二轮: findings where the durable record contradicts itself (the
+   * lagging checkpoint saw state the trace no longer holds, or a pending call
+   * it recorded vanished). Surfaced to stderr by resume — never auto-repaired:
+   * the trace stays the authority, and a silent "fix" would hide real loss.
+   */
+  degradations: string[];
 }
 
 /**
  * Rebuilds the exact state a crashed run was in, from the durable record only:
- * trace events (source of truth) reconciled against the latest checkpoint.
+ * trace events (source of truth) cross-checked against the latest checkpoint —
+ * the checkpoint's message count, seq horizon and pending tool-call set must
+ * all be consistent with the rebuilt trace; every disagreement becomes a
+ * degradation note (加固期第二轮; before that the checkpoint was written but
+ * never read).
  * A tool call is unresolved when its toolResult message never made it to the
  * log — classified by what the log does and doesn't contain:
  *   planned            assistant asked for it, tool_execution_start never written
@@ -52,7 +68,48 @@ export function loadCrashedRun(db: DatabaseSync, runId: string, tools: readonly 
   const events = new TraceEventRepo(db).getByRun(runId);
   const first = events[0];
   const last = events.at(-1);
-  if (!first || first.type !== "run_start") throw new HarnessError(`run "${runId}" has no trace to recover`);
+  if (!first) {
+    // 加固期第二轮: a run killed in the window between the runs-row insert and
+    // its FIRST trace event (run_start) used to be a permanently stuck row
+    // ("no trace to recover"). With an empty ledger in both stores nothing can
+    // have executed — every event is written synchronously, tool executions
+    // are preceded by their events, and reconcile just cleared any lone
+    // first-event JSONL remnant — so the correct continuation is restarting
+    // the task under the same run id (the resume drives the empty transcript
+    // through its ordinary prompt(task) branch). Guard: a checkpoint row or
+    // evidence files would prove the ledger was partially LOST, not never
+    // started — a restart could then duplicate side effects; refuse instead.
+    const checkpoint = new CheckpointRepo(db).latest(runId);
+    if (checkpoint) {
+      throw new HarnessError(
+        `run "${runId}" has an empty trace but checkpoint seq ${checkpoint.seq} exists — the ledger was ` +
+          `partially lost; refusing to restart (re-running could duplicate side effects) — repair or clear the record by hand`,
+      );
+    }
+    const evidenceDir = path.join(harnessDataDir(process.cwd()), "evidence", runId);
+    let evidence: string[] = [];
+    try {
+      evidence = fs.existsSync(evidenceDir) ? fs.readdirSync(evidenceDir) : [];
+    } catch {
+      evidence = [];
+    }
+    if (evidence.length > 0) {
+      throw new HarnessError(
+        `run "${runId}" has an empty trace but ${evidence.length} evidence file(s) exist under ${evidenceDir} — ` +
+          `the ledger was partially lost; refusing to restart (re-running could duplicate side effects)`,
+      );
+    }
+    return {
+      record,
+      messages: [],
+      unresolved: [],
+      lastSeq: 0,
+      degradations: [
+        "trace is empty — no event was ever recorded, nothing can have executed; restarting the task under the same run id",
+      ],
+    };
+  }
+  if (first.type !== "run_start") throw new HarnessError(`run "${runId}" has no trace to recover`);
   if (last && last.type === "run_end") {
     throw new HarnessError(`run "${runId}" already recorded run_end — nothing to recover`);
   }
@@ -90,13 +147,67 @@ export function loadCrashedRun(db: DatabaseSync, runId: string, tools: readonly 
     }
   }
 
+  const checkpoint = new CheckpointRepo(db).latest(runId);
+  const lastSeq = last?.seq ?? 0;
   return {
     record,
     messages,
     unresolved: [...unresolved.values()],
-    lastSeq: last?.seq ?? 0,
-    checkpoint: new CheckpointRepo(db).latest(runId),
+    lastSeq,
+    checkpoint,
+    degradations: crossCheckCheckpoint(checkpoint, messages, unresolved, lastSeq),
   };
+}
+
+/**
+ * 加固期第二轮: the one-directional consistency checks that turn the lagging
+ * checkpoint into a real degradation detector. Each check fires only when the
+ * checkpoint saw MORE than the trace still holds — the checkpoint legitimately
+ * lags (it is written after the log), so equality and shortfall are expected,
+ * but excess proves event loss (a sink hole below the checkpoint's horizon, or
+ * a JSONL tail the reconcile had to discard).
+ */
+function crossCheckCheckpoint(
+  checkpoint: CheckpointRow | undefined,
+  messages: readonly AgentMessage[],
+  unresolved: ReadonlyMap<string, UnresolvedToolCall>,
+  lastSeq: number,
+): string[] {
+  if (!checkpoint) return [];
+  const state = checkpoint.state as Partial<CheckpointState> | null | undefined;
+  if (!state || typeof state !== "object") return [];
+  const notes: string[] = [];
+  if (typeof state.messages === "number" && Number.isFinite(state.messages) && state.messages > messages.length) {
+    notes.push(
+      `checkpoint seq ${checkpoint.seq} counted ${state.messages} message(s) but the trace holds only ${messages.length} — message_end event(s) were lost below its horizon`,
+    );
+  }
+  if (typeof state.lastSeq === "number" && Number.isFinite(state.lastSeq) && state.lastSeq > lastSeq) {
+    notes.push(
+      `checkpoint seq ${checkpoint.seq} claims trace seq ${state.lastSeq} but the log ends at ${lastSeq} — event(s) the checkpoint had seen are missing`,
+    );
+  }
+  if (Array.isArray(state.toolCalls)) {
+    const known = new Set<string>(unresolved.keys());
+    for (const m of messages) {
+      if (m.role === "assistant" && Array.isArray(m.content)) {
+        for (const b of m.content) if (b.type === "toolCall") known.add(b.id);
+      } else if (m.role === "toolResult") {
+        known.add(m.toolCallId);
+      }
+    }
+    for (const t of state.toolCalls) {
+      if (!t || typeof t !== "object") continue;
+      const tracked = t as TrackedToolCall;
+      if (typeof tracked.toolCallId === "string" && !known.has(tracked.toolCallId)) {
+        notes.push(
+          `checkpoint seq ${checkpoint.seq} records pending tool call ${tracked.toolCallId} ("${tracked.toolName}") ` +
+            `that the trace no longer contains — its requesting message was lost; recovery cannot resolve it`,
+        );
+      }
+    }
+  }
+  return notes;
 }
 
 export type RecoveryAction =

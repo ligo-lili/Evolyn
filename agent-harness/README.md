@@ -27,7 +27,11 @@ environment. Tool calls default to **interactive approval**; `--yolo` opts out.
   result, gated re-execute (idempotent tools), or a synthesized
   "result unknown" error fed back to the model — never a hallucinated success.
   A "zombie" run whose trace already finished is self-healed (status
-  backfilled), not resumed into a broken bracket.
+  backfilled), not resumed into a broken bracket; a run killed before its
+  FIRST trace event (empty ledger in both sinks) restarts the task under the
+  same run id — unless a checkpoint or evidence file proves the ledger was
+  partially lost, in which case resume refuses rather than risk re-running
+  side effects.
 - **Reproducible crashes** — fault injection (`--fault point:tool`) kills the
   process at exact points — after a tool call, mid-execution, between the two
   trace sinks, after a tool-carrying assistant message ("planned"), or mid-
@@ -39,9 +43,12 @@ environment. Tool calls default to **interactive approval**; `--yolo` opts out.
   log.
 - **Permissions & audit** — per-run capability grants (`fs:read/write`,
   `process:exec`, `net:outbound`, `notify:send`), risk classes, interactive
-  approval that shows the actual arguments, and a workspace path fence
-  (lexical + symlink-realpath) on every path-like tool argument; every
-  decision lands in the trace as an audit event.
+  approval that shows the actual arguments, a workspace path fence
+  (lexical + symlink-realpath) on every path-like tool argument, and a write
+  fence that keeps the structured file tools out of the harness state dir
+  (`.harness/`) — model edits cannot bypass the memory store's locks and
+  history (shell-class tools remain a documented non-goal); every decision
+  lands in the trace as an audit event.
 - **Runaway guards** — turns, tool calls, repeated identical calls, cost
   budget, token budget (the backstop for models that report zero cost), and
   per-tool timeouts (which are never retried — the first execution may still
@@ -132,7 +139,9 @@ keys.
   checkpoint at every message boundary, always *lagging* the trace log;
   `FaultController` provides the two kill points; `recovery.ts` rebuilds the
   crashed moment from persisted data alone (transcript, pending tool-call
-  state machine, lagging checkpoint) and plans per-call resolution.
+  state machine) and plans per-call resolution; the lagging checkpoint is
+  cross-checked — disagreements surface as degradation warnings, never
+  silent repair.
 
 - **`trace/`** — event sourcing. Events reuse Pi's vocabulary inside a
   versioned envelope; the recorder fans out to JSONL (unbuffered

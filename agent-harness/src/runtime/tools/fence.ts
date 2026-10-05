@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import { resolveWorkspacePath } from "../paths.js";
+import { harnessDataDir, resolveWorkspacePath } from "../paths.js";
+import { permissionsFor } from "../permissions.js";
 import type { AnyAgentTool } from "./index.js";
 
 /**
@@ -23,6 +24,16 @@ import type { AnyAgentTool } from "./index.js";
  *     node_modules junction into a store outside the root is REJECTED
  *     fail-closed (reading installed deps there requires lifting the fence
  *     for that prefix explicitly — a policy decision, not a silent default).
+ *
+ * 加固期第二轮: structured file writers (fs:write WITHOUT process:exec — i.e.
+ * write/edit/write_file, not shell-class tools) additionally refuse paths that
+ * resolve INTO the harness state dir (.harness): memory files, traces and the
+ * db were otherwise writable with a plain write tool, bypassing the memory
+ * store's cross-process locks, history snapshots, INDEX projection and the
+ * three write gates. The check is realpath-based (a junction alias into
+ * .harness cannot dodge it) and one-directional: readers are unaffected, the
+ * sanctioned memory tools write through the store (their args are ids, not
+ * paths), and shell-class tools stay the documented non-goal above.
  */
 
 function assertNoStreamSpecifier(resolved: string, raw: string): void {
@@ -60,21 +71,73 @@ function assertInsideRealRoot(root: string, resolved: string): void {
 
 const FENCED_KEYS = ["path", "cwd", "dir"] as const;
 
+/**
+ * 加固期第二轮: structured writers are tools that require fs:write but NOT
+ * process:exec. Shell-class tools can reach .harness by exec anyway, so
+ * fencing their path arguments would buy nothing and imply a boundary that
+ * does not exist; the structured writers are the ones where a path argument is
+ * the actual write mechanism.
+ */
+function isStructuredWriter(toolName: string): boolean {
+  const caps = permissionsFor(toolName).capabilities;
+  return caps.includes("fs:write") && !caps.includes("process:exec");
+}
+
+/**
+ * Refuse a structured WRITE whose target resolves into the harness state dir.
+ * Realpath-based, mirroring assertInsideRealRoot: the deepest existing
+ * ancestor is realpathed, so `alias -> .harness` junctions and dot-segment
+ * spellings that normalize elsewhere are both handled correctly. When the
+ * state dir does not exist yet there is no harness state to protect.
+ */
+function assertNotHarnessStateWrite(root: string, resolved: string, raw: string): void {
+  let realState: string;
+  try {
+    realState = fs.realpathSync(harnessDataDir(root));
+  } catch {
+    return; // no state dir yet — nothing to protect
+  }
+  let probe = resolved;
+  while (!fs.existsSync(probe)) {
+    const parent = path.dirname(probe);
+    if (parent === probe) return;
+    probe = parent;
+  }
+  let real: string;
+  try {
+    real = fs.realpathSync(probe);
+  } catch {
+    return; // unreadable ancestor — let the tool surface its own error
+  }
+  const rel = path.relative(realState, real);
+  const inside = rel === "" || (!rel.startsWith(".." + path.sep) && rel !== ".." && !path.isAbsolute(rel));
+  if (inside) {
+    throw new Error(
+      `refusing to write into the harness state directory (${raw}) — it holds the memory store, traces and the ledger; ` +
+        `use the memory tools for memory files`,
+    );
+  }
+}
+
 /** Wrap every tool so path-like arguments must stay inside the workspace root. */
 export function withPathFence(tools: readonly AnyAgentTool[], root: string = process.cwd()): AnyAgentTool[] {
-  return tools.map((tool) => ({
-    ...tool,
-    execute: async (toolCallId: string, params: any, signal?: AbortSignal, onUpdate?: any) => {
-      if (params && typeof params === "object") {
-        for (const key of FENCED_KEYS) {
-          const value = (params as Record<string, unknown>)[key];
-          if (typeof value !== "string" || !value.trim()) continue;
-          const resolved = resolveWorkspacePath(root, value); // throws on lexical escape
-          assertNoStreamSpecifier(resolved, value);
-          assertInsideRealRoot(root, resolved);
+  return tools.map((tool) => {
+    const stateDirGuarded = isStructuredWriter(tool.name);
+    return {
+      ...tool,
+      execute: async (toolCallId: string, params: any, signal?: AbortSignal, onUpdate?: any) => {
+        if (params && typeof params === "object") {
+          for (const key of FENCED_KEYS) {
+            const value = (params as Record<string, unknown>)[key];
+            if (typeof value !== "string" || !value.trim()) continue;
+            const resolved = resolveWorkspacePath(root, value); // throws on lexical escape
+            assertNoStreamSpecifier(resolved, value);
+            assertInsideRealRoot(root, resolved);
+            if (stateDirGuarded) assertNotHarnessStateWrite(root, resolved, value);
+          }
         }
-      }
-      return tool.execute(toolCallId, params, signal, onUpdate);
-    },
-  }));
+        return tool.execute(toolCallId, params, signal, onUpdate);
+      },
+    };
+  });
 }

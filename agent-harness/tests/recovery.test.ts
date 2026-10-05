@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { openDatabase } from "../src/storage/db.js";
 import { TraceEventRepo } from "../src/storage/repos/trace-events.js";
+import { RunRepo } from "../src/storage/repos/runs.js";
 import { CheckpointRepo } from "../src/storage/repos/checkpoints.js";
 import { loadCrashedRun } from "../src/execution/recovery.js";
 import { readTraceFile } from "../src/trace/read.js";
@@ -111,6 +112,7 @@ describe("crash recovery (阶段 5/6)", () => {
     });
     expect(crashed.lastSeq).toBe(cutSeq);
     expect(crashed.checkpoint?.kind).toBe("message_boundary");
+    expect(crashed.degradations).toEqual([]); // a healthy record cross-checks clean
     const state = crashed.checkpoint?.state as {
       lastSeq: number;
       messages: number;
@@ -119,6 +121,137 @@ describe("crash recovery (阶段 5/6)", () => {
     expect(state.lastSeq).toBeLessThanOrEqual(cutSeq);
     expect(state.messages).toBe(2);
     expect(state.toolCalls).toEqual([{ toolCallId: "call_1", toolName: "send_notification", state: "planned" }]);
+  });
+
+  it("加固期第二轮: the lagging checkpoint is cross-checked — losses surface as degradations, never silently", () => {
+    const dbPath = path.join(tmp.dir, "crosscheck", "harness.db");
+    const db = openDatabase(dbPath);
+    try {
+      const runId = "run-crosscheck";
+      new RunRepo(db).insert({
+        id: runId,
+        task: "t",
+        modelSpec: "m",
+        status: "running",
+        startedAt: new Date().toISOString(),
+      });
+      const repo = new TraceEventRepo(db);
+      const ts = new Date().toISOString();
+      repo.append({ v: 1, seq: 1, ts, runId, type: "run_start", task: "t", modelSpec: "m" } as never);
+      repo.append({
+        v: 1,
+        seq: 2,
+        ts,
+        runId,
+        type: "message_end",
+        message: { role: "user", content: "x", timestamp: 1 },
+      } as never);
+      repo.append({
+        v: 1,
+        seq: 3,
+        ts,
+        runId,
+        type: "message_end",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "call_live", name: "send_notification", arguments: {} }],
+          timestamp: 2,
+        },
+      } as never);
+      // The checkpoint claims state the trace no longer holds: one extra
+      // message, a seq horizon past the log's end, and a pending call whose
+      // requesting message vanished.
+      new CheckpointRepo(db).append(runId, "message_boundary", {
+        lastSeq: 4,
+        messages: 3,
+        toolCalls: [{ toolCallId: "call_ghost", toolName: "ghost", state: "planned" }],
+      });
+
+      const crashed = loadCrashedRun(db, runId, TOOLS);
+      expect(crashed.degradations).toHaveLength(3);
+      const joined = crashed.degradations.join("\n");
+      expect(joined).toMatch(/counted 3 message\(s\) but the trace holds only 2/);
+      expect(joined).toMatch(/claims trace seq 4 but the log ends at 3/);
+      expect(joined).toMatch(/call_ghost.*requesting message was lost/);
+      // the call that IS in the trace stays silent
+      expect(joined).not.toContain("call_live");
+    } finally {
+      db.close();
+    }
+  });
+
+  it("加固期第二轮: resume restarts a run killed before its first trace event (empty ledger, nothing executed)", async () => {
+    const dbPath = path.join(tmp.dir, "empty-ledger", "harness.db");
+    const runId = "run-empty-ledger";
+    const db = openDatabase(dbPath);
+    new RunRepo(db).insert({
+      id: runId,
+      task: "send a notification and confirm",
+      modelSpec: "fake-model",
+      status: "running",
+      startedAt: new Date().toISOString(),
+    });
+    db.close();
+    const before = logLines();
+
+    const manager = new RunManager();
+    const result = await manager.resume(runId, {
+      model: FAKE_MODEL,
+      streamFn: scriptedStreamFn(steps()),
+      reporter: new CollectingReporter(),
+      database: dbPath,
+      tools: TOOLS,
+    });
+    manager.close();
+
+    expect(result.record.status).toBe("completed");
+    expect(logLines()).toBe(before + 1); // the task really ran once
+    const trace = readTraceFile(result.tracePath as string);
+    expect(trace.events[0]).toMatchObject({ type: "run_start", seq: 1 });
+    expect(trace.events.at(-1)).toMatchObject({ type: "run_end", status: "completed" });
+  });
+
+  it("加固期第二轮: refuses to restart when a checkpoint proves the lost ledger had progressed", async () => {
+    const { runId, dbPath } = await seedRun("guard-checkpoint");
+    const db = openDatabase(dbPath);
+    db.prepare("DELETE FROM trace_events WHERE run_id = ?").run(runId);
+    db.prepare("UPDATE runs SET status = 'running', finished_at = NULL, error = NULL WHERE id = ?").run(runId);
+    db.close();
+    fs.rmSync(path.join(tmp.dir, ".harness", "traces", `${runId}.jsonl`), { force: true });
+
+    const manager = new RunManager();
+    await expect(
+      manager.resume(runId, {
+        model: FAKE_MODEL,
+        streamFn: scriptedStreamFn([]),
+        reporter: new CollectingReporter(),
+        database: dbPath,
+        tools: TOOLS,
+      }),
+    ).rejects.toThrow(/refusing to restart/);
+    manager.close();
+  });
+
+  it("加固期第二轮: refuses to restart when evidence files prove prior tool activity", async () => {
+    const { runId, dbPath } = await seedRun("guard-evidence");
+    const db = openDatabase(dbPath);
+    db.prepare("DELETE FROM trace_events WHERE run_id = ?").run(runId);
+    db.prepare("DELETE FROM checkpoints WHERE run_id = ?").run(runId);
+    db.prepare("UPDATE runs SET status = 'running', finished_at = NULL, error = NULL WHERE id = ?").run(runId);
+    db.close();
+    fs.rmSync(path.join(tmp.dir, ".harness", "traces", `${runId}.jsonl`), { force: true });
+
+    const manager = new RunManager();
+    await expect(
+      manager.resume(runId, {
+        model: FAKE_MODEL,
+        streamFn: scriptedStreamFn([]),
+        reporter: new CollectingReporter(),
+        database: dbPath,
+        tools: TOOLS,
+      }),
+    ).rejects.toThrow(/evidence file/);
+    manager.close();
   });
 
   it("executing + replay:never → synthesizes an error result; delivery happens exactly once", async () => {

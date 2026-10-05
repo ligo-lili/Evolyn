@@ -18,10 +18,10 @@ npm run harness -- run "<task>" --model deepseek/deepseek-flash --tools coding -
 
 ## 功能
 
-- **持久执行**——每个 run 在消息边界落 checkpoint；进程被杀后在**同一 runId** 上恢复，trace 序列续号，工具集从 run 行持久化的规格自动还原（crash 的 `--tools coding` run 不会以 demo 默认集续跑）。未决工具调用按规则结算：用日志里的结果重建 / 过门重执行（幂等工具）/ 合成"结果未知"错误回喂模型——绝不幻觉成功。trace 已经跑完的"僵尸 run"自愈（补写状态），不会被恢复成断裂的括号。
+- **持久执行**——每个 run 在消息边界落 checkpoint；进程被杀后在**同一 runId** 上恢复，trace 序列续号，工具集从 run 行持久化的规格自动还原（crash 的 `--tools coding` run 不会以 demo 默认集续跑）。未决工具调用按规则结算：用日志里的结果重建 / 过门重执行（幂等工具）/ 合成"结果未知"错误回喂模型——绝不幻觉成功。trace 已经跑完的"僵尸 run"自愈（补写状态），不会被恢复成断裂的括号；首个 trace 事件落盘之前就被杀（双 sink 全空）的 run，resume 在同一 runId 下重启任务——除非 checkpoint 或 evidence 文件证明台账是"部分丢失"而非"从未开始"，那时 resume 拒绝重启（避免重复副作用）。
 - **崩溃可复现**——故障注入（`--fault point:tool`）在精确位置杀进程：工具调用之后、执行中途、两份 trace sink 之间、带工具调用的 assistant 消息之后（"planned"窗口）、恢复过程中途——恢复因此可测试，不是表演。
 - **执行即数据库**——每个事件以同一序列号双写 JSONL 与 SQLite；`trace summary / replay --until / query` 回答任意 run 的"做了什么、为什么"，支持跳到任意历史序列号做 debugger 式状态检查。sink 失败留下可容忍的补洞，而不是一条坏日志。
-- **权限与审计**——按 run 授予能力（`fs:read/write`、`process:exec`、`net:outbound`、`notify:send`）、风险分级、显示实际参数的交互审批、覆盖每个路径类参数的工作区路径围栏（词法 + 符号链接 realpath）；每次决策作为审计事件落入 trace。
+- **权限与审计**——按 run 授予能力（`fs:read/write`、`process:exec`、`net:outbound`、`notify:send`）、风险分级、显示实际参数的交互审批、覆盖每个路径类参数的工作区路径围栏（词法 + 符号链接 realpath），以及一条写围栏：结构化文件工具不得写入 harness 状态目录（`.harness/`），模型编辑无法绕过记忆库的跨进程锁与 history（shell 类工具仍是显式非目标）；每次决策作为审计事件落入 trace。
 - **失控护栏**——回合数、工具调用数、同参重复调用、成本预算、token 预算（对上报零成本的模型是可靠兜底）、工具级超时（超时不重试——第一次执行可能还在后台跑）；违规即把 run 降级为 `failed` 并附原因。
 - **可扩展的上下文**——上下文管理围绕块模型重建（system / conversation / tool-round / malformed 四类块；tool_call id 用 Counter 精确配对，不合法整轮降级保守保留），六条预算线（输入硬上界 → 64k 偏好工作集 → 0.80 软线 → 强制线 → 0.45 深压目标 → 工具结果独立小账本），校准的 token 估算（chars/4 × 模型族系数，`scripts/calibrate_tokens.mjs` 用真实 Trace 再校准），以及服务 prompt cache 的决策循环：每次模型调用产出一条 `prefix_decision`——reuse 纯续用 / defer 越软线但缓存前缀可复用继续追加 / compact 真压缩 / rebuild 前缀断裂深压到位。第一层确定性整理旧工具结果（头尾截断附 evidence 指针、最旧优先整轮移除、注册工具的语义 JSON 裁剪）；第二层把前缀折叠成严格 JSON 的滚动摘要（硬校验、"必须更小"闸门、带失败原因的唯一重试、大折叠放宽）。全部只改模型视图：转录与 trace 保持 append-only，每次决策作为 `context_decision` 事件落入 trace。
 - **只读子代理（上下文隔离）**——`explore` 工具（coding 工具集）派生一个完整的子 Agent：独立上下文窗口、受限只读工具集（read/grep/ls/find——无 shell、无递归）、自己更紧的限额与上下文管理。子代理的最终回答作为工具结果返回，中间的读取永不进入父对话。子代理是 (任务, 工作区) 的纯函数：父调用声明 `replay: "safe"`，崩溃在子代理中间 = 恢复时经普通恢复路径整体重跑——不做嵌套 checkpoint。子代理用量计入父 run 的成本/token 熔断，审计事件（`subagent_start/end`）落入 trace，完整转录落入 evidence 目录。
@@ -36,7 +36,7 @@ npm run harness -- run "<task>" --model deepseek/deepseek-flash --tools coding -
 
 - **`runtime/`**——run 生命周期。`RunManager.run/resume` 每个 run 驱动一个 Pi `Agent`；`compose.ts` 的 `composeRuntime()` 是工具包装链（fault → evidence → timeout → retry）与 `beforeToolCall` 组合门（限额 → 权限）的唯一组装点，run、resume 与 explore 子代理（以 run-lite 形态：受限工具集、独立限额、独立执行器）共用。两套工具集：`demo`（四个教学工具，含一个非幂等工具供崩溃演示）与 `coding`（Pi 的 read/edit/write/grep/ls/find + shell，叠加能力/风险/`replay` 元数据）。`agent-factory.ts` 是全仓库唯一触碰 Pi 构造函数的文件。
 
-- **`execution/`**——持久化内核。`CheckpointWriter` 在每个消息边界追加 checkpoint，永远**滞后**于 trace 日志；`FaultController` 提供两个杀进程注入点；`recovery.ts` 仅凭持久化数据重建崩溃时刻（转录、未决工具调用状态机、滞后 checkpoint）并逐调用规划结算。
+- **`execution/`**——持久化内核。`CheckpointWriter` 在每个消息边界追加 checkpoint，永远**滞后**于 trace 日志；`FaultController` 提供两个杀进程注入点；`recovery.ts` 仅凭持久化数据重建崩溃时刻（转录、未决工具调用状态机）并逐调用规划结算；滞后 checkpoint 被交叉核对——矛盾以 degradation 警告上浮，绝不静默修补。
 
 - **`trace/`**——事件溯源。事件沿用 Pi 的词汇表，装进带版本号的信封；recorder 扇出到 JSONL（零缓冲 `appendFileSync`——被杀只丢"从未发出"的事件）与 SQLite（提取列建索引），共享同一序列号。`reconcile.ts` 在 resume 前把 JSONL 尾部对齐到 SQLite；`replay.ts` 是纯离线状态机，重建任意序列号处的转录与工具调用状态，并解释"为什么走到这里"。
 

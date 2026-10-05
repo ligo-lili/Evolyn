@@ -192,6 +192,62 @@ function lastAssistant(messages: readonly AgentMessage[]): AssistantMessage | un
 }
 
 /**
+ * 加固期第三轮: the run/resume epilogue was duplicated nearly line-for-line —
+ * with the crash-recovery invariants riding on both paths, drift between them
+ * is expensive. Terminal classification (shared): an error stop or a dangling
+ * toolUse is NEVER "completed" — a dangling toolUse means the model's last
+ * tool request was answered by nothing.
+ */
+function classifyTerminal(messages: readonly AgentMessage[]): { status: RunStatus; error: string | undefined } {
+  const last = lastAssistant(messages);
+  if (last && (last.stopReason === "error" || last.errorMessage)) {
+    return { status: "failed", error: last.errorMessage ?? `stopReason=${last.stopReason}` };
+  }
+  if (last?.stopReason === "toolUse") {
+    return { status: "failed", error: "run ended with an unanswered tool call (dangling toolUse)" };
+  }
+  return { status: "completed", error: undefined };
+}
+
+/**
+ * Shared run/resume epilogue (加固期第三轮 extraction): a limit violation
+ * degrades the outcome even when the model finished cleanly; the terminal
+ * state lands on the record, run_end closes the trace bracket, the event
+ * subscription detaches, and the status is persisted LOUDLY — a persistence
+ * failure must never mask the run's real outcome.
+ */
+function finalizeRun(input: {
+  record: RunRecord;
+  status: RunStatus;
+  error: string | undefined;
+  limitViolation: LimitViolation | undefined;
+  /** Close the trace bracket; the caller supplies its own clock. */
+  end: (status: RunStatus, error: string | undefined) => void;
+  unsubscribe: () => void;
+  runRepo: RunRepo | undefined;
+  /** "run" / "resumed" — only used in the persistence-failure message. */
+  label: string;
+}): void {
+  let { status, error } = input;
+  if (input.limitViolation) {
+    status = "failed";
+    error = `run stopped by limit (${input.limitViolation.kind}): ${input.limitViolation.reason}`;
+  }
+  input.record.status = status;
+  if (error !== undefined) input.record.error = error;
+  input.record.finishedAt = new Date().toISOString();
+  input.end(status, error);
+  input.unsubscribe();
+  try {
+    input.runRepo?.updateStatus(input.record);
+  } catch (err) {
+    process.stderr.write(
+      `[harness] failed to persist ${input.label} run status: ${err instanceof Error ? err.message : err}\n`,
+    );
+  }
+}
+
+/**
  * Owns the run lifecycle (id, status, timing, trace, durable rows) and drives
  * one Agent per run. Checkpoint/Recovery (阶段 5/6) attach here next.
  */
@@ -416,40 +472,21 @@ export class RunManager {
       await agent.prompt(options.task);
       await agent.waitForIdle();
       messages = [...agent.state.messages];
-      const last = lastAssistant(messages);
-      if (last && (last.stopReason === "error" || last.errorMessage)) {
-        status = "failed";
-        error = last.errorMessage ?? `stopReason=${last.stopReason}`;
-      } else if (last?.stopReason === "toolUse") {
-        // 加固期 (P0): a dangling toolUse is NOT a completion — never report
-        // "completed" when the model's last tool request was never answered.
-        status = "failed";
-        error = "run ended with an unanswered tool call (dangling toolUse)";
-      } else {
-        status = "completed";
-      }
+      ({ status, error } = classifyTerminal(messages));
     } catch (err) {
       status = "failed";
       error = err instanceof Error ? err.message : String(err);
     } finally {
-      // 阶段 9.8: a limit violation degrades the run to failed with the reason
-      // attached, even when the model itself finished cleanly afterwards.
-      if (limitViolation) {
-        status = "failed";
-        error = `run stopped by limit (${limitViolation.kind}): ${limitViolation.reason}`;
-      }
-      record.status = status;
-      if (error !== undefined) record.error = error;
-      record.finishedAt = new Date().toISOString();
-      recorder?.runEnd(status, error, Date.now() - startedMs);
-      unsubscribe();
-      try {
-        runRepo?.updateStatus(record);
-      } catch (err) {
-        // The run itself succeeded/failed already; a persistence failure here
-        // must not mask that. Surface loudly, decide policy in 加固 (阶段 14).
-        process.stderr.write(`[harness] failed to persist run status: ${err instanceof Error ? err.message : err}\n`);
-      }
+      finalizeRun({
+        record,
+        status,
+        error,
+        limitViolation,
+        end: (s, e) => recorder?.runEnd(s, e, Date.now() - startedMs),
+        unsubscribe,
+        runRepo,
+        label: "run",
+      });
       // 向量补全触发点：run 结束后 fire-and-forget（宿主经 drainMemoryBackfill
       // 决定是否等待——CLI 在 reflect 之后 drain，长驻宿主可以不理会）。
       this.memoryBackfillContext = memoryIndex
@@ -798,40 +835,21 @@ export class RunManager {
         // run_end) — nothing to drive, just finalize below.
       }
       messages = [...agent.state.messages];
-      const last = lastAssistant(messages);
-      if (last && (last.stopReason === "error" || last.errorMessage)) {
-        status = "failed";
-        error = last.errorMessage ?? `stopReason=${last.stopReason}`;
-      } else if (last?.stopReason === "toolUse") {
-        // 加固期 (P0): a dangling toolUse is NOT a completion — never report
-        // "completed" when the model's last tool request was never answered.
-        status = "failed";
-        error = "run ended with an unanswered tool call (dangling toolUse)";
-      } else {
-        status = "completed";
-      }
+      ({ status, error } = classifyTerminal(messages));
     } catch (err) {
       status = "failed";
       error = err instanceof Error ? err.message : String(err);
     } finally {
-      // 阶段 9.8: a limit violation degrades the run to failed with the reason
-      // attached, even when the model itself finished cleanly afterwards.
-      if (limitViolation) {
-        status = "failed";
-        error = `run stopped by limit (${limitViolation.kind}): ${limitViolation.reason}`;
-      }
-      record.status = status;
-      if (error !== undefined) record.error = error;
-      record.finishedAt = new Date().toISOString();
-      recorder.runEnd(status, error, Date.now() - startedMs);
-      unsubscribe();
-      try {
-        runRepo.updateStatus(record);
-      } catch (err) {
-        process.stderr.write(
-          `[harness] failed to persist resumed run status: ${err instanceof Error ? err.message : err}\n`,
-        );
-      }
+      finalizeRun({
+        record,
+        status,
+        error,
+        limitViolation,
+        end: (s, e) => recorder.runEnd(s, e, Date.now() - startedMs),
+        unsubscribe,
+        runRepo,
+        label: "resumed",
+      });
       this.memoryBackfillContext = memoryIndex
         ? { store: memoryStore, index: memoryIndex, embedder: memoryEmbedder }
         : undefined;

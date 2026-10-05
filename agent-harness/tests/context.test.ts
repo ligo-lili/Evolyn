@@ -749,6 +749,30 @@ describe("context transformer (prefix decisions)", () => {
     expect(JSON.stringify(out)).toContain("<context-summary>");
   });
 
+  it("加固期第三轮: a projection still over the input budget after compaction is flagged (posterior check)", async () => {
+    const decisions: { reason: string; summarized: boolean; tokensAfter?: number }[] = [];
+    const transformer = createContextTransformer({
+      model: { ...FAKE_MODEL, contextWindow: WINDOW },
+      summaryChat: summaryChat(validSummary()),
+      onDecision: (d) => decisions.push({ reason: d.reason, summarized: d.summarized, tokensAfter: d.tokensAfter }),
+    });
+    // 最近两个大工具轮被两层同时保护（设计如此）——成功压缩之后投影里仍留
+    // 着它们，估算必然越过 inputBudget(210)：后验检查必须把它说破（决策
+    // reason + stderr），而不是让请求在 provider 窗口前静默失败。
+    const messages: AgentMessage[] = [
+      m("system", "sys"),
+      m("user", "task"),
+      ...round("r1", 2000),
+      ...round("r2", 2000),
+      ...round("r3", 2000),
+    ];
+    const out = await transformer(messages);
+    expect(decisions[0]!.summarized).toBe(true);
+    expect(decisions[0]!.tokensAfter!).toBeGreaterThan(WINDOW);
+    expect(decisions[0]!.reason).toContain("POST-COMPACTION");
+    expect(JSON.stringify(out)).toContain("<context-summary>");
+  });
+
   it("gate ③: a summary that is not smaller than the material is rejected", async () => {
     const decisions: { summarized: boolean; reason: string }[] = [];
     const transformer = createContextTransformer({

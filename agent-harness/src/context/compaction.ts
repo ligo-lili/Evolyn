@@ -188,6 +188,20 @@ export function createContextTransformer(
           cutIndex = compacted.cutIndex;
           summaryAttempts = compacted.attempts;
           tokensAfter = compacted.tokensAfter;
+          // 加固期第三轮: posterior check — a single oversized "protected" block
+          // (immune to both layers by design) can leave the projection over the
+          // hard input budget even after a successful summary; the model call
+          // below may then die at the provider window. Surface it on the
+          // decision AND stderr instead of failing silently at the API.
+          if (compacted.tokensAfter > budget.inputBudget) {
+            reason +=
+              `; POST-COMPACTION still over input budget (${compacted.tokensAfter} > ${budget.inputBudget}` +
+              ` tokens) — an oversized protected block may be immune to both layers`;
+            process.stderr.write(
+              `[harness] context: projection still exceeds the input budget after compaction ` +
+                `(${compacted.tokensAfter} > ${budget.inputBudget}) — an oversized protected block may be immune to both layers\n`,
+            );
+          }
           options.onEvent?.({
             type: "compaction",
             trigger: watermark ? "rolling" : "threshold",

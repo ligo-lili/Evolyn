@@ -28,6 +28,7 @@ import { SkillIndex } from "../src/skills/retrieve.js";
 import { serializeSkillMd } from "../src/skills/format.js";
 import { parseArgs } from "../src/cli/parse-args.js";
 import { withPathFence } from "../src/runtime/tools/fence.js";
+import { composeRuntime } from "../src/runtime/compose.js";
 import { withEvidenceCapture } from "../src/runtime/tools/evidence.js";
 import { TraceRecorder, type TraceSink } from "../src/trace/recorder.js";
 import { FaultController, parseFaultSpec } from "../src/execution/fault.js";
@@ -1343,7 +1344,7 @@ describe("加固期: tool path fence", () => {
     fs.mkdirSync(path.join(root, ".harness", "memory", "active"), { recursive: true });
     fs.writeFileSync(path.join(root, ".harness", "memory", "INDEX.md"), "index", "utf8");
     const calls: string[] = [];
-    const probe = (name: string) =>
+    const probe = (name: string, sink: string[] = calls) =>
       ({
         name,
         label: name,
@@ -1351,7 +1352,7 @@ describe("加固期: tool path fence", () => {
         parameters: {} as never,
         replay: "safe" as const,
         execute: async (_id: string, params: { path: string }) => {
-          calls.push(`${name}:${params.path}`);
+          sink.push(`${name}:${params.path}`);
           return { content: [{ type: "text", text: "ok" }], details: undefined };
         },
       }) as never;
@@ -1360,12 +1361,12 @@ describe("加固期: tool path fence", () => {
     // traces, ledger) is write-protected: a plain write tool must not bypass
     // the store's locks, history snapshots and INDEX projection.
     await expect(fenced[0]!.execute("t1", { path: ".harness/memory/active/M001.md" })).rejects.toThrow(
-      /harness state directory/,
+      /harness-protected state/,
     );
     // a junction alias into .harness cannot dodge the realpath-based check
     fs.symlinkSync(path.join(root, ".harness"), path.join(root, "alias"), "junction");
     await expect(fenced[0]!.execute("t2", { path: "alias/memory/INDEX.md" })).rejects.toThrow(
-      /harness state directory/,
+      /harness-protected state/,
     );
     // normal workspace writes, and paths that normalize out of the prefix, stay allowed
     await fenced[0]!.execute("t3", { path: "src/app.ts" });
@@ -1385,8 +1386,62 @@ describe("加固期: tool path fence", () => {
     fs.mkdirSync(bare, { recursive: true });
     const bareFenced = withPathFence([probe("write_file")], bare);
     await expect(bareFenced[0]!.execute("t7", { path: ".harness/memory/active/M001.md" })).rejects.toThrow(
-      /harness state directory/,
+      /harness-protected state/,
     );
+    // 加固期第六轮: relocated state (custom database/traceDir) rides in via
+    // protectedPaths — directory entries match by prefix, file entries by
+    // equality, and a longer sibling name is NOT a prefix match.
+    const relocatedRoot = path.join(tmp.dir, "state-fence-relocated");
+    fs.mkdirSync(path.join(relocatedRoot, "state"), { recursive: true });
+    const relocatedCalls: string[] = [];
+    const relocated = withPathFence([probe("write_file", relocatedCalls)], relocatedRoot, {
+      protectedPaths: [path.join(relocatedRoot, "state"), path.join(relocatedRoot, "ledger.db")],
+    });
+    await expect(relocated[0]!.execute("t8", { path: "state/harness.db" })).rejects.toThrow(/harness-protected state/);
+    await expect(relocated[0]!.execute("t9", { path: "ledger.db" })).rejects.toThrow(/harness-protected state/);
+    await relocated[0]!.execute("t10", { path: "stateful-note.txt" });
+    expect(relocatedCalls).toEqual(["write_file:stateful-note.txt"]);
+    tmp.leave();
+  });
+
+  it("加固期第六轮: composeRuntime carries relocated state paths into the write fence", async () => {
+    tmp.enter();
+    const root = path.join(tmp.dir, "compose-fence");
+    const stateDir = path.join(root, "state");
+    fs.mkdirSync(path.join(stateDir, "memory"), { recursive: true });
+    const calls: string[] = [];
+    const probe = {
+      name: "write_file",
+      label: "Probe",
+      description: "probe",
+      parameters: {} as never,
+      replay: "safe" as const,
+      execute: async (_id: string, params: { path: string }) => {
+        calls.push(params.path);
+        return { content: [{ type: "text", text: "ok" }], details: undefined };
+      },
+    } as never;
+    const composed = composeRuntime({
+      tools: [probe],
+      faultSpec: undefined,
+      evidenceDir: path.join(root, ".harness", "evidence", "run-x"),
+      protectedPaths: [stateDir, path.join(root, "ledger.db")],
+      limits: DEFAULT_RUN_LIMITS,
+      retryPolicy: undefined,
+      approval: undefined,
+      audit: () => {},
+      onLimitViolation: () => {},
+    });
+    // cwd is tmp.dir (the test root) — the state dir sits inside it, so the
+    // absolute targets clear the escape fence and reach the write protection.
+    await expect(composed.tools[0]!.execute("t1", { path: path.join(stateDir, "memory", "M001.md") })).rejects.toThrow(
+      /harness-protected state/,
+    );
+    await expect(composed.tools[0]!.execute("t2", { path: path.join(root, "ledger.db") })).rejects.toThrow(
+      /harness-protected state/,
+    );
+    await composed.tools[0]!.execute("t3", { path: path.join(root, "notes.txt") });
+    expect(calls).toEqual([path.join(root, "notes.txt")]);
     tmp.leave();
   });
 

@@ -25,6 +25,8 @@ export function composeRuntime(input: {
   tools: AnyAgentTool[];
   faultSpec: FaultSpec | undefined;
   evidenceDir: string;
+  /** 加固期第六轮: actual (possibly relocated) state paths the write fence must protect. */
+  protectedPaths?: readonly string[];
   limits: Required<RunLimits>;
   retryPolicy: RetryPolicy | undefined;
   approval: ApprovalOptions | undefined;
@@ -40,8 +42,11 @@ export function composeRuntime(input: {
       withEvidenceCapture(
         // 加固期 (P0): path fence OUTSIDE the fault wrapper — every execution
         // (live or fault-injected) checks path-like args against the workspace
-        // root, lexically AND through symlinks.
-        withPathFence(applyFaultToTools(input.tools, input.faultSpec)),
+        // root, lexically AND through symlinks. 加固期第六轮: relocated state
+        // paths ride along so a custom database/traceDir stays protected.
+        withPathFence(applyFaultToTools(input.tools, input.faultSpec), undefined, {
+          protectedPaths: input.protectedPaths,
+        }),
         input.evidenceDir,
       ),
       input.limits.toolTimeoutMs,

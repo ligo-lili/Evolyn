@@ -85,33 +85,36 @@ function isStructuredWriter(toolName: string): boolean {
 }
 
 /**
- * Refuse a structured WRITE whose target resolves into the harness state dir.
- * Two layers: a LEXICAL check that also holds before the dir exists (a writer
- * must never be the thing that creates `.harness` — 加固期第五轮), and a
- * realpath probe (mirroring assertInsideRealRoot) so `alias -> .harness`
- * junctions and dot-segment spellings normalize correctly.
+ * Refuse a structured WRITE whose target resolves into harness-protected
+ * state. Two layers: a LEXICAL check that also holds before a path exists (a
+ * writer must never be the thing that creates `.harness` — 加固期第五轮),
+ * and a realpath probe (mirroring assertInsideRealRoot) so alias junctions
+ * and dot-segment spellings normalize correctly. Each protected entry may be
+ * a DIRECTORY (prefix match) or a FILE (equality — e.g. a relocated ledger
+ * db); the default state dir is always included, and run/resume add the
+ * actual locations a custom database/traceDir may have moved elsewhere
+ * (加固期第六轮). A protected entry equal to the workspace root itself is
+ * dropped by the caller — protecting it would block every write.
  *
- * Known non-goals (documented scope): hard links are invisible to realpath
- * (they require a same-volume link created outside the run); the guard covers
- * the DEFAULT state location only — state relocated via the programmatic
- * API's custom database/traceDir is out of scope; and a new structured writer
- * must be registered in TOOL_PERMISSIONS to be recognized as one.
+ * Known non-goals (documented scope): hard links are invisible to realpath,
+ * but the model-facing structured tools cannot create one (no shell), so the
+ * vector requires a local actor placing the link before the run — an actor
+ * who could equally edit `.harness` directly, i.e. outside this fence's
+ * threat model (prompt-injected model, not local access). A new structured
+ * writer must be registered in TOOL_PERMISSIONS to be recognized as one.
  */
-function assertNotHarnessStateWrite(root: string, resolved: string, raw: string): void {
+function assertNotProtectedWrite(root: string, resolved: string, raw: string, protectedPaths: readonly string[]): void {
   const refuse = (): never => {
     throw new Error(
-      `refusing to write into the harness state directory (${raw}) — it holds the memory store, traces and the ledger; ` +
+      `refusing to write into harness-protected state (${raw}) — it holds the memory store, traces and the ledger; ` +
         `use the memory tools for memory files`,
     );
   };
-  const lexicalRel = path.relative(path.resolve(root), resolved);
-  if (lexicalRel === ".harness" || lexicalRel.startsWith(".harness" + path.sep)) refuse();
-  let realState: string;
-  try {
-    realState = fs.realpathSync(harnessDataDir(root));
-  } catch {
-    return; // dir absent — the lexical layer already covered the literal path
-  }
+  const inside = (base: string, target: string): boolean => {
+    const rel = path.relative(base, target);
+    return rel === "" || (!rel.startsWith(".." + path.sep) && rel !== ".." && !path.isAbsolute(rel));
+  };
+  if (protectedPaths.some((p) => inside(p, resolved))) refuse();
   let probe = resolved;
   while (!fs.existsSync(probe)) {
     const parent = path.dirname(probe);
@@ -124,13 +127,41 @@ function assertNotHarnessStateWrite(root: string, resolved: string, raw: string)
   } catch {
     return; // unreadable ancestor — let the tool surface its own error
   }
-  const rel = path.relative(realState, real);
-  const inside = rel === "" || (!rel.startsWith(".." + path.sep) && rel !== ".." && !path.isAbsolute(rel));
-  if (inside) refuse();
+  for (const p of protectedPaths) {
+    let realBase: string;
+    try {
+      realBase = fs.realpathSync(p);
+    } catch {
+      continue; // this protected path does not exist (yet)
+    }
+    if (inside(realBase, real)) refuse();
+  }
+}
+
+export interface FenceOptions {
+  /**
+   * 加固期第六轮: absolute paths protected against structured writes, in
+   * ADDITION to the conventional `<root>/.harness` — run/resume pass the
+   * ACTUAL state locations (memory dir, ledger db file, trace dir) so a
+   * custom `database`/`traceDir` relocation stays protected. Directory
+   * entries match by prefix, file entries by equality.
+   */
+  protectedPaths?: readonly string[];
 }
 
 /** Wrap every tool so path-like arguments must stay inside the workspace root. */
-export function withPathFence(tools: readonly AnyAgentTool[], root: string = process.cwd()): AnyAgentTool[] {
+export function withPathFence(
+  tools: readonly AnyAgentTool[],
+  root: string = process.cwd(),
+  opts: FenceOptions = {},
+): AnyAgentTool[] {
+  const rootAbs = path.resolve(root);
+  // The conventional state dir is protected unconditionally; callers add the
+  // real (possibly relocated) state locations. The root itself is never a
+  // protected entry — protecting it would refuse every write.
+  const protectedPaths = [
+    ...new Set([harnessDataDir(rootAbs), ...(opts.protectedPaths ?? [])].map((p) => path.resolve(p))),
+  ].filter((p) => p !== rootAbs);
   return tools.map((tool) => {
     const stateDirGuarded = isStructuredWriter(tool.name);
     return {
@@ -140,10 +171,10 @@ export function withPathFence(tools: readonly AnyAgentTool[], root: string = pro
           for (const key of FENCED_KEYS) {
             const value = (params as Record<string, unknown>)[key];
             if (typeof value !== "string" || !value.trim()) continue;
-            const resolved = resolveWorkspacePath(root, value); // throws on lexical escape
+            const resolved = resolveWorkspacePath(rootAbs, value); // throws on lexical escape
             assertNoStreamSpecifier(resolved, value);
-            assertInsideRealRoot(root, resolved);
-            if (stateDirGuarded) assertNotHarnessStateWrite(root, resolved, value);
+            assertInsideRealRoot(rootAbs, resolved);
+            if (stateDirGuarded) assertNotProtectedWrite(rootAbs, resolved, value, protectedPaths);
           }
         }
         return tool.execute(toolCallId, params, signal, onUpdate);

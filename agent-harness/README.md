@@ -46,9 +46,10 @@ environment. Tool calls default to **interactive approval**; `--yolo` opts out.
   approval that shows the actual arguments, a workspace path fence
   (lexical + symlink-realpath) on every path-like tool argument, and a write
   fence that keeps the structured file tools out of the harness state dir
-  (`.harness/`) — model edits cannot bypass the memory store's locks and
-  history (shell-class tools remain a documented non-goal); every decision
-  lands in the trace as an audit event.
+  (`.harness/` — and any relocated state locations a custom database/traceDir
+  selects) — model edits cannot bypass the memory store's locks and history
+  (shell-class tools remain a documented non-goal); every decision lands in
+  the trace as an audit event.
 - **Runaway guards** — turns, tool calls, repeated identical calls, cost
   budget, token budget (the backstop for models that report zero cost), and
   per-tool timeouts (which are never retried — the first execution may still

@@ -420,6 +420,14 @@ export class RunManager {
       tools: [...resolveTools(options.tools, exploreDeps), ...memoryTools],
       faultSpec,
       evidenceDir: path.join(harnessDataDir(process.cwd()), "evidence", record.id),
+      // 加固期第六轮: the write fence protects the conventional .harness by
+      // default; hand it the ACTUAL state locations so a relocated
+      // database/trace dir stays protected against structured writers.
+      protectedPaths: [
+        memoryDir,
+        typeof options.database === "string" ? options.database : defaultDbPath(),
+        options.traceDir ?? path.join(harnessDataDir(process.cwd()), "traces"),
+      ],
       limits,
       retryPolicy: options.retry,
       approval: options.approval,
@@ -660,6 +668,8 @@ export class RunManager {
       tools: [...resolvedTools, ...memoryTools],
       faultSpec: undefined,
       evidenceDir: path.join(harnessDataDir(process.cwd()), "evidence", record.id),
+      // 加固期第六轮: relocated state locations ride along (see run()).
+      protectedPaths: [memoryDir, typeof options.database === "string" ? options.database : defaultDbPath(), traceDir],
       limits,
       retryPolicy: options.retry,
       approval: options.approval,

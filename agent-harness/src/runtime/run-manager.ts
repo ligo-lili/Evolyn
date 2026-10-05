@@ -11,6 +11,7 @@ import { openDatabase, defaultDbPath } from "../storage/db.js";
 import { RunRepo } from "../storage/repos/runs.js";
 import { TraceEventRepo } from "../storage/repos/trace-events.js";
 import { CheckpointRepo } from "../storage/repos/checkpoints.js";
+import { ContextWatermarkRepo } from "../storage/repos/context-watermarks.js";
 import { CheckpointWriter } from "../execution/checkpoint.js";
 import { loadCrashedRun, planRecovery, toolResultMessage } from "../execution/recovery.js";
 import {
@@ -431,6 +432,10 @@ export class RunManager {
     // 阶段 9.7: the permission gate is ALWAYS installed — capability checks are
     // not optional. Default options grant everything (backwards compatible).
     const composedBeforeToolCall = composed.beforeToolCall;
+    // 加固期第四轮: persist the summary watermark as it advances — the
+    // write half of the resume optimization (in-memory state dies with the
+    // process; a resumed run continues the rolling summary from the record).
+    const watermarkRepo = database ? new ContextWatermarkRepo(database) : undefined;
     const contextTransformer = createContextTransformer({
       ...options.context,
       model: options.model,
@@ -438,6 +443,7 @@ export class RunManager {
       summaryChat: options.context?.summaryChat,
       onEvent: (event) => recorder?.record(event),
       evidenceBase: path.join(".harness", "evidence", record.id),
+      onWatermark: watermarkRepo ? (watermark) => watermarkRepo.save(record.id, watermark) : undefined,
     });
     const agent = createAgent({
       model: options.model,
@@ -532,6 +538,8 @@ export class RunManager {
     // rejecting — resuming would append a SECOND run_end and permanently break
     // the run_start…run_end bracket that the reader validates.
     const runRepo = new RunRepo(database);
+    // 加固期第四轮: the read side of watermark persistence.
+    const watermarkRepo = new ContextWatermarkRepo(database);
     const storedRow = runRepo.get(runId);
     if (!storedRow) throw new HarnessError(`run "${runId}" not found`);
     mkdirSync(traceDir, { recursive: true });
@@ -779,6 +787,8 @@ export class RunManager {
         historyCount: transcript.length,
         onEvent: (event) => recorder.record(event),
         evidenceBase: path.join(".harness", "evidence", record.id),
+        restoredWatermark: watermarkRepo.get(runId),
+        onWatermark: (watermark) => watermarkRepo.save(runId, watermark),
       }),
     });
     const checkpointWriter = new CheckpointWriter(new CheckpointRepo(database), record.id, () => recorder.lastSeq, {

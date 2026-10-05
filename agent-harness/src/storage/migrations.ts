@@ -301,6 +301,22 @@ export const MIGRATIONS: Migration[] = [
       );
     `,
   },
+  {
+    // 加固期第四轮: the summary watermark's serializable core, so a resumed
+    // run continues its rolling summary instead of re-summarizing the
+    // pre-crash prefix (cost) and re-rendering a different summary message
+    // (prefix bytes → prompt cache). One row per run; reclaimed by prune for
+    // finished runs, like checkpoints.
+    id: 14,
+    name: "context-watermarks",
+    sql: `
+      CREATE TABLE context_watermarks (
+        run_id TEXT PRIMARY KEY REFERENCES runs(id),
+        watermark_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+    `,
+  },
 ];
 
 export function migrate(db: DatabaseSync): void {

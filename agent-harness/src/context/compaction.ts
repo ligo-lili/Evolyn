@@ -10,7 +10,10 @@ import {
   countUnsummarizedConversationBlocks,
   coveredBoundaryIndex,
   replaceCoveredPrefix,
+  restoreWatermark,
+  serializeWatermark,
   summaryCutoffBlockIndex,
+  type PersistedWatermark,
   type SummaryWatermark,
 } from "./reducers/conversation.js";
 import {
@@ -58,6 +61,19 @@ export interface ContextManagementOptions {
    * resume 段消息：最近窗口保护工作集，更老的让出预算。fresh run 不传。
    */
   historyCount?: number;
+  /**
+   * resume 场景（加固期第四轮）：该 run 上一次进程内已推进到的水位线核心
+   * （coveredCount + summary）。首个请求时按当前转录重建 refs / tool_call
+   * ids / cutIndex；转录比记录承诺的短（对账截断）或渲染失败时丢弃记录、
+   * 从新水位线开始（stderr 说明）。
+   */
+  restoredWatermark?: PersistedWatermark;
+  /**
+   * 水位线每次前进（一次成功压缩）后的持久化钩子——resume 优化的一半：
+   * 崩溃后下一次 resume 得以续用滚动摘要，而不是从头重摘已覆盖前缀。
+   * 回调失败只降低 resume 质量（下次会重新摘要），绝不杀 run。
+   */
+  onWatermark?: (watermark: PersistedWatermark) => void;
   /** Evidence 目录（相对路径），截短标记里的全文回查指针。 */
   evidenceBase?: string;
   /** 注入的摘要 chat 函数（测试/独立摘要模型路由）。 */
@@ -106,11 +122,25 @@ export function createContextTransformer(
     evidenceBase: options.evidenceBase ?? options.tool?.evidenceBase,
   };
   const state: PrefixState = { lastRefs: undefined };
+  // 加固期第四轮：恢复的水位线只能在拿到真实转录后重建（refs 等按位置
+  // 重建），因此延迟到首个请求应用一次。
+  let watermarkRestorePending = options.restoredWatermark !== undefined;
 
   // pi 以 (messages, signal) 调用本钩子并 await 其结果——run 被 abort 时
   // 按其"必须不抛、返回安全回退"的契约原样返回，不再发起摘要模型调用。
   return async (messages: AgentMessage[], signal?: AbortSignal): Promise<AgentMessage[]> => {
     if (signal?.aborted) return messages;
+    if (watermarkRestorePending) {
+      watermarkRestorePending = false;
+      const restored = restoreWatermark(options.restoredWatermark!, messages);
+      if (restored) {
+        state.watermark = restored;
+      } else {
+        process.stderr.write(
+          "[harness] context: persisted watermark ignored (transcript shorter than its horizon or unreadable) — starting a fresh one\n",
+        );
+      }
+    }
     const started = Date.now();
     const blocks = partitionMessages(messages);
     const stats = blockStats(blocks);
@@ -179,6 +209,14 @@ export function createContextTransformer(
         if (compacted.ok) {
           projection = compacted.projection;
           state.watermark = compacted.watermark;
+          // 加固期第四轮：水位线前进即持久化（resume 续用滚动摘要的前提）。
+          try {
+            options.onWatermark?.(serializeWatermark(compacted.watermark));
+          } catch (err) {
+            process.stderr.write(
+              `[harness] context: watermark persist failed (${err instanceof Error ? err.message : err}) — resume will re-summarize\n`,
+            );
+          }
           state.lastSummaryFailure = undefined;
           summarized = true;
           summaryChars = compacted.summaryChars;

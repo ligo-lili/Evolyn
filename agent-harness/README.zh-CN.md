@@ -18,7 +18,7 @@ npm run harness -- run "<task>" --model deepseek/deepseek-flash --tools coding -
 
 ## 功能
 
-- **持久执行**——每个 run 在消息边界落 checkpoint；进程被杀后在**同一 runId** 上恢复，trace 序列续号，工具集从 run 行持久化的规格自动还原（crash 的 `--tools coding` run 不会以 demo 默认集续跑）。未决工具调用按规则结算：用日志里的结果重建 / 过门重执行（幂等工具）/ 合成"结果未知"错误回喂模型——绝不幻觉成功。trace 已经跑完的"僵尸 run"自愈（补写状态），不会被恢复成断裂的括号；首个 trace 事件落盘之前就被杀（双 sink 全空）的 run，resume 在同一 runId 下重启任务——除非 checkpoint 或 evidence 文件证明台账是"部分丢失"而非"从未开始"，那时 resume 拒绝重启（避免重复副作用）。
+- **持久执行**——每个 run 在消息边界落 checkpoint；进程被杀后在**同一 runId** 上恢复，trace 序列续号，工具集从 run 行持久化的规格自动还原（crash 的 `--tools coding` run 不会以 demo 默认集续跑）。未决工具调用按规则结算：用日志里的结果重建 / 过门重执行（幂等工具）/ 合成"结果未知"错误回喂模型——绝不幻觉成功。trace 已经跑完的"僵尸 run"自愈（补写状态），不会被恢复成断裂的括号；首个 trace 事件落盘之前就被杀（双 sink 全空）的 run，resume 在同一 runId 下重启任务——除非 checkpoint、持久化水位线或 evidence 文件证明台账是"部分丢失"而非"从未开始"，那时 resume 拒绝重启（避免重复副作用）。
 - **崩溃可复现**——故障注入（`--fault point:tool`）在精确位置杀进程：工具调用之后、执行中途、两份 trace sink 之间、带工具调用的 assistant 消息之后（"planned"窗口）、恢复过程中途——恢复因此可测试，不是表演。
 - **执行即数据库**——每个事件以同一序列号双写 JSONL 与 SQLite；`trace summary / replay --until / query` 回答任意 run 的"做了什么、为什么"，支持跳到任意历史序列号做 debugger 式状态检查。sink 失败留下可容忍的补洞，而不是一条坏日志。
 - **权限与审计**——按 run 授予能力（`fs:read/write`、`process:exec`、`net:outbound`、`notify:send`）、风险分级、显示实际参数的交互审批、覆盖每个路径类参数的工作区路径围栏（词法 + 符号链接 realpath），以及一条写围栏：结构化文件工具不得写入 harness 状态目录（`.harness/`），模型编辑无法绕过记忆库的跨进程锁与 history（shell 类工具仍是显式非目标）；每次决策作为审计事件落入 trace。
@@ -28,7 +28,7 @@ npm run harness -- run "<task>" --model deepseek/deepseek-flash --tools coding -
 - **经验记忆**——双层：结构化 **Core Memory**（只能按 key upsert 单条，每条强制携带 `reason` + `source_statement` 证据，注入按 2000 token 预算裁剪）与**普通记忆**（一条一个 Markdown 文件，`M001…` 自增 id，乐观锁 `revision`，active/archive 且 active 硬顶 25 条，原子写，`history/` 版本快照最近 5 版 FIFO，`INDEX.md` 投影）。写入过**三道闸**：确定性反思门控 → 严格 JSON `{action: none|create|update}` 反思器 → 授权写入（只允许更新本轮 `memory_read` 过全文的记忆——用机制而非提示词）。检索为 chunk 级 FTS（tokenizer 探测 trigram→unicode61）+ 本地 `e5` 向量，按 memory 为单位做 RRF 融合 + accessCount 有界乘性提升，降级链显式（每个结果带 `mode` + `degrade_reason`）。**向量路在后台补全完成后生效**——没建过向量的 run 零模型开销，CLI 在退出前 drain 补全；`memory: { hybrid: false }` 可关。启动以 Markdown 为权威对账，embedding 后台有界退避补全（条件写防旧向量覆盖）。模型工具面：`memory_read / memory_search / memory_create / memory_update / memory_archive / core_memory_update`（coding 工具集默认带）。检索质量由 `npm run eval:memory` 在 CI 门控（recall@5 + precision@5 + 盲区检查，fixture 见 `evals/memory-retrieval.json`）；真实模型链路（下载 → run → backfill 完成 → 下次 run hybrid 召回）用 `npm run e2e:memory-hybrid` 验证——只进台账，不进 CI（30MB 模型下载）。
 - **技能自进化**——从 trace 挖重复模式（support ≥ 3 硬门槛），蒸馏成 pi 兼容的 `SKILL.md`，用 Pi 自己的 loader 校验，作为 `<available_skills>` 注入后续 run——注入内容带溯源标记（"挖自本工作区自己的运行记录，当数据看"）并做结构标记转义，挖出来的内容永远无法冒充系统指令；`--force` 覆盖已有技能需要确认过 diff 才放行。
 - **评测框架**——确定性判分（coding 任务由仓库自己的测试裁决）、回归基线、Wilson 置信区间、门控评测的最小 repeats 下限、基础设施失败防线（被污染的报告标记 INVALID，进不了门控）。
-- **数据保留**——`harness prune` 清理已完成 run 的 checkpoint（恢复只读中断的 run）与超出保留窗口的 trace/evidence。
+- **数据保留**——`harness prune` 清理已完成 run 的 checkpoint 与持久化的上下文水位线（恢复只读中断的 run）与超出保留窗口的 trace/evidence。
 
 ## 模块实现
 
@@ -40,7 +40,7 @@ npm run harness -- run "<task>" --model deepseek/deepseek-flash --tools coding -
 
 - **`trace/`**——事件溯源。事件沿用 Pi 的词汇表，装进带版本号的信封；recorder 扇出到 JSONL（零缓冲 `appendFileSync`——被杀只丢"从未发出"的事件）与 SQLite（提取列建索引），共享同一序列号。`reconcile.ts` 在 resume 前把 JSONL 尾部对齐到 SQLite；`replay.ts` 是纯离线状态机，重建任意序列号处的转录与工具调用状态，并解释"为什么走到这里"。
 
-- **`context/`**——模型视图。`assembler` 确定性组装 system prompt（base → core memory → 技能 → 经验 → workspace 目录树；字节级稳定，利于 prompt cache）。其余是挂在 `transformContext` 上的两层上下文管理：`blocks` 把转录切成四类块（一切压缩的最小单元——绝不产生半截工具轮）；`tokens` 用校准的模型族系数估算、与最后一条实测 Usage 混合；`budget` 推导六条预算线；`reducers/tool` 是确定性的第一层（头尾截断附 evidence 指针、最旧优先整轮移除、语义 JSON 裁剪；resume 段与普通消息同规则老化）；`summarizer` + `reducers/conversation` 是模型驱动的第二层（严格 JSON 滚动摘要带硬校验、covered_message_count 水位线、按引用与 tool_call_id 精确的前缀替换）；`compaction` 是编排器，为每次请求产出 `prefix_decision`（reuse/defer/compact/rebuild）——原始历史永不修改，只产出投影。
+- **`context/`**——模型视图。`assembler` 确定性组装 system prompt（base → core memory → 技能 → 经验 → workspace 目录树；字节级稳定，利于 prompt cache）。其余是挂在 `transformContext` 上的两层上下文管理：`blocks` 把转录切成四类块（一切压缩的最小单元——绝不产生半截工具轮）；`tokens` 用校准的模型族系数估算、与最后一条实测 Usage 混合；`budget` 推导六条预算线；`reducers/tool` 是确定性的第一层（头尾截断附 evidence 指针、最旧优先整轮移除、语义 JSON 裁剪；resume 段与普通消息同规则老化）；`summarizer` + `reducers/conversation` 是模型驱动的第二层（严格 JSON 滚动摘要带硬校验、covered_message_count 水位线——跨 resume 持久化，恢复段续用滚动摘要而非重摘已覆盖前缀——按引用与 tool_call_id 精确的前缀替换）；`compaction` 是编排器，为每次请求产出 `prefix_decision`（reuse/defer/compact/rebuild）——原始历史永不修改，只产出投影。
 
 - **`memory/`**——跨 run 的经验，按 `memory-design.md` 组织。`model`（M### 记录 + 900/180/16 切块，块带 `title | summary` 语义头与 sha256 内容身份）、`store`（Markdown 权威：CORE.md / INDEX.md / active / archive，原子写、互斥守卫、容量硬顶）、`core`（带证据的按 key upsert、token 预算注入）、`search`（chunk 索引 + FTS5 tokenizer 探测 + 按 memory 的 RRF 融合、降级链、启动对账、embedding 后台条件写补全）、`reflection`（确定性门控 → 严格 JSON 反思器 → 授权写入）、`tools`（模型记忆工具面）。
 

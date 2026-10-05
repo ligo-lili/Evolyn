@@ -955,7 +955,7 @@ async function main(): Promise<number> {
       const plan = planPrune(db, { keepRuns: keepFlag, deep: flags.deep === true });
       console.log(
         `prune plan: keep newest ${plan.keepRuns} finished run(s) — ` +
-          `${plan.beyond.length} beyond window, ${plan.checkpointRows} checkpoint row(s) across ${plan.checkpointRuns} finished run(s)${plan.deep ? ", deep (ledger rows + VACUUM)" : ""}`,
+          `${plan.beyond.length} beyond window, ${plan.checkpointRows} checkpoint row(s) + ${plan.watermarkRows} context watermark(s) across ${plan.checkpointRuns} finished run(s)${plan.deep ? ", deep (ledger rows + VACUUM)" : ""}`,
       );
       if (flags["dry-run"] === true) {
         console.log("(dry run — nothing deleted)");
@@ -966,8 +966,8 @@ async function main(): Promise<number> {
         evidenceDir: path.join(harnessDataDir(process.cwd()), "evidence"),
       });
       console.log(
-        `pruned: ${result.checkpointsDeleted} checkpoint row(s), ${result.tracesDeleted} trace file(s), ` +
-          `${result.evidenceDeleted} evidence dir(s), ${result.eventRowsDeleted} ledger row(s), ${(result.bytesFreed / 1024).toFixed(1)} KiB freed`,
+        `pruned: ${result.checkpointsDeleted} checkpoint row(s), ${result.watermarksDeleted} context watermark(s), ` +
+          `${result.tracesDeleted} trace file(s), ${result.evidenceDeleted} evidence dir(s), ${result.eventRowsDeleted} ledger row(s), ${(result.bytesFreed / 1024).toFixed(1)} KiB freed`,
       );
     } finally {
       db.close();

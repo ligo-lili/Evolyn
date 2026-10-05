@@ -8,6 +8,7 @@ import { harnessDataDir } from "../runtime/paths.js";
 import type { RunRecord } from "../runtime/run-manager.js";
 import type { AnyAgentTool } from "../runtime/tools/index.js";
 import { CheckpointRepo, type CheckpointRow } from "../storage/repos/checkpoints.js";
+import { ContextWatermarkRepo } from "../storage/repos/context-watermarks.js";
 import { RunRepo } from "../storage/repos/runs.js";
 import { TraceEventRepo } from "../storage/repos/trace-events.js";
 import type { CheckpointState, TrackedToolCall } from "./checkpoint.js";
@@ -80,9 +81,11 @@ export function loadCrashedRun(db: DatabaseSync, runId: string, tools: readonly 
     // evidence files would prove the ledger was partially LOST, not never
     // started — a restart could then duplicate side effects; refuse instead.
     const checkpoint = new CheckpointRepo(db).latest(runId);
-    if (checkpoint) {
+    const watermark = new ContextWatermarkRepo(db).get(runId);
+    if (checkpoint || watermark) {
+      const proof = checkpoint ? `checkpoint seq ${checkpoint.seq} exists` : "a persisted context watermark exists";
       throw new HarnessError(
-        `run "${runId}" has an empty trace but checkpoint seq ${checkpoint.seq} exists — the ledger was ` +
+        `run "${runId}" has an empty trace but ${proof} — the ledger was ` +
           `partially lost; refusing to restart (re-running could duplicate side effects) — repair or clear the record by hand`,
       );
     }

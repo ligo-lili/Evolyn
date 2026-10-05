@@ -23,6 +23,8 @@ export interface PrunePlan {
   /** Checkpoint rows that would be deleted (all finished runs). */
   checkpointRows: number;
   checkpointRuns: number;
+  /** 加固期第四轮: context watermark rows of finished runs (same lifecycle as checkpoints). */
+  watermarkRows: number;
   deep: boolean;
 }
 
@@ -41,17 +43,24 @@ export function planPrune(db: DatabaseSync, options: { keepRuns?: number; deep?:
   const checkpointRow = db
     .prepare("SELECT COUNT(*) AS n FROM checkpoints WHERE run_id IN (SELECT id FROM runs WHERE status != 'running')")
     .get() as { n: number };
+  const watermarkRow = db
+    .prepare(
+      "SELECT COUNT(*) AS n FROM context_watermarks WHERE run_id IN (SELECT id FROM runs WHERE status != 'running')",
+    )
+    .get() as { n: number };
   return {
     keepRuns,
     beyond,
     checkpointRows: Number(checkpointRow.n),
     checkpointRuns: finished.length,
+    watermarkRows: Number(watermarkRow.n),
     deep: options.deep ?? false,
   };
 }
 
 export interface PruneResult {
   checkpointsDeleted: number;
+  watermarksDeleted: number;
   tracesDeleted: number;
   evidenceDeleted: number;
   eventRowsDeleted: number;
@@ -95,6 +104,12 @@ export function applyPrune(
     .prepare("DELETE FROM checkpoints WHERE run_id IN (SELECT id FROM runs WHERE status != 'running')")
     .run();
   const checkpointsDeleted = Number(cpResult.changes);
+  // 1b. 加固期第四轮: context watermarks — same lifecycle (resume only reads
+  // interrupted runs' records; a finished run never resumes again).
+  const wmResult = db
+    .prepare("DELETE FROM context_watermarks WHERE run_id IN (SELECT id FROM runs WHERE status != 'running')")
+    .run();
+  const watermarksDeleted = Number(wmResult.changes);
 
   // 2. traces + evidence beyond the keep window.
   for (const run of plan.beyond) {
@@ -120,5 +135,5 @@ export function applyPrune(
     db.exec("VACUUM");
   }
 
-  return { checkpointsDeleted, tracesDeleted, evidenceDeleted, eventRowsDeleted, bytesFreed };
+  return { checkpointsDeleted, watermarksDeleted, tracesDeleted, evidenceDeleted, eventRowsDeleted, bytesFreed };
 }

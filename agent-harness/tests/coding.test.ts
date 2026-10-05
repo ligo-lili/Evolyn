@@ -1618,6 +1618,10 @@ describe("加固期: prune (retention)", () => {
         db.prepare(
           "INSERT INTO checkpoints (run_id, seq, kind, state_json, created_at) VALUES (?, 1, 'message_boundary', '{}', ?)",
         ).run(id, new Date().toISOString());
+        db.prepare("INSERT INTO context_watermarks (run_id, watermark_json, updated_at) VALUES (?, '{}', ?)").run(
+          id,
+          new Date().toISOString(),
+        );
       });
       const tracesDirPath = path.join(tmp.dir, "prune", "traces");
       const evidencePath = path.join(tmp.dir, "prune", "evidence");
@@ -1629,14 +1633,23 @@ describe("加固期: prune (retention)", () => {
       }
       const plan = planPrune(db, { keepRuns: 2 });
       expect(plan.beyond.map((r) => r.runId).sort()).toEqual(["old-1", "old-2"]);
+      expect(plan.watermarkRows).toBe(4); // the four FINISHED runs
       const result = applyPrune(db, plan, { tracesDir: tracesDirPath, evidenceDir: evidencePath });
       expect(result.tracesDeleted).toBe(2);
       expect(result.evidenceDeleted).toBe(2);
+      expect(result.watermarksDeleted).toBe(4);
       const cpRows = (id: string): number =>
         Number((db.prepare("SELECT COUNT(*) AS n FROM checkpoints WHERE run_id = ?").get(id) as { n: number }).n);
       expect(cpRows("old-1")).toBe(0);
       expect(cpRows("new-1")).toBe(0);
       expect(cpRows("live-1")).toBe(1); // interrupted runs keep their checkpoints
+      const wmRows = (id: string): number =>
+        Number(
+          (db.prepare("SELECT COUNT(*) AS n FROM context_watermarks WHERE run_id = ?").get(id) as { n: number }).n,
+        );
+      expect(wmRows("old-1")).toBe(0);
+      expect(wmRows("new-1")).toBe(0);
+      expect(wmRows("live-1")).toBe(1); // …and their watermarks
     } finally {
       db.close();
     }

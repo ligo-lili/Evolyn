@@ -11,6 +11,8 @@ import { readTraceFile } from "../src/trace/read.js";
 import { RunManager } from "../src/runtime/run-manager.js";
 import { CollectingReporter } from "../src/runtime/reporter.js";
 import { sendNotificationTool } from "../src/runtime/tools/send-notification.js";
+import { readFileTool } from "../src/runtime/tools/read-file.js";
+import { ContextWatermarkRepo } from "../src/storage/repos/context-watermarks.js";
 import { assistantMessage, FAKE_MODEL, makeTempCwd, scriptedStreamFn } from "./helpers.js";
 
 const tmp = makeTempCwd();
@@ -58,12 +60,19 @@ async function seedRun(prefix: string): Promise<{ runId: string; dbPath: string 
  * log, reset the run row to running, drop checkpoints that would lead the log,
  * and mirror the surviving rows into the JSONL (a real kill truncates both).
  */
-function crashAround(dbPath: string, runId: string, type: string, mode: "through" | "before"): number {
+function crashAround(dbPath: string, runId: string, type: string, mode: "through" | "before", occurrence = 1): number {
   const db = openDatabase(dbPath);
   try {
     const events = new TraceEventRepo(db).getByRun(runId);
-    const idx = events.findIndex((e) => e.type === type);
-    if (idx === -1) throw new Error(`event ${type} not found in seeded run`);
+    let idx = -1;
+    for (let seen = 0, i = 0; i < events.length; i++) {
+      if (events[i]!.type !== type) continue;
+      if (++seen === occurrence) {
+        idx = i;
+        break;
+      }
+    }
+    if (idx === -1) throw new Error(`event ${type} #${occurrence} not found in seeded run`);
     const cutSeq = (mode === "through" ? events[idx] : events[idx - 1])?.seq;
     if (cutSeq === undefined) throw new Error("cut seq undefined");
     db.prepare("DELETE FROM trace_events WHERE run_id = ? AND seq > ?").run(runId, cutSeq);
@@ -389,5 +398,106 @@ describe("crash recovery (阶段 5/6)", () => {
     const trace = readTraceFile(result.tracePath as string);
     expect(trace.events.some((e) => e.type === "recovery_action" && e.action === "synthesize_error")).toBe(false);
     expect(trace.events.some((e) => e.type === "recovery_action" && e.action === "reexecute")).toBe(true);
+  });
+
+  it("加固期第四轮: a persisted watermark survives the crash and resume continues it (no re-summarization)", async () => {
+    fs.writeFileSync(path.join(tmp.dir, "wm-a.txt"), "ALPHA-" + "a".repeat(2000), "utf8");
+    fs.writeFileSync(path.join(tmp.dir, "wm-b.txt"), "BRAVO-" + "b".repeat(2000), "utf8");
+    fs.writeFileSync(path.join(tmp.dir, "wm-c.txt"), "CHARLIE-" + "c".repeat(2000), "utf8");
+    fs.writeFileSync(path.join(tmp.dir, "wm-d.txt"), "DELTA-" + "d".repeat(2000), "utf8");
+    const dbPath = path.join(tmp.dir, "watermark", "harness.db");
+    const summaryJson = JSON.stringify({
+      current_objective: "read the files",
+      user_constraints: [],
+      key_decisions: [],
+      completed_work: [],
+      current_state: [],
+      pending_work: [],
+      important_facts: [],
+    });
+    const readStep = (id: string, file: string) =>
+      assistantMessage([{ type: "toolCall", id, name: "read_file", arguments: { path: file } }], "toolUse");
+    // 小窗口强制压缩：第 4 次请求时水位线覆盖 user + r1，第 5 次推进到 r2。
+    const seeder = new RunManager();
+    const seed = await seeder.run({
+      task: "read three files in order",
+      model: { ...FAKE_MODEL, contextWindow: 300 },
+      streamFn: scriptedStreamFn([
+        readStep("r1", "wm-a.txt"),
+        readStep("r2", "wm-b.txt"),
+        readStep("r3", "wm-c.txt"),
+        readStep("r4", "wm-d.txt"),
+        assistantMessage([{ type: "text", text: "all done" }], "stop"),
+      ]),
+      reporter: new CollectingReporter(),
+      database: dbPath,
+      tools: [readFileTool],
+      context: { summaryChat: async () => summaryJson },
+    });
+    seeder.close();
+    expect(seed.record.status).toBe("completed");
+
+    // 完成态的行保留在库里（prune 回收）；手术把它变成真实的"in-flight 崩溃"。
+    const db0 = openDatabase(dbPath);
+    const persisted = new ContextWatermarkRepo(db0).get(seed.record.id);
+    db0.close();
+    expect(persisted).toBeTruthy();
+    expect(persisted!.coveredCount).toBe(5);
+    crashAround(dbPath, seed.record.id, "tool_execution_start", "through", 4);
+
+    const resumedPrompts: string[] = [];
+    const manager = new RunManager();
+    const result = await manager.resume(seed.record.id, {
+      model: { ...FAKE_MODEL, contextWindow: 300 },
+      streamFn: scriptedStreamFn([assistantMessage([{ type: "text", text: "resumed fine" }], "stop")]),
+      reporter: new CollectingReporter(),
+      database: dbPath,
+      tools: [readFileTool],
+      context: {
+        summaryChat: async (turns) => {
+          resumedPrompts.push(turns[0]!.content);
+          return summaryJson;
+        },
+      },
+    });
+    manager.close();
+
+    expect(result.record.status).toBe("completed");
+    // 续用持久化水位线：恢复段第一次摘要的材料只含未覆盖的尾部——CHARLIE（r3）
+    // 与 DELTA（r4）在材料里；ALPHA/BRAVO 已被覆盖，绝不重新进入摘要
+    // （未持久化时水位线从 0 重建，材料会从头包含 ALPHA/BRAVO）。
+    const first = resumedPrompts[0]!;
+    expect(first).toContain("CHARLIE");
+    expect(first).toContain("DELTA");
+    expect(first).not.toContain("ALPHA");
+    expect(first).not.toContain("BRAVO");
+  });
+
+  it("加固期第四轮: refuses to restart when only a persisted watermark proves progress", async () => {
+    const { runId, dbPath } = await seedRun("guard-watermark");
+    const db = openDatabase(dbPath);
+    db.prepare("DELETE FROM trace_events WHERE run_id = ?").run(runId);
+    db.prepare("DELETE FROM checkpoints WHERE run_id = ?").run(runId);
+    db.prepare("UPDATE runs SET status = 'running', finished_at = NULL, error = NULL WHERE id = ?").run(runId);
+    // seedRun 的模型窗口很大、无压缩——此处直接构造该记录（守卫只关心存在性）。
+    db.prepare("INSERT INTO context_watermarks (run_id, watermark_json, updated_at) VALUES (?, ?, ?)").run(
+      runId,
+      JSON.stringify({ coveredCount: 1, summary: { current_objective: "t" } }),
+      new Date().toISOString(),
+    );
+    db.close();
+    fs.rmSync(path.join(tmp.dir, ".harness", "traces", `${runId}.jsonl`), { force: true });
+
+    const manager = new RunManager();
+    await expect(
+      manager.resume(runId, {
+        model: FAKE_MODEL,
+        streamFn: scriptedStreamFn([]),
+        reporter: new CollectingReporter(),
+        database: dbPath,
+        tools: TOOLS,
+      }),
+    ).rejects.toThrow(/persisted context watermark/);
+    manager.close();
   });
 });

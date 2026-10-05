@@ -33,6 +33,67 @@ export interface SummaryWatermark {
   summaryMessage: AgentMessage;
 }
 
+/**
+ * 加固期第四轮: the serializable core of the watermark. Object references do
+ * not survive a process, so refs / tool-call ids / cut index are rebuilt from
+ * the transcript on restore; only the two fields that CANNOT be recomputed —
+ * how much was covered, and the summary itself — are persisted. Persisting
+ * lets a resumed run continue the rolling summary instead of re-summarizing
+ * the pre-crash prefix from scratch (cost) and re-rendering a different
+ * summary message (prefix bytes → prompt cache).
+ */
+export interface PersistedWatermark {
+  coveredCount: number;
+  summary: RollingConversationSummary;
+}
+
+export function serializeWatermark(watermark: SummaryWatermark): PersistedWatermark {
+  return { coveredCount: watermark.coveredCount, summary: watermark.summary };
+}
+
+/**
+ * Rebuild a live watermark from its persisted core against the CURRENT
+ * transcript. Returns undefined when the record cannot be trusted: a
+ * transcript holding fewer non-system messages than the watermark claims
+ * means the log lost events below its horizon (reconcile truncation), and a
+ * summary that fails to render means the persisted JSON is corrupt — in both
+ * cases the caller falls back to a fresh watermark rather than silently
+ * dropping messages from the model's view.
+ */
+export function restoreWatermark(
+  persisted: PersistedWatermark,
+  messages: readonly AgentMessage[],
+): SummaryWatermark | undefined {
+  if (!Number.isInteger(persisted.coveredCount) || persisted.coveredCount < 0) return undefined;
+  const nonSystem = messages.filter((m) => m.role !== "system");
+  if (persisted.coveredCount > nonSystem.length) return undefined;
+  const covered = nonSystem.slice(0, persisted.coveredCount);
+  const coveredRefs = new Set<object>(covered as object[]);
+  const coveredToolCallIds = new Set<string>();
+  for (const m of covered) {
+    for (const id of toolCallIdsOf(m)) coveredToolCallIds.add(id);
+    if (m.role === "toolResult") coveredToolCallIds.add(m.toolCallId);
+  }
+  let summaryMessage: AgentMessage;
+  try {
+    summaryMessage = {
+      role: "user",
+      content: renderSummaryText(persisted.summary),
+      timestamp: Date.now(),
+    } as AgentMessage;
+  } catch {
+    return undefined;
+  }
+  return {
+    coveredCount: persisted.coveredCount,
+    summary: persisted.summary,
+    coveredRefs,
+    coveredToolCallIds,
+    cutIndex: leadingSystemRunEnd(messages),
+    summaryMessage,
+  };
+}
+
 export interface CutoffOptions {
   /** 受保护的最近普通对话块数。默认 4。 */
   keepConversationBlocks?: number;

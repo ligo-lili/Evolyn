@@ -760,6 +760,55 @@ describe("context transformer (prefix decisions)", () => {
     expect(JSON.stringify(out)).toContain("<context-summary>");
   });
 
+  it("加固期第四轮: a restored watermark continues the rolling summary (covered prefix is not re-summarized)", async () => {
+    const prompts: string[] = [];
+    const transformer = createContextTransformer({
+      model: { ...FAKE_MODEL, contextWindow: WINDOW },
+      summaryChat: async (turns) => {
+        prompts.push(turns[0]!.content);
+        return JSON.stringify(validSummary());
+      },
+      // 崩溃前已覆盖 user + r1（3 条非 system 消息）。
+      restoredWatermark: { coveredCount: 3, summary: validSummary() },
+    });
+    const messages: AgentMessage[] = [
+      m("system", "sys"),
+      m("user", "old task"),
+      ...round("r1", 2000),
+      ...round("r2", 2000),
+      ...round("r3", 2000),
+    ];
+    const out = await transformer(messages);
+    expect(JSON.stringify(out)).toContain("<context-summary>");
+    // 材料只含未覆盖的尾部（材料下限扩展越过受保护窗口）；已覆盖的 r1 不再
+    // 进入摘要 prompt——未持久化时水位线从 0 重建，材料=user+r1（含 r1、不含 r2）。
+    expect(prompts[0]).toContain('"r2"');
+    expect(prompts[0]).not.toContain('"r1"');
+  });
+
+  it("加固期第四轮: a stale restored watermark (transcript shorter than claimed) is dropped safely", async () => {
+    const prompts: string[] = [];
+    const transformer = createContextTransformer({
+      model: { ...FAKE_MODEL, contextWindow: WINDOW },
+      summaryChat: async (turns) => {
+        prompts.push(turns[0]!.content);
+        return JSON.stringify(validSummary());
+      },
+      restoredWatermark: { coveredCount: 99, summary: validSummary() },
+    });
+    const messages: AgentMessage[] = [
+      m("system", "sys"),
+      m("user", "old task"),
+      ...round("r1", 2000),
+      ...round("r2", 2000),
+      ...round("r3", 2000),
+    ];
+    const out = await transformer(messages);
+    // 记录不可信 → 回退新水位线：材料从转录头部开始（含 r1），一切照常。
+    expect(prompts[0]).toContain('"r1"');
+    expect(JSON.stringify(out)).toContain("<context-summary>");
+  });
+
   it("gate ③: a summary that is not smaller than the material is rejected", async () => {
     const decisions: { summarized: boolean; reason: string }[] = [];
     const transformer = createContextTransformer({

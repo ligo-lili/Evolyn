@@ -29,9 +29,9 @@ environment. Tool calls default to **interactive approval**; `--yolo` opts out.
   A "zombie" run whose trace already finished is self-healed (status
   backfilled), not resumed into a broken bracket; a run killed before its
   FIRST trace event (empty ledger in both sinks) restarts the task under the
-  same run id — unless a checkpoint or evidence file proves the ledger was
-  partially lost, in which case resume refuses rather than risk re-running
-  side effects.
+  same run id — unless a checkpoint, a persisted watermark or evidence file
+  proves the ledger was partially lost, in which case resume refuses rather
+  than risk re-running side effects.
 - **Reproducible crashes** — fault injection (`--fault point:tool`) kills the
   process at exact points — after a tool call, mid-execution, between the two
   trace sinks, after a tool-carrying assistant message ("planned"), or mid-
@@ -117,9 +117,9 @@ environment. Tool calls default to **interactive approval**; `--yolo` opts out.
   coding tasks), regression baselines, Wilson confidence intervals, a
   minimum-repeats floor for anything that gates, and an infra-failure guard
   that marks contaminated reports INVALID before they can gate anything.
-- **Data retention** — `harness prune` drops checkpoints of finished runs
-  (recovery only reads interrupted ones) and traces/evidence beyond a keep
-  window.
+- **Data retention** — `harness prune` drops checkpoints AND persisted
+  context watermarks of finished runs (recovery only reads interrupted ones)
+  and traces/evidence beyond a keep window.
 
 ## Modules
 
@@ -162,8 +162,9 @@ keys.
   an evidence pointer, remove whole rounds oldest-first, semantic JSON
   trimming; resumed segments age out under the same rules); `summarizer` + `reducers/conversation`
   are the model-driven layer-2 (strict JSON rolling summary with hard
-  validation, a covered-message watermark, and id/tool-call-precise prefix
-  replacement); `compaction` is the orchestrator producing a `prefix_decision`
+  validation, a covered-message watermark — persisted across resume so a
+  resumed run continues its rolling summary instead of re-summarizing the
+  pre-crash prefix — and id/tool-call-precise prefix replacement); `compaction` is the orchestrator producing a `prefix_decision`
   (reuse/defer/compact/rebuild) for every request — the raw history is never
   modified, only projected. `compose.ts` is the shared tool-wrapper chain and
   the gate composition, reused verbatim by the explore subagent as

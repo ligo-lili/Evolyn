@@ -1,0 +1,56 @@
+{
+  "metrics": [
+    {
+      "id": "pass",
+      "kind": "binary",
+      "label": "Task pass"
+    },
+    {
+      "id": "verified",
+      "kind": "binary",
+      "label": "Write→read"
+    }
+  ],
+  "perf_fields": [
+    {
+      "id": "latency_s",
+      "label": "latency",
+      "unit": "s"
+    },
+    {
+      "id": "tool_calls",
+      "label": "tools"
+    },
+    {
+      "id": "in_tokens",
+      "label": "tok in"
+    },
+    {
+      "id": "out_tokens",
+      "label": "tok out"
+    }
+  ],
+  "harness_paths": [
+    "evals/coding-fix-v1.json",
+    "evals/file-creation.json",
+    "evals/file-precision-v1.json",
+    "evals/fixtures/inventory-cli/config.js",
+    "evals/fixtures/inventory-cli/package.json",
+    "evals/fixtures/inventory-cli/service.js",
+    "evals/fixtures/inventory-cli/test.js",
+    "evals/fixtures/string-utils/index.js",
+    "evals/fixtures/string-utils/lib/format.js",
+    "evals/fixtures/string-utils/lib/parse-v1.js",
+    "evals/fixtures/string-utils/lib/parse.js",
+    "evals/fixtures/string-utils/package.json",
+    "evals/fixtures/string-utils/test.js",
+    "evals/fixtures/todo-store/package.json",
+    "evals/fixtures/todo-store/serializer.js",
+    "evals/fixtures/todo-store/store.js",
+    "evals/fixtures/todo-store/test.js",
+    "src/learning/eval.ts",
+    "src/learning/judge.ts",
+    "src/learning/protocol.ts"
+  ],
+  "harness_sha": "c80e884211a64a6f9457ca2ee86d13da619cb0f567367034898666408726e3bd"
+}

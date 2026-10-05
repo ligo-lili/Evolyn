@@ -16,3 +16,11 @@ dist/
 
 # local-only docs
 STATUS.md
+
+# hillclimb eval: derived/bulk output stays out; runner, inputs.md, _state.json
+# and baseline/results.jsonl are tracked
+.claude/hillclimb/**/_workspace/
+.claude/hillclimb/**/traces/
+.claude/hillclimb/**/trajectory/
+.claude/hillclimb/**/report.html
+.claude/hillclimb/**/progress.txt

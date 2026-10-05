@@ -30,10 +30,11 @@ import type { AnyAgentTool } from "./index.js";
  * resolve INTO the harness state dir (.harness): memory files, traces and the
  * db were otherwise writable with a plain write tool, bypassing the memory
  * store's cross-process locks, history snapshots, INDEX projection and the
- * three write gates. The check is realpath-based (a junction alias into
- * .harness cannot dodge it) and one-directional: readers are unaffected, the
- * sanctioned memory tools write through the store (their args are ids, not
- * paths), and shell-class tools stay the documented non-goal above.
+ * three write gates. The check is lexical + realpath-based (a junction alias
+ * into .harness cannot dodge it, and the lexical layer also holds before the
+ * dir exists) and one-directional: readers are unaffected, the sanctioned
+ * memory tools write through the store (their args are ids, not paths), and
+ * shell-class tools stay the documented non-goal above.
  */
 
 function assertNoStreamSpecifier(resolved: string, raw: string): void {
@@ -85,17 +86,31 @@ function isStructuredWriter(toolName: string): boolean {
 
 /**
  * Refuse a structured WRITE whose target resolves into the harness state dir.
- * Realpath-based, mirroring assertInsideRealRoot: the deepest existing
- * ancestor is realpathed, so `alias -> .harness` junctions and dot-segment
- * spellings that normalize elsewhere are both handled correctly. When the
- * state dir does not exist yet there is no harness state to protect.
+ * Two layers: a LEXICAL check that also holds before the dir exists (a writer
+ * must never be the thing that creates `.harness` — 加固期第五轮), and a
+ * realpath probe (mirroring assertInsideRealRoot) so `alias -> .harness`
+ * junctions and dot-segment spellings normalize correctly.
+ *
+ * Known non-goals (documented scope): hard links are invisible to realpath
+ * (they require a same-volume link created outside the run); the guard covers
+ * the DEFAULT state location only — state relocated via the programmatic
+ * API's custom database/traceDir is out of scope; and a new structured writer
+ * must be registered in TOOL_PERMISSIONS to be recognized as one.
  */
 function assertNotHarnessStateWrite(root: string, resolved: string, raw: string): void {
+  const refuse = (): never => {
+    throw new Error(
+      `refusing to write into the harness state directory (${raw}) — it holds the memory store, traces and the ledger; ` +
+        `use the memory tools for memory files`,
+    );
+  };
+  const lexicalRel = path.relative(path.resolve(root), resolved);
+  if (lexicalRel === ".harness" || lexicalRel.startsWith(".harness" + path.sep)) refuse();
   let realState: string;
   try {
     realState = fs.realpathSync(harnessDataDir(root));
   } catch {
-    return; // no state dir yet — nothing to protect
+    return; // dir absent — the lexical layer already covered the literal path
   }
   let probe = resolved;
   while (!fs.existsSync(probe)) {
@@ -111,12 +126,7 @@ function assertNotHarnessStateWrite(root: string, resolved: string, raw: string)
   }
   const rel = path.relative(realState, real);
   const inside = rel === "" || (!rel.startsWith(".." + path.sep) && rel !== ".." && !path.isAbsolute(rel));
-  if (inside) {
-    throw new Error(
-      `refusing to write into the harness state directory (${raw}) — it holds the memory store, traces and the ledger; ` +
-        `use the memory tools for memory files`,
-    );
-  }
+  if (inside) refuse();
 }
 
 /** Wrap every tool so path-like arguments must stay inside the workspace root. */

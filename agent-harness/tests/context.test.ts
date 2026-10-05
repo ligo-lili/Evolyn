@@ -809,6 +809,29 @@ describe("context transformer (prefix decisions)", () => {
     expect(JSON.stringify(out)).toContain("<context-summary>");
   });
 
+  it("加固期第五轮: the material floor consumes protected blocks ONE at a time (off-by-one fix)", async () => {
+    const decisions: { summarized: boolean; coveredMessageCount: number }[] = [];
+    const transformer = createContextTransformer({
+      model: { ...FAKE_MODEL, contextWindow: WINDOW },
+      summaryChat: summaryChat(validSummary()),
+      onDecision: (d) => decisions.push({ summarized: d.summarized, coveredMessageCount: d.coveredMessageCount }),
+    });
+    const messages: AgentMessage[] = [
+      m("system", "sys"),
+      m("user", "task"),
+      ...round("rA", 40), // tiny round → the pre-cutoff material stays under the floor
+      ...round("rB", 2000), // first protected block — consumed by the extension
+      ...round("rC", 2000), // newest — must stay protected and RAW
+    ];
+    const out = await transformer(messages);
+    expect(decisions[0]!.summarized).toBe(true);
+    // 材料 = user + rA + rB（恰好越过 256 下限即停）——旧代码第一步会连 rC
+    // 一起吞掉（coveredCount 7），把最新的工作证据折进摘要。
+    expect(decisions[0]!.coveredMessageCount).toBe(5);
+    expect(JSON.stringify(out)).toContain('"rC"');
+    expect(JSON.stringify(out)).not.toContain('"rB"');
+  });
+
   it("gate ③: a summary that is not smaller than the material is rejected", async () => {
     const decisions: { summarized: boolean; reason: string }[] = [];
     const transformer = createContextTransformer({

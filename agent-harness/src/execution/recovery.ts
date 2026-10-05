@@ -61,7 +61,12 @@ export interface CrashedRun {
  *   executing          started, no end recorded — outcome unknown
  *   executed-no-result tool_execution_end recorded, toolResult message missing
  */
-export function loadCrashedRun(db: DatabaseSync, runId: string, tools: readonly AnyAgentTool[]): CrashedRun {
+export function loadCrashedRun(
+  db: DatabaseSync,
+  runId: string,
+  tools: readonly AnyAgentTool[],
+  opts: { traceFile?: string } = {},
+): CrashedRun {
   const record = new RunRepo(db).get(runId);
   if (!record) throw new HarnessError(`run "${runId}" not found`);
   if (record.status !== "running") throw new HarnessError(`run "${runId}" is ${record.status}, not resumable`);
@@ -70,19 +75,21 @@ export function loadCrashedRun(db: DatabaseSync, runId: string, tools: readonly 
   const first = events[0];
   const last = events.at(-1);
   if (!first) {
-    // 加固期第二轮: a run killed in the window between the runs-row insert and
-    // its FIRST trace event (run_start) used to be a permanently stuck row
-    // ("no trace to recover"). With an empty ledger in both stores nothing can
-    // have executed — every event is written synchronously, tool executions
-    // are preceded by their events, and reconcile just cleared any lone
-    // first-event JSONL remnant — so the correct continuation is restarting
-    // the task under the same run id (the resume drives the empty transcript
-    // through its ordinary prompt(task) branch). Guard: a checkpoint row or
-    // evidence files would prove the ledger was partially LOST, not never
-    // started — a restart could then duplicate side effects; refuse instead.
+    // 加固期第二轮/第五轮: a run killed in the window between the runs-row
+    // insert and its FIRST trace event (run_start) used to be a permanently
+    // stuck row ("no trace to recover"). The restart is only provable when a
+    // trace sink actually ran: the between-sinks remnant was just cleared by
+    // reconcile, which leaves the trace FILE behind (empty) — while a
+    // trace-less run (`trace: false`) never creates it, and with no recorder
+    // a crashed trace-less run can have executed tools with zero durable
+    // events. So: restart requires the trace file's existence, and refuses on
+    // any counter-proof — a checkpoint, a watermark (even a corrupt one), or
+    // evidence files all mean the ledger was partially LOST, and a restart
+    // could duplicate side effects. The evidence read itself fails CLOSED: an
+    // unreadable directory is "cannot prove", not "no evidence".
     const checkpoint = new CheckpointRepo(db).latest(runId);
-    const watermark = new ContextWatermarkRepo(db).get(runId);
-    if (checkpoint || watermark) {
+    const watermarkRepo = new ContextWatermarkRepo(db);
+    if (checkpoint || watermarkRepo.exists(runId)) {
       const proof = checkpoint ? `checkpoint seq ${checkpoint.seq} exists` : "a persisted context watermark exists";
       throw new HarnessError(
         `run "${runId}" has an empty trace but ${proof} — the ledger was ` +
@@ -92,14 +99,26 @@ export function loadCrashedRun(db: DatabaseSync, runId: string, tools: readonly 
     const evidenceDir = path.join(harnessDataDir(process.cwd()), "evidence", runId);
     let evidence: string[] = [];
     try {
-      evidence = fs.existsSync(evidenceDir) ? fs.readdirSync(evidenceDir) : [];
-    } catch {
+      evidence = fs.readdirSync(evidenceDir);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw new HarnessError(
+          `run "${runId}" has an empty trace and the evidence directory ${evidenceDir} cannot be read ` +
+            `(${err instanceof Error ? err.message : err}) — cannot prove the run never executed; refusing to restart`,
+        );
+      }
       evidence = [];
     }
     if (evidence.length > 0) {
       throw new HarnessError(
         `run "${runId}" has an empty trace but ${evidence.length} evidence file(s) exist under ${evidenceDir} — ` +
           `the ledger was partially lost; refusing to restart (re-running could duplicate side effects)`,
+      );
+    }
+    if (opts.traceFile === undefined || !fs.existsSync(opts.traceFile)) {
+      throw new HarnessError(
+        `run "${runId}" has no trace to recover — no event was ever recorded and the trace file is missing ` +
+          `(the run was trace-less, or died before its first trace append); refusing an unprovable restart`,
       );
     }
     return {

@@ -27,11 +27,11 @@ environment. Tool calls default to **interactive approval**; `--yolo` opts out.
   result, gated re-execute (idempotent tools), or a synthesized
   "result unknown" error fed back to the model — never a hallucinated success.
   A "zombie" run whose trace already finished is self-healed (status
-  backfilled), not resumed into a broken bracket; a run killed before its
-  FIRST trace event (empty ledger in both sinks) restarts the task under the
-  same run id — unless a checkpoint, a persisted watermark or evidence file
-  proves the ledger was partially lost, in which case resume refuses rather
-  than risk re-running side effects.
+  backfilled), not resumed into a broken bracket; a run killed between the
+  sinks of its FIRST trace event restarts the task under the same run id —
+  but only when the trace file proves the run was traced and no checkpoint,
+  watermark or evidence file proves the ledger was partially lost; otherwise
+  resume refuses rather than risk re-running side effects.
 - **Reproducible crashes** — fault injection (`--fault point:tool`) kills the
   process at exact points — after a tool call, mid-execution, between the two
   trace sinks, after a tool-carrying assistant message ("planned"), or mid-

@@ -412,14 +412,16 @@ describe("加固期: timeouts and aborts are never retried", () => {
 });
 
 describe("加固期第三轮: notifications are log-safe", () => {
-  it("escapes tabs/newlines so model-controlled fields cannot forge log rows", async () => {
+  it("escapes CR/tabs/newlines so model-controlled fields cannot forge log rows", async () => {
     tmp.enter();
     const dir = tmp.dir;
-    await sendNotificationTool.execute("call_x", { channel: "email", message: "line1\nforged\trow" });
+    await sendNotificationTool.execute("call_x", { channel: "email", message: "line1\nforged\trow\rcr-forged" });
     const log = fs.readFileSync(path.join(dir, ".harness", "notifications.log"), "utf8");
     tmp.leave();
-    const lines = log.trim().split("\n");
-    expect(lines).toHaveLength(1); // the embedded \n cannot forge a second line
-    expect(lines[0]).toContain("line1\\nforged\\trow"); // the payload is visible, escaped
+    // CR-aware readers (readline, universal newlines) split on \r too — it is
+    // escaped like the rest.
+    const lines = log.trim().split(/\r?\n/);
+    expect(lines).toHaveLength(1); // the embedded \n/\r cannot forge a second line
+    expect(lines[0]).toContain("line1\\nforged\\trow\\rcr-forged"); // the payload is visible, escaped
   });
 });

@@ -226,7 +226,7 @@ function finalizeRun(input: {
   end: (status: RunStatus, error: string | undefined) => void;
   unsubscribe: () => void;
   runRepo: RunRepo | undefined;
-  /** "run" / "resumed" — only used in the persistence-failure message. */
+  /** "run" / "resumed run" — only used in the persistence-failure message. */
   label: string;
 }): void {
   let { status, error } = input;
@@ -243,7 +243,7 @@ function finalizeRun(input: {
     input.runRepo?.updateStatus(input.record);
   } catch (err) {
     process.stderr.write(
-      `[harness] failed to persist ${input.label} run status: ${err instanceof Error ? err.message : err}\n`,
+      `[harness] failed to persist ${input.label} status: ${err instanceof Error ? err.message : err}\n`,
     );
   }
 }
@@ -627,7 +627,7 @@ export class RunManager {
           })
         : [];
     const resolvedTools = resolveTools(toolsetSpec, exploreDeps);
-    const crashed = loadCrashedRun(database, runId, [...resolvedTools, ...memoryTools]);
+    const crashed = loadCrashedRun(database, runId, [...resolvedTools, ...memoryTools], { traceFile });
     // 加固期第二轮: durable-record contradictions (checkpoint vs trace) and the
     // empty-ledger restart are surfaced loudly — never silently repaired.
     for (const note of crashed.degradations) process.stderr.write(`[harness] recovery: ${note}\n`);
@@ -787,7 +787,12 @@ export class RunManager {
         historyCount: transcript.length,
         onEvent: (event) => recorder.record(event),
         evidenceBase: path.join(".harness", "evidence", record.id),
-        restoredWatermark: watermarkRepo.get(runId),
+        // 加固期第五轮: a degradation means the record contradicts itself
+        // (messages/events were lost below the checkpoint horizon), so the
+        // persisted watermark's coveredCount no longer maps onto positions in
+        // the rebuilt transcript — restoring it would let the summary replace
+        // messages it never described. Re-summarizing is the safe direction.
+        restoredWatermark: crashed.degradations.length === 0 ? watermarkRepo.get(runId) : undefined,
         onWatermark: (watermark) => watermarkRepo.save(runId, watermark),
       }),
     });
@@ -860,7 +865,7 @@ export class RunManager {
         end: (s, e) => recorder.runEnd(s, e, Date.now() - startedMs),
         unsubscribe,
         runRepo,
-        label: "resumed",
+        label: "resumed run",
       });
       this.memoryBackfillContext = memoryIndex
         ? { store: memoryStore, index: memoryIndex, embedder: memoryEmbedder }

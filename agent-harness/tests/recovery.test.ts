@@ -189,7 +189,7 @@ describe("crash recovery (阶段 5/6)", () => {
     }
   });
 
-  it("加固期第二轮: resume restarts a run killed before its first trace event (empty ledger, nothing executed)", async () => {
+  it("加固期第二轮: resume restarts a run killed between the sinks of its first trace event (traced, nothing executed)", async () => {
     const dbPath = path.join(tmp.dir, "empty-ledger", "harness.db");
     const runId = "run-empty-ledger";
     const db = openDatabase(dbPath);
@@ -201,6 +201,24 @@ describe("crash recovery (阶段 5/6)", () => {
       startedAt: new Date().toISOString(),
     });
     db.close();
+    // The between-sinks window: run_start reached the JSONL but never SQLite.
+    // reconcile clears the lone remnant — leaving the trace FILE (empty)
+    // behind, which is the proof of a traced run the restart gate requires.
+    const tracesPath = path.join(tmp.dir, ".harness", "traces");
+    fs.mkdirSync(tracesPath, { recursive: true });
+    fs.writeFileSync(
+      path.join(tracesPath, `${runId}.jsonl`),
+      JSON.stringify({
+        v: 1,
+        seq: 1,
+        ts: new Date().toISOString(),
+        runId,
+        type: "run_start",
+        task: "send a notification and confirm",
+        modelSpec: "fake-model",
+      }) + "\n",
+      "utf8",
+    );
     const before = logLines();
 
     const manager = new RunManager();
@@ -218,6 +236,34 @@ describe("crash recovery (阶段 5/6)", () => {
     const trace = readTraceFile(result.tracePath as string);
     expect(trace.events[0]).toMatchObject({ type: "run_start", seq: 1 });
     expect(trace.events.at(-1)).toMatchObject({ type: "run_end", status: "completed" });
+  });
+
+  it("加固期第五轮: refuses to restart a trace-less run with an empty ledger (no proof anything was traced)", async () => {
+    const dbPath = path.join(tmp.dir, "traceless", "harness.db");
+    const runId = "run-traceless";
+    const db = openDatabase(dbPath);
+    new RunRepo(db).insert({
+      id: runId,
+      task: "send a notification and confirm",
+      modelSpec: "fake-model",
+      status: "running",
+      startedAt: new Date().toISOString(),
+    });
+    db.close();
+    // No trace file, no checkpoints, no watermark, no evidence: with `trace:
+    // false` a run can have executed tools and still leave this exact state —
+    // an unprovable restart must refuse (side effects could duplicate).
+    const manager = new RunManager();
+    await expect(
+      manager.resume(runId, {
+        model: FAKE_MODEL,
+        streamFn: scriptedStreamFn([]),
+        reporter: new CollectingReporter(),
+        database: dbPath,
+        tools: TOOLS,
+      }),
+    ).rejects.toThrow(/no trace to recover/);
+    manager.close();
   });
 
   it("加固期第二轮: refuses to restart when a checkpoint proves the lost ledger had progressed", async () => {
@@ -464,11 +510,12 @@ describe("crash recovery (阶段 5/6)", () => {
 
     expect(result.record.status).toBe("completed");
     // 续用持久化水位线：恢复段第一次摘要的材料只含未覆盖的尾部——CHARLIE（r3）
-    // 与 DELTA（r4）在材料里；ALPHA/BRAVO 已被覆盖，绝不重新进入摘要
-    // （未持久化时水位线从 0 重建，材料会从头包含 ALPHA/BRAVO）。
+    // 在材料里（恰越 256 下限即停，DELTA/r4 作为最新受保护轮保持原样）；
+    // ALPHA/BRAVO 已被覆盖，绝不重新进入摘要（未持久化时水位线从 0 重建，
+    // 材料会从头包含 ALPHA/BRAVO）。
     const first = resumedPrompts[0]!;
     expect(first).toContain("CHARLIE");
-    expect(first).toContain("DELTA");
+    expect(first).not.toContain("DELTA");
     expect(first).not.toContain("ALPHA");
     expect(first).not.toContain("BRAVO");
   });

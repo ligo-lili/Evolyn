@@ -231,10 +231,12 @@ export function createContextTransformer(
           if (compacted.tokensAfter > budget.inputBudget) {
             reason +=
               `; POST-COMPACTION still over input budget (${compacted.tokensAfter} > ${budget.inputBudget}` +
-              ` tokens) — an oversized protected block may be immune to both layers`;
+              ` tokens) — an oversized protected block may be immune to both layers` +
+              ` (estimate may overstate right after a fold — it anchors on the last measured usage)`;
             process.stderr.write(
               `[harness] context: projection still exceeds the input budget after compaction ` +
-                `(${compacted.tokensAfter} > ${budget.inputBudget}) — an oversized protected block may be immune to both layers\n`,
+                `(${compacted.tokensAfter} > ${budget.inputBudget}) — an oversized protected block may be immune to both layers` +
+                ` (estimate may overstate right after a fold)\n`,
             );
           }
           options.onEvent?.({
@@ -325,7 +327,11 @@ export function createContextTransformer(
     let material = messages.slice(boundary, materialEnd).filter((m) => m.role !== "system");
     let materialEstimate = estimateMessagesTokens(material, ctx.coeff);
     if (materialEstimate < MIN_MATERIAL_TOKENS) {
-      for (let i = cutoff + 1; i < blocks.length; i++) {
+      // 加固期第五轮(off-by-one 修复): 从切割点块自身开始、一次只消费一个受
+      // 保护块。材料止于 blocks[cutoff].start，旧代码 i=cutoff+1 的第一步会
+      // 连吞 cutoff 与 cutoff+1 两块——即使只消费 cutoff 就够越过下限，也会
+      // 把下一个受保护块（常常是最新的工作证据）一并折进摘要。
+      for (let i = cutoff; i < blocks.length; i++) {
         const b = blocks[i]!;
         if (b.kind === "system") continue;
         const end = b.end;

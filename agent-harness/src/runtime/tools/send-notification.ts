@@ -30,9 +30,11 @@ export const sendNotificationTool: AgentTool<typeof parameters, SendNotification
     const dir = harnessDataDir(process.cwd());
     await mkdir(dir, { recursive: true });
     // 加固期第三轮: the log is TSV-ish and model-controlled fields must not
-    // forge fields or rows — backslash-escape \, \t and \n in the channel and
-    // message (the returned content/details keep the raw text).
-    const field = (value: string): string => value.replace(/\\/g, "\\\\").replace(/\t/g, "\\t").replace(/\n/g, "\\n");
+    // forge fields or rows — backslash-escape \, \r, \t and \n in the channel
+    // and message (the returned content/details keep the raw text). \r matters
+    // because CR-aware readers (readline, universal newlines) split on it too.
+    const field = (value: string): string =>
+      value.replace(/\\/g, "\\\\").replace(/\r/g, "\\r").replace(/\n/g, "\\n").replace(/\t/g, "\\t");
     const line = `${new Date().toISOString()}\t${receiptId}\t${field(args.channel)}\t${field(args.message)}\n`;
     await appendFile(path.join(dir, "notifications.log"), line, "utf8");
     return {

@@ -18,7 +18,7 @@ npm run harness -- run "<task>" --model deepseek/deepseek-flash --tools coding -
 
 ## 功能
 
-- **持久执行**——每个 run 在消息边界落 checkpoint；进程被杀后在**同一 runId** 上恢复，trace 序列续号，工具集从 run 行持久化的规格自动还原（crash 的 `--tools coding` run 不会以 demo 默认集续跑）。未决工具调用按规则结算：用日志里的结果重建 / 过门重执行（幂等工具）/ 合成"结果未知"错误回喂模型——绝不幻觉成功。trace 已经跑完的"僵尸 run"自愈（补写状态），不会被恢复成断裂的括号；首个 trace 事件落盘之前就被杀（双 sink 全空）的 run，resume 在同一 runId 下重启任务——除非 checkpoint、持久化水位线或 evidence 文件证明台账是"部分丢失"而非"从未开始"，那时 resume 拒绝重启（避免重复副作用）。
+- **持久执行**——每个 run 在消息边界落 checkpoint；进程被杀后在**同一 runId** 上恢复，trace 序列续号，工具集从 run 行持久化的规格自动还原（crash 的 `--tools coding` run 不会以 demo 默认集续跑）。未决工具调用按规则结算：用日志里的结果重建 / 过门重执行（幂等工具）/ 合成"结果未知"错误回喂模型——绝不幻觉成功。trace 已经跑完的"僵尸 run"自愈（补写状态），不会被恢复成断裂的括号；首个 trace 事件在双 sink 之间被杀的 run，resume 在同一 runId 下重启任务——但仅在 trace 文件证明该 run 本应被记录、且没有 checkpoint/水位线/evidence 证明台账"部分丢失"时；否则 resume 拒绝重启（避免重复副作用）。
 - **崩溃可复现**——故障注入（`--fault point:tool`）在精确位置杀进程：工具调用之后、执行中途、两份 trace sink 之间、带工具调用的 assistant 消息之后（"planned"窗口）、恢复过程中途——恢复因此可测试，不是表演。
 - **执行即数据库**——每个事件以同一序列号双写 JSONL 与 SQLite；`trace summary / replay --until / query` 回答任意 run 的"做了什么、为什么"，支持跳到任意历史序列号做 debugger 式状态检查。sink 失败留下可容忍的补洞，而不是一条坏日志。
 - **权限与审计**——按 run 授予能力（`fs:read/write`、`process:exec`、`net:outbound`、`notify:send`）、风险分级、显示实际参数的交互审批、覆盖每个路径类参数的工作区路径围栏（词法 + 符号链接 realpath），以及一条写围栏：结构化文件工具不得写入 harness 状态目录（`.harness/`），模型编辑无法绕过记忆库的跨进程锁与 history（shell 类工具仍是显式非目标）；每次决策作为审计事件落入 trace。

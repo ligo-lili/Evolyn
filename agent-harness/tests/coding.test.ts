@@ -1379,6 +1379,14 @@ describe("加固期: tool path fence", () => {
       "read_file:.harness/memory/INDEX.md",
       "exec:.harness",
     ]);
+    // 加固期第五轮: the guard must also hold BEFORE the state dir exists — a
+    // writer must never be the thing that creates `.harness` (lexical layer).
+    const bare = path.join(tmp.dir, "state-fence-bare");
+    fs.mkdirSync(bare, { recursive: true });
+    const bareFenced = withPathFence([probe("write_file")], bare);
+    await expect(bareFenced[0]!.execute("t7", { path: ".harness/memory/active/M001.md" })).rejects.toThrow(
+      /harness state directory/,
+    );
     tmp.leave();
   });
 

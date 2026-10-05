@@ -60,7 +60,8 @@ export function estimateMessagesTokens(messages: readonly AgentMessage[], coeffi
 }
 
 export interface ContextUsageEstimate {
-  /** 混合估算：实测 Usage（如有）+ 其后尾部的校准估算，取大者。 */
+  /** 混合估算：实测 Usage（如有）+ 其后尾部的校准估算——【求和】，实测是
+   * 事实、估算只补增量（加固期第三轮注释修正的遗留第二处，第五轮收口）。 */
   tokens: number;
   /** 最后一条 assistant 的实测 context token（无则 null）。 */
   usageTokens: number | null;

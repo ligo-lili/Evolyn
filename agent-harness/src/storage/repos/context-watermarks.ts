@@ -23,6 +23,15 @@ export class ContextWatermarkRepo {
       .run(runId, JSON.stringify(watermark), new Date().toISOString());
   }
 
+  /**
+   * Row presence regardless of parseability — the restart guard must treat a
+   * corrupt-but-present row as proof of prior progress, not as absence, while
+   * the RESTORE path (get) is right to ignore it.
+   */
+  exists(runId: string): boolean {
+    return this.db.prepare("SELECT 1 FROM context_watermarks WHERE run_id = ?").get(runId) !== undefined;
+  }
+
   /** undefined on missing row, malformed JSON, or a shape that cannot be a
    * watermark — the caller then starts a fresh watermark (never throws). */
   get(runId: string): PersistedWatermark | undefined {

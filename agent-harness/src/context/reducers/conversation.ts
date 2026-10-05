@@ -59,6 +59,12 @@ export function serializeWatermark(watermark: SummaryWatermark): PersistedWaterm
  * summary that fails to render means the persisted JSON is corrupt — in both
  * cases the caller falls back to a fresh watermark rather than silently
  * dropping messages from the model's view.
+ *
+ * Limitation (加固期第五轮): SAME-LENGTH prefix drift — an event lost from
+ * BOTH sinks below the horizon while later events survive — is not detectable
+ * from the transcript alone. That class is caught upstream by the checkpoint
+ * cross-check, and resume() withholds the restore whenever any degradation
+ * was found; this function itself can only verify the count.
  */
 export function restoreWatermark(
   persisted: PersistedWatermark,

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { HarnessError } from "../errors.js";
 import { defaultModelSpec } from "../config.js";
 import { getModelRegistry, listProviderIds, resolveModel } from "../providers.js";
@@ -1061,13 +1062,32 @@ async function main(): Promise<number> {
   return record.status === "completed" ? 0 : 1;
 }
 
-main()
-  .then((code) => process.exit(code))
-  .catch((err: unknown) => {
-    // HarnessError carries a polished message; anything else is a bug — keep
-    // the stack so unexpected TypeErrors are debuggable at all.
-    if (err instanceof HarnessError) console.error(err.message);
-    else if (err instanceof Error) console.error(err.stack ?? err.message);
-    else console.error(err);
-    process.exit(1);
-  });
+// 加固期第三轮: run only when EXECUTED (the bin), never when imported — the
+// module was previously import-hostile (any importer triggered main()).
+// `import.meta.main` is authoritative where the runtime provides it; the
+// realpath fallback covers Node 22.19 (the engines floor) defensively and
+// resolves bin symlinks on POSIX.
+const invokedDirectly: boolean =
+  (import.meta as { main?: boolean }).main ??
+  (() => {
+    const entry = process.argv[1];
+    if (entry === undefined) return false;
+    try {
+      return fs.realpathSync(entry) === fs.realpathSync(fileURLToPath(import.meta.url));
+    } catch {
+      return false;
+    }
+  })();
+
+if (invokedDirectly) {
+  main()
+    .then((code) => process.exit(code))
+    .catch((err: unknown) => {
+      // HarnessError carries a polished message; anything else is a bug — keep
+      // the stack so unexpected TypeErrors are debuggable at all.
+      if (err instanceof HarnessError) console.error(err.message);
+      else if (err instanceof Error) console.error(err.stack ?? err.message);
+      else console.error(err);
+      process.exit(1);
+    });
+}

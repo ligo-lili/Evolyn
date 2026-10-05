@@ -2,7 +2,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import path from "node:path";
 import { Type } from "typebox";
 import { HarnessError } from "../errors.js";
-import { defaultChat, type ChatFn } from "../llm/structured.js";
+import { completeStructured, defaultChat, type ChatFn } from "../llm/structured.js";
 import { resolveModel } from "../providers.js";
 import { defaultDbPath, openDatabase } from "../storage/db.js";
 import { RunRepo } from "../storage/repos/runs.js";
@@ -308,27 +308,28 @@ export async function reflectRunById(runId: string, options: ReflectOptions = {}
 
     const spec = options.reflectModelSpec ?? process.env.HARNESS_DISTILL_MODEL ?? "deepseek/deepseek-flash";
     const complete = options.complete ?? defaultChat(resolveModel(spec), { systemPrompt: REFLECTION_SYSTEM_PROMPT });
-    const raw = await complete(
-      [
-        {
-          role: "user",
-          content: buildReflectionPrompt({
-            digest,
-            candidates,
-            activeCount: store.activeCount(),
-            maxActive: MAX_ACTIVE_MEMORIES,
-          }),
-        },
-      ],
-      {
-        schemaTool: {
-          name: "record_memory_decision",
-          description: "Record the memory decision JSON.",
-          parameters: REFLECTION_SCHEMA,
-        },
+    // 加固期第三轮: route through completeStructured — direct parse → one
+    // re-prompt carrying the parse error → the constrained-decoding schema
+    // tool, under a bounded extraction budget. The previous single-shot parse
+    // let one bad JSON answer end the reflection entirely (and one stalled
+    // provider hang it); the caller's catch still degrades to "write nothing".
+    const { value: decision } = await completeStructured({
+      prompt: buildReflectionPrompt({
+        digest,
+        candidates,
+        activeCount: store.activeCount(),
+        maxActive: MAX_ACTIVE_MEMORIES,
+      }),
+      parse: parseReflectionDecision,
+      complete,
+      maxReprompts: 1,
+      signal: AbortSignal.timeout(120_000),
+      schemaTool: {
+        name: "record_memory_decision",
+        description: "Record the memory decision JSON.",
+        parameters: REFLECTION_SCHEMA,
       },
-    );
-    const decision = parseReflectionDecision(raw);
+    });
 
     if (decision.action === "none") {
       return { action: "none", reason: decision.reason };

@@ -469,6 +469,23 @@ describe("reflectRunById (three gates end to end)", () => {
     expect(forced.action).toBe("none");
   });
 
+  it("加固期第三轮: a malformed first answer is re-prompted with the parse error, not fatal", async () => {
+    const { runId, dbPath } = await seedRun("reflect-retry", "organize the quarterly reports", true);
+    let calls = 0;
+    const outcome = await reflectRunById(runId, {
+      database: dbPath,
+      complete: async (messages) => {
+        calls++;
+        if (calls === 1) return "sorry, here you go: not json at all";
+        // the second call carries the parse error back to the model
+        expect(messages.some((m) => m.role === "user" && m.content.includes("failed validation"))).toBe(true);
+        return JSON.stringify({ action: "none", reason: "nothing durable after all" });
+      },
+    });
+    expect(calls).toBe(2);
+    expect(outcome.action).toBe("none");
+  });
+
   it("create: a real-work run produces M001 with provenance; INDEX.md is rebuilt", async () => {
     const { runId, dbPath } = await seedRun("create", "organize the quarterly reports", true);
     const outcome = await reflectRunById(runId, {

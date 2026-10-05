@@ -7,6 +7,7 @@ import { completeStructured } from "../src/llm/structured.js";
 import { isTransientError, withRetry } from "../src/runtime/retry.js";
 import { ToolTimeoutError, withToolTimeout } from "../src/runtime/tools/timeout.js";
 import { execTool } from "../src/runtime/tools/exec.js";
+import { sendNotificationTool } from "../src/runtime/tools/send-notification.js";
 import { readTraceFile } from "../src/trace/read.js";
 import type { AnyAgentTool } from "../src/index.js";
 import { RunManager } from "../src/runtime/run-manager.js";
@@ -407,5 +408,18 @@ describe("加固期: timeouts and aborts are never retried", () => {
       delete process.env.HARNESS_CANARY;
     }
     tmp.leave();
+  });
+});
+
+describe("加固期第三轮: notifications are log-safe", () => {
+  it("escapes tabs/newlines so model-controlled fields cannot forge log rows", async () => {
+    tmp.enter();
+    const dir = tmp.dir;
+    await sendNotificationTool.execute("call_x", { channel: "email", message: "line1\nforged\trow" });
+    const log = fs.readFileSync(path.join(dir, ".harness", "notifications.log"), "utf8");
+    tmp.leave();
+    const lines = log.trim().split("\n");
+    expect(lines).toHaveLength(1); // the embedded \n cannot forge a second line
+    expect(lines[0]).toContain("line1\\nforged\\trow"); // the payload is visible, escaped
   });
 });

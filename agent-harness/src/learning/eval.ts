@@ -1,11 +1,17 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { resolveModel } from "../providers.js";
 import { HarnessError } from "../errors.js";
 import { RunManager, type SkillInjection } from "../runtime/run-manager.js";
+import { isInfraFailure, judgeRun, type JudgeFn } from "./judge.js";
+import { buildProtocol, writeSessionArtifacts, type EvalSessionLine } from "./protocol.js";
+
+// The judge stack lives in ./judge.ts and the pinned protocol / session
+// artifacts in ./protocol.ts (加固期第三轮 split); both surfaces are
+// re-exported at the bottom, so `learning/eval.js` stays the single import
+// point for callers and tests.
 
 /**
  * 阶段 10/11 scripted A/B eval: on the SAME task set, does the run succeed
@@ -198,67 +204,6 @@ export function readBackVerified(messages: readonly AgentMessage[]): boolean {
   return false;
 }
 
-// ---------- LLM judge (阶段 11: deterministic first, judge second) ----------
-
-export interface JudgeInput {
-  task: string;
-  judgeInstructions: string;
-  finalText?: string;
-  status: string;
-}
-
-export interface JudgeVerdict {
-  pass: boolean;
-  reason: string;
-}
-
-export type JudgeFn = (input: JudgeInput) => Promise<JudgeVerdict>;
-
-const JUDGE_SYSTEM_PROMPT =
-  "You are a strict eval judge for a coding agent. " +
-  "You see a task, extra judging instructions, and the agent's final response. " +
-  "Decide ONLY whether the response satisfies the task's stated requirements per the judging instructions — " +
-  "never reward unstated extra quality. Output ONLY strict JSON with keys pass (boolean) and reason (one sentence).";
-
-export function parseJudgeVerdictStrict(raw: string): JudgeVerdict {
-  const start = raw.indexOf("{");
-  const end = raw.lastIndexOf("}");
-  if (start === -1 || end <= start) throw new Error("no JSON object found in judge response");
-  const parsed = JSON.parse(raw.slice(start, end + 1)) as Record<string, unknown>;
-  if (typeof parsed.pass !== "boolean") throw new Error('judge verdict missing boolean "pass"');
-  return { pass: parsed.pass, reason: String(parsed.reason ?? "").trim() || (parsed.pass ? "passed" : "failed") };
-}
-
-export function buildJudgePrompt(input: JudgeInput): string {
-  return [
-    "Judge this coding-agent run:",
-    `task: ${input.task}`,
-    `judging instructions: ${input.judgeInstructions}`,
-    `run status: ${input.status}`,
-    `agent final response:\n${(input.finalText ?? "(no text response)").slice(0, 2_000)}`,
-  ].join("\n");
-}
-
-/** Real judge via the pi-ai registry (same cheap model tier as the distiller). */
-export function defaultJudge(modelSpec?: string): JudgeFn {
-  const spec = modelSpec ?? process.env.HARNESS_DISTILL_MODEL ?? "deepseek/deepseek-flash";
-  return async (input) => {
-    const { completeStructured, defaultChat } = await import("../llm/structured.js");
-    const { resolveModel } = await import("../providers.js");
-    const complete = defaultChat(resolveModel(spec), { systemPrompt: JUDGE_SYSTEM_PROMPT });
-    const { value } = await completeStructured({
-      prompt: buildJudgePrompt(input),
-      parse: parseJudgeVerdictStrict,
-      complete,
-      maxReprompts: 1,
-      // Bounded extraction budget (加固期修复): an unbounded judge call hangs
-      // the whole comparison when a provider stalls.
-      signal: AbortSignal.timeout(120_000),
-    });
-    return value;
-  };
-}
-
 export interface EvalResult extends EvalRawRun {
   repeat: number;
   pass: boolean;
@@ -268,115 +213,7 @@ export interface EvalResult extends EvalRawRun {
   infra?: boolean;
 }
 
-/**
- * Provider-infrastructure failures are NOT task failures: a 429 or an auth
- * error says nothing about the model's ability, and counting them as task
- * failures corrupts the comparison (阶段 12 lesson — the first weak-model
- * treatment arm was wiped out by OpenRouter's free-tier daily quota).
- * Vocabulary matches the retry.ts transient-error style. 阶段 14 addition:
- * Aliyun wraps out-of-credit as HTTP 400 + "Arrearage"/"overdue-payment"
- * ("Access denied") — a bare 400 is a normal bad request, so the business
- * words carry that match.
- */
-const INFRA_ERROR_PATTERN =
-  /\b429\b|\b401\b|\b403\b|\b400\b[\s\S]{0,200}(arrearage|overdue|insufficient)|arrearage|overdue[- ]?payment|access denied|rate.?limit|quota|insufficient credits|unauthorized|invalid api key|provider is not configured|not configured/i;
-
-export function isInfraFailure(run: EvalRawRun): boolean {
-  return run.status !== "completed" && run.error !== undefined && INFRA_ERROR_PATTERN.test(run.error);
-}
-
 export type EvalRunner = (task: EvalTask, skills: SkillInjection | false) => Promise<EvalRawRun>;
-
-/**
- * Deterministic judging: run completed, and the expected artifact exists and
- * satisfies every stated check. No model opinion involved.
- */
-export function judgeRun(task: EvalTask, run: EvalRawRun, repeat = 1): EvalResult {
-  const infra = isInfraFailure(run);
-  const fail = (reason: string): EvalResult => ({
-    ...run,
-    repeat,
-    pass: false,
-    reason,
-    ...(infra ? { infra: true } : {}),
-  });
-  if (run.status !== "completed") {
-    return fail(`run ${run.status}${run.error ? `: ${run.error}` : ""}`);
-  }
-  if (task.expectFile) {
-    let content: string;
-    try {
-      content = fs.readFileSync(path.resolve(task.expectFile), "utf8");
-    } catch {
-      return fail(`expected file missing: ${task.expectFile}`);
-    }
-    if (task.expectContains && !content.includes(task.expectContains)) {
-      return fail(`${task.expectFile} does not contain "${task.expectContains}"`);
-    }
-    const lines = content
-      .split(/\r?\n/)
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0);
-    if (task.expectLinesExact) {
-      const expected = task.expectLinesExact;
-      if (lines.length !== expected.length) {
-        return fail(`expected ${expected.length} non-empty lines, got ${lines.length}`);
-      }
-      const bad = lines.findIndex((l, i) => l !== expected[i]);
-      if (bad !== -1) {
-        return fail(`line ${bad + 1} is "${lines[bad]}" but expected "${expected[bad]}"`);
-      }
-    } else if (task.expectLines !== undefined && lines.length !== task.expectLines) {
-      return fail(`expected ${task.expectLines} non-empty lines, got ${lines.length}`);
-    }
-    if (task.expectUnique && new Set(lines).size !== lines.length) {
-      return fail(`${task.expectFile} contains duplicate lines`);
-    }
-    if (task.expectSorted) {
-      const descending = task.expectSorted === "desc";
-      // 加固期第三轮: codepoint compare on the lowercased forms — the old
-      // locale-collated verdict varied with the grading machine's ICU.
-      const sorted = [...lines].sort((a, b) => {
-        const x = a.toLowerCase();
-        const y = b.toLowerCase();
-        const cmp = x < y ? -1 : x > y ? 1 : 0;
-        return descending ? -cmp : cmp;
-      });
-      const unsorted = lines.findIndex((l, i) => l.toLowerCase() !== sorted[i]?.toLowerCase());
-      if (unsorted !== -1) {
-        return fail(
-          `line ${unsorted + 1} ("${lines[unsorted]}") breaks ${descending ? "reverse" : "alphabetical"} order`,
-        );
-      }
-    }
-    if (task.expectLineRegex) {
-      const re = new RegExp(task.expectLineRegex);
-      const bad = lines.find((l) => !re.test(l));
-      if (bad !== undefined) {
-        return fail(`line "${bad}" does not match /${task.expectLineRegex}/`);
-      }
-    }
-  }
-  // 阶段 14: the coding gate — the repo's own tests decide. Exit 0 passes;
-  // anything else fails with the output tail. Fully deterministic.
-  if (task.testCommand) {
-    const cwd = task.cwd ? path.resolve(task.cwd) : process.cwd();
-    try {
-      execSync(task.testCommand, {
-        cwd,
-        stdio: ["ignore", "pipe", "pipe"],
-        timeout: task.testTimeoutMs ?? 120_000,
-        windowsHide: true,
-        encoding: "utf8",
-      });
-    } catch (err) {
-      const e = err as { stdout?: string; stderr?: string; message?: string };
-      const tail = `${e.stderr ?? ""}\n${e.stdout ?? ""}\n${e.message ?? ""}`.trim().split("\n").slice(-8).join("\n");
-      return fail(`test command failed: ${task.testCommand}\n${tail.slice(0, 600)}`);
-    }
-  }
-  return { ...run, repeat, pass: true };
-}
 
 export interface EvalTaskSummary {
   taskId: string;
@@ -591,87 +428,6 @@ function validityOf(baseline: EvalArmResult, treatment: EvalArmResult): { valid:
     valid: false,
     invalidReason: `${infra} run(s) died to provider infrastructure (rate limit/quota/auth) — the comparison is not attributable to the task; re-run after the limit resets or on a paid tier`,
   };
-}
-
-// ---------- 阶段 14: pinned protocol + session artifacts (pi evals §27 borrow) ----------
-
-/** Bump when judging SEMANTICS change — the sha pins protocol + judge era.
- * v3 (加固期第三轮): expectSorted grades codepoint order — locale-independent. */
-export const EVAL_JUDGE_VERSION = 3;
-
-/** Key-sorted JSON — the canonical form the protocol sha is computed over.
- * 加固期第三轮: codepoint key order, locale-independent (cross-machine shas). */
-export function stableStringify(value: unknown): string {
-  const sort = (v: unknown): unknown => {
-    if (Array.isArray(v)) return v.map(sort);
-    if (v !== null && typeof v === "object") {
-      return Object.fromEntries(
-        Object.entries(v as Record<string, unknown>)
-          .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-          .map(([k, vv]) => [k, sort(vv)]),
-      );
-    }
-    return v;
-  };
-  return JSON.stringify(sort(value));
-}
-
-export interface EvalProtocol {
-  taskSet: string;
-  tasks: unknown[];
-  model: string;
-  toolset?: string;
-  repeats: number;
-  judgeVersion: number;
-}
-
-/** The protocol pins everything the comparison depends on — except the arm
- * itself (skill vs no-skill), which is the variable under test. Equal
- * sha256 ⇒ the two reports are comparable. */
-export function buildProtocol(
-  taskSet: EvalTaskSet,
-  opts: { model: string; toolset?: string; repeats: number },
-): { protocol: EvalProtocol; sha256: string } {
-  const protocol: EvalProtocol = {
-    taskSet: taskSet.name,
-    // codepoint order — the protocol sha must not depend on the machine's ICU (加固期第三轮)
-    tasks: [...taskSet.tasks].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
-    model: opts.model,
-    toolset: opts.toolset,
-    repeats: opts.repeats,
-    judgeVersion: EVAL_JUDGE_VERSION,
-  };
-  const sha256 = createHash("sha256").update(stableStringify(protocol)).digest("hex");
-  return { protocol, sha256 };
-}
-
-/** One line of session.jsonl — the replay/attribution index for one run. */
-export interface EvalSessionLine {
-  seq: number;
-  repeat: number;
-  arm: "baseline" | "treatment";
-  taskId: string;
-  runId?: string;
-  tracePath?: string;
-  status: string;
-  pass: boolean;
-  reason?: string;
-  verified?: boolean;
-  tokens?: number;
-  durationMs?: number;
-}
-
-function writeSessionArtifacts(
-  dir: string,
-  protocol: EvalProtocol,
-  sha256: string,
-  session: readonly EvalSessionLine[],
-): string {
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, "protocol.json"), JSON.stringify({ ...protocol, sha256 }, null, 2), "utf8");
-  const sessionFile = path.join(dir, "session.jsonl");
-  fs.writeFileSync(sessionFile, session.map((l) => JSON.stringify(l)).join("\n") + "\n", "utf8");
-  return sessionFile;
 }
 
 /** Full A/B: arms INTERLEAVE per repeat (odd repeat → baseline first, even →
@@ -950,3 +706,25 @@ export function defaultEvalRunner(modelSpec: string, options: DefaultRunnerOptio
     }
   };
 }
+
+// ---------- re-exports: judge + protocol live in dedicated modules ----------
+// (加固期第三轮 split — both surfaces stay available from this module so
+// `learning/eval.js` remains the single import point for callers and tests.)
+
+export {
+  buildJudgePrompt,
+  defaultJudge,
+  isInfraFailure,
+  judgeRun,
+  parseJudgeVerdictStrict,
+  type JudgeFn,
+  type JudgeInput,
+  type JudgeVerdict,
+} from "./judge.js";
+export {
+  EVAL_JUDGE_VERSION,
+  buildProtocol,
+  stableStringify,
+  type EvalProtocol,
+  type EvalSessionLine,
+} from "./protocol.js";

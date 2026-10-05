@@ -53,8 +53,9 @@ export interface ContextManagementOptions {
   /** 切割点保护的最近普通对话块数。默认 4。 */
   keepConversationBlocks?: number;
   /**
-   * resume 场景：恢复出的持久化转录长度。其后的消息属于当前 Run——第一层
-   * 永不触碰、摘要水位线也不会覆盖它们。fresh run 不传。
+   * resume 场景：恢复出的持久化转录长度。加固期第三轮（对等老化）后仅作
+   * 观测用途（进 ContextDecision 记录）——两层压缩都按普通老化规则处理
+   * resume 段消息：最近窗口保护工作集，更老的让出预算。fresh run 不传。
    */
   historyCount?: number;
   /** Evidence 目录（相对路径），截短标记里的全文回查指针。 */
@@ -116,14 +117,12 @@ export function createContextTransformer(
     const transcriptEstimate = estimateContextTokens(messages, coeff).tokens;
     const watermark = state.watermark;
 
-    // resume 边界按对象引用传递：投影重建会平移下标，身份不会。当前 Run
-    // 新增的消息在两层都不可触碰（第一层不截短、第二层不折叠）。
-    const persistedEnd = options.historyCount ?? messages.length;
-    const protectedRefs: ReadonlySet<object> = new Set(messages.slice(persistedEnd) as object[]);
-
+    // 加固期第三轮（对等老化）：resume 边界不再豁免两层压缩——persistedEnd
+    // 钳制与 protectedRefs 按引用豁免一并移除；resume 段消息与普通消息同
+    // 规则老化（最近 keep 窗口保护工作集，更老的让出预算）。
     // —— 第一层（确定性，零模型成本）：对候选投影跑工具结果整理 ——
     const candidate = watermark ? buildSummaryCandidate(messages, watermark) : messages;
-    const reduction = reduceToolResults(candidate, coeff, toolOptions, { protectedRefs });
+    const reduction = reduceToolResults(candidate, coeff, toolOptions);
     const estimate = estimateContextTokens(reduction.messages, coeff);
     const boundary = coveredBoundaryIndex(messages, watermark?.coveredCount ?? 0);
     const unsummarized = countUnsummarizedConversationBlocks(blocks, boundary);
@@ -170,8 +169,6 @@ export function createContextTransformer(
           budget,
           keepConversationBlocks,
           toolOptions,
-          persistedEnd,
-          protectedRefs,
           coeff,
           failureHint: state.lastSummaryFailure,
           model: options.model,
@@ -257,8 +254,6 @@ export function createContextTransformer(
       budget: ContextBudget;
       keepConversationBlocks: number;
       toolOptions: ToolReducerOptions;
-      persistedEnd: number;
-      protectedRefs: ReadonlySet<object>;
       coeff: number;
       failureHint?: string;
       model: Model<Api>;
@@ -285,16 +280,17 @@ export function createContextTransformer(
     // 旦水位线越过切割点、或切割点前的材料本身极小，gate ③ / "material is
     // empty" 会在每次请求上永久失败——水位线推不动，估算单调上涨直到
     // provider 窗口报错。受保护偏好让位于功能：材料低于下限时，窗口向切割
-    // 点之后扩展（绝不越过 resume 边界），让摘要器有真正可压缩的东西。
+    // 点之后扩展，让摘要器有真正可压缩的东西（加固期第三轮对等老化后，
+    // 该扩展同样可以进入 resume 段）。
     const MIN_MATERIAL_TOKENS = 256;
-    let materialEnd = Math.min(blocks[cutoff]!.start, ctx.persistedEnd);
+    let materialEnd = blocks[cutoff]!.start;
     let material = messages.slice(boundary, materialEnd).filter((m) => m.role !== "system");
     let materialEstimate = estimateMessagesTokens(material, ctx.coeff);
     if (materialEstimate < MIN_MATERIAL_TOKENS) {
       for (let i = cutoff + 1; i < blocks.length; i++) {
         const b = blocks[i]!;
         if (b.kind === "system") continue;
-        const end = Math.min(b.end, ctx.persistedEnd);
+        const end = b.end;
         if (end <= materialEnd) continue;
         materialEnd = end;
         material = messages.slice(boundary, materialEnd).filter((m) => m.role !== "system");
@@ -343,10 +339,9 @@ export function createContextTransformer(
     }
 
     const next = advanceWatermark(watermark, messages, material, generated);
-    // 投影从原始历史 + 新水位线整体重建，再过一遍第一层（protectedRefs 按
-    // 身份匹配，跨投影重建依然有效）。
+    // 投影从原始历史 + 新水位线整体重建，再过一遍第一层。
     const rebuilt = replaceCoveredPrefix(messages, next);
-    const reduced = reduceToolResults(rebuilt, ctx.coeff, ctx.toolOptions, { protectedRefs: ctx.protectedRefs });
+    const reduced = reduceToolResults(rebuilt, ctx.coeff, ctx.toolOptions);
     const tokensAfter = estimateContextTokens(reduced.messages, ctx.coeff).tokens;
     return {
       ok: true,

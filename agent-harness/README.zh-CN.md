@@ -40,7 +40,7 @@ npm run harness -- run "<task>" --model deepseek/deepseek-flash --tools coding -
 
 - **`trace/`**——事件溯源。事件沿用 Pi 的词汇表，装进带版本号的信封；recorder 扇出到 JSONL（零缓冲 `appendFileSync`——被杀只丢"从未发出"的事件）与 SQLite（提取列建索引），共享同一序列号。`reconcile.ts` 在 resume 前把 JSONL 尾部对齐到 SQLite；`replay.ts` 是纯离线状态机，重建任意序列号处的转录与工具调用状态，并解释"为什么走到这里"。
 
-- **`context/`**——模型视图。`assembler` 确定性组装 system prompt（base → core memory → 技能 → 经验 → workspace 目录树；字节级稳定，利于 prompt cache）。其余是挂在 `transformContext` 上的两层上下文管理：`blocks` 把转录切成四类块（一切压缩的最小单元——绝不产生半截工具轮）；`tokens` 用校准的模型族系数估算、与最后一条实测 Usage 混合；`budget` 推导六条预算线；`reducers/tool` 是确定性的第一层（头尾截断附 evidence 指针、最旧优先整轮移除、语义 JSON 裁剪、感知 resume 边界）；`summarizer` + `reducers/conversation` 是模型驱动的第二层（严格 JSON 滚动摘要带硬校验、covered_message_count 水位线、按引用与 tool_call_id 精确的前缀替换）；`compaction` 是编排器，为每次请求产出 `prefix_decision`（reuse/defer/compact/rebuild）——原始历史永不修改，只产出投影。
+- **`context/`**——模型视图。`assembler` 确定性组装 system prompt（base → core memory → 技能 → 经验 → workspace 目录树；字节级稳定，利于 prompt cache）。其余是挂在 `transformContext` 上的两层上下文管理：`blocks` 把转录切成四类块（一切压缩的最小单元——绝不产生半截工具轮）；`tokens` 用校准的模型族系数估算、与最后一条实测 Usage 混合；`budget` 推导六条预算线；`reducers/tool` 是确定性的第一层（头尾截断附 evidence 指针、最旧优先整轮移除、语义 JSON 裁剪；resume 段与普通消息同规则老化）；`summarizer` + `reducers/conversation` 是模型驱动的第二层（严格 JSON 滚动摘要带硬校验、covered_message_count 水位线、按引用与 tool_call_id 精确的前缀替换）；`compaction` 是编排器，为每次请求产出 `prefix_decision`（reuse/defer/compact/rebuild）——原始历史永不修改，只产出投影。
 
 - **`memory/`**——跨 run 的经验，按 `memory-design.md` 组织。`model`（M### 记录 + 900/180/16 切块，块带 `title | summary` 语义头与 sha256 内容身份）、`store`（Markdown 权威：CORE.md / INDEX.md / active / archive，原子写、互斥守卫、容量硬顶）、`core`（带证据的按 key upsert、token 预算注入）、`search`（chunk 索引 + FTS5 tokenizer 探测 + 按 memory 的 RRF 融合、降级链、启动对账、embedding 后台条件写补全）、`reflection`（确定性门控 → 严格 JSON 反思器 → 授权写入）、`tools`（模型记忆工具面）。
 

@@ -730,12 +730,7 @@ describe("P1-5 block invariants (阶段 13)", () => {
       assistantWithCalls(["c3"]),
       toolResult("c3", "r3".padEnd(2000, "x")),
     ];
-    const out = reduceToolResults(
-      messages,
-      1,
-      { budgetTokens: 10, headChars: 5, tailChars: 2 },
-      { protectedRefs: new Set() },
-    );
+    const out = reduceToolResults(messages, 1, { budgetTokens: 10, headChars: 5, tailChars: 2 });
     // 每条残留的 assistant 工具调用消息，其结果必然紧随其后（同块同进退）
     const blocks = partitionMessages(out.messages);
     for (const b of blocks) {

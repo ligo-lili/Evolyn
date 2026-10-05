@@ -766,9 +766,11 @@ export class RunManager {
       sessionId: record.id,
       messages: transcript,
       beforeToolCall: composed.beforeToolCall,
-      // 加固期 (P0): the recovered transcript is the persisted prefix —
-      // historyCount marks the boundary so the current segment's messages are
-      // never touched by the tool reducer or the summary watermark.
+      // historyCount is informational since 加固期第三轮 (resume parity): the
+      // resumed segment ages under the ordinary rules — the recent-keep windows
+      // protect the working set, older messages yield to budget like any
+      // others (the one-sided exemption made an over-budget segment
+      // uncompactable and doomed the run).
       transformContext: createContextTransformer({
         ...options.context,
         model,

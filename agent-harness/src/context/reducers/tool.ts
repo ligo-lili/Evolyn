@@ -7,8 +7,7 @@ import { estimateMessageTokens, estimateMessagesTokens } from "../tokens.js";
  *
  * 触发条件：未受保护的旧工具轮的结果 token 合计超过独立小账本
  * （tool_result_budget）。最近 keep_recent_tool_rounds（默认 2）轮是"当前
- * 工作证据"，绝不截短不删除；resume 边界（historyCount）之后的轮次属于当前
- * Run 新增消息——全部豁免。其余旧轮按两步走：
+ * 工作证据"，绝不截短不删除。其余旧轮按两步走：
  *
  *  1. 截短：保留 head + tail 字符，中间插入标记（保留 tool 与 tool_call_id，
  *     配合 Evidence 库可回查全文）；
@@ -19,6 +18,11 @@ import { estimateMessageTokens, estimateMessagesTokens } from "../tokens.js";
  * 所有工具轮都落在"最后一个 user 消息之后"——第一层在整个生产运行形态下是
  * 死代码，全部减压负担都压到模型摘要层。豁免收敛为全局最近 keep 轮
  * （protectedFrom）：正在进行的回合由它覆盖，更早的旧轮可被整理。
+ *
+ * 加固期第三轮（对等老化）：resume 段的"当前 Run 消息"按引用豁免
+ * （protectedRefs）整体移除——段内消息与其它消息同规则老化。最近 keep 轮的
+ * 全局保护已经覆盖正在进行的工作集；留着整段豁免会让"段自身超预算"的
+ * resumed run 两层都无处让压，只能走到 provider 窗口报错。
  *
  * 特例：注册了语义裁剪器的工具（如结构化 JSON 观测结果）不走头尾截断，
  * 而是解析后保留元数据、按预算贪心装填 elements 数组，始终输出合法 JSON。
@@ -114,12 +118,6 @@ interface RoundPlan {
   tokens: number;
 }
 
-/** 压缩边界：对象引用集合而非下标——投影重建会平移下标，身份引用不会。 */
-export interface ToolReducerBoundary {
-  /** 当前 Run 新增消息（resume 持久化前缀之后的所有消息）；命中任一消息的轮次整轮豁免。 */
-  protectedRefs: ReadonlySet<object>;
-}
-
 /**
  * 第一层 Reducer。返回新数组；未触发时原样返回传入引用（零成本快速路径）。
  * 转录与 Trace 永不修改——这里只塑形模型视图。
@@ -128,7 +126,6 @@ export function reduceToolResults(
   messages: readonly AgentMessage[],
   coefficient: number,
   options: ToolReducerOptions,
-  boundary: ToolReducerBoundary,
 ): ToolReduction {
   const keep = options.keepRecentRounds ?? DEFAULT_TOOL_REDUCER_OPTIONS.keepRecentRounds;
   const head = options.headChars ?? DEFAULT_TOOL_REDUCER_OPTIONS.headChars;
@@ -138,18 +135,15 @@ export function reduceToolResults(
   if (rounds.length === 0) return { messages, trimmedRounds: 0, removedRounds: 0, savedTokens: 0, triggered: false };
 
   const protectedFrom = rounds.length - keep; // 全局序数 ≥ 此值 = 全局最近 keep 轮
-  const touchesProtected = (block: ToolRoundBlock): boolean =>
-    boundary.protectedRefs.has(block.assistant as object) ||
-    block.results.some((r) => boundary.protectedRefs.has(r as object));
   // 加固期修复：不再豁免"最后一个 user 消息之后"的轮次——单任务 run 里那
   // 覆盖了全部工具轮（见模块头注释）。进行中的工作由全局最近 keep 轮保护，
   // in-flight 回合里更早的轮次同样需要让出预算。
-  const isCompactable = (ordinal: number, block: ToolRoundBlock): boolean =>
-    ordinal < protectedFrom && !touchesProtected(block);
+  // 加固期第三轮：resume 段的按引用豁免（protectedRefs）一并移除——对等老化。
+  const isCompactable = (ordinal: number): boolean => ordinal < protectedFrom;
   const oldRounds: RoundPlan[] = [];
   for (let ordinal = 0; ordinal < rounds.length; ordinal++) {
     const block = rounds[ordinal]!;
-    if (isCompactable(ordinal, block)) {
+    if (isCompactable(ordinal)) {
       oldRounds.push({ block, tokens: estimateMessagesTokens(block.results, coefficient) });
     }
   }

@@ -160,7 +160,7 @@ keys.
   coefficient and blends the last measured usage; `budget` derives the six
   lines; `reducers/tool` is the deterministic layer-1 (truncate head+tail with
   an evidence pointer, remove whole rounds oldest-first, semantic JSON
-  trimming, resume-boundary aware); `summarizer` + `reducers/conversation`
+  trimming; resumed segments age out under the same rules); `summarizer` + `reducers/conversation`
   are the model-driven layer-2 (strict JSON rolling summary with hard
   validation, a covered-message watermark, and id/tool-call-precise prefix
   replacement); `compaction` is the orchestrator producing a `prefix_decision`

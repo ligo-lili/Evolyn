@@ -252,7 +252,7 @@ describe("context tool reducer (第一层)", () => {
       toolCallAssistant(["c2"]),
       toolResultMsg("c2", big(100)),
     ];
-    const out = reduceToolResults(messages, 1, { budgetTokens: 10_000 }, { protectedRefs: new Set() });
+    const out = reduceToolResults(messages, 1, { budgetTokens: 10_000 });
     expect(out.messages).toBe(messages);
     expect(out.triggered).toBe(false);
   });
@@ -269,12 +269,12 @@ describe("context tool reducer (第一层)", () => {
     ];
     // keepRecentRounds: 1 → c1 是唯一可压缩轮；c2 是当前回合，豁免
     // 账本取"截短后可满足"的量 → 只截短不删除
-    const out = reduceToolResults(
-      messages,
-      1,
-      { budgetTokens: 100, headChars: 100, tailChars: 50, keepRecentRounds: 1 },
-      { protectedRefs: new Set() },
-    );
+    const out = reduceToolResults(messages, 1, {
+      budgetTokens: 100,
+      headChars: 100,
+      tailChars: 50,
+      keepRecentRounds: 1,
+    });
     expect(out.triggered).toBe(true);
     expect(out.trimmedRounds).toBe(1);
     expect(out.removedRounds).toBe(0);
@@ -306,12 +306,7 @@ describe("context tool reducer (第一层)", () => {
       toolResultMsg("current", big(2000)),
     ];
     // 账本=截短后的总量可以满足 → 只截短不删除
-    const out = reduceToolResults(
-      messages,
-      1,
-      { budgetTokens: 250, headChars: 10, tailChars: 5 },
-      { protectedRefs: new Set() },
-    );
+    const out = reduceToolResults(messages, 1, { budgetTokens: 250, headChars: 10, tailChars: 5 });
     const text = JSON.stringify(out.messages);
     // 全局最近 2 轮（recent2、current）+ 当前回合绝不截短；更老的轮次截短
     expect(text).toContain(big(2000));
@@ -339,43 +334,40 @@ describe("context tool reducer (第一层)", () => {
       toolResultMsg("r4", big(3000)),
     ];
     // headChars 极小也塞不进账本 → 截短后仍超 → 整轮移除，够就停
-    const out = reduceToolResults(
-      messages,
-      1,
-      { budgetTokens: 50, headChars: 5, tailChars: 2 },
-      { protectedRefs: new Set() },
-    );
+    const out = reduceToolResults(messages, 1, { budgetTokens: 50, headChars: 5, tailChars: 2 });
     expect(out.removedRounds).toBeGreaterThanOrEqual(1);
     const text = JSON.stringify(out.messages);
     expect(text).not.toContain('"c1"'); // 最旧的整轮消失（assistant 与结果一起）
     expect(text).toContain("r4"); // 受保护的最近轮还在
   });
 
-  it("never touches rounds at or after the resume boundary (protected refs)", () => {
+  it("加固期第三轮: resume parity — aged-out resumed-segment rounds are compactable too (ref-exemption removed)", () => {
     const messages = [
       m("system", "sys"),
       m("user", "recovered task"),
       toolCallAssistant(["recovered1"]),
       toolResultMsg("recovered1", big(3000)),
-      m("user", "recovered turn 2"),
-      toolCallAssistant(["recovered2"]),
-      toolResultMsg("recovered2", big(3000)),
-      m("user", "fresh turn"),
-      toolCallAssistant(["fresh"]),
-      toolResultMsg("fresh", big(3000)),
+      m("user", "fresh turn 1"),
+      toolCallAssistant(["fresh1"]),
+      toolResultMsg("fresh1", big(3000)),
+      m("user", "fresh turn 2"),
+      toolCallAssistant(["fresh2"]),
+      toolResultMsg("fresh2", big(3000)),
+      m("user", "fresh turn 3"),
+      toolCallAssistant(["fresh3"]),
+      toolResultMsg("fresh3", big(3000)),
     ];
-    // 恢复转录 8 条 = 持久化前缀；其后的 fresh 轮属于当前 Run（按对象引用保护）。
-    // 账本取"截短后可满足"的量 → 只截短不删除。
-    const out = reduceToolResults(
-      messages,
-      1,
-      { budgetTokens: 100, headChars: 10, tailChars: 5 },
-      { protectedRefs: new Set(messages.slice(8) as object[]) },
-    );
+    // 旧契约把 resume 段（此处 fresh* 三轮）整段按引用豁免；对等老化后它们与
+    // 普通轮同规则：最近 2 轮（fresh2/fresh3）受保护，更老的（recovered1、
+    // fresh1）让出预算。账本取"截短后可满足"的量 → 只截短不删除。
+    const out = reduceToolResults(messages, 1, { budgetTokens: 100, headChars: 10, tailChars: 5 });
     const text = JSON.stringify(out.messages);
-    expect(text).toContain("tool_call_id=recovered1"); // 持久化前缀里的旧轮被截短
-    expect(JSON.stringify(out.messages[9])).toContain(big(3000)); // 当前 Run 新增的轮完整
-    expect(text).not.toContain("tool_call_id=recovered2"); // 最近 2 轮全局保护也覆盖它
+    expect(out.trimmedRounds).toBe(2);
+    expect(out.removedRounds).toBe(0);
+    expect(text).toContain("tool_call_id=recovered1"); // 旧轮被截短
+    expect(text).toContain("tool_call_id=fresh1"); // resume 段老化轮同样被截短（旧契约下豁免）
+    expect(JSON.stringify(out.messages[9])).toContain(big(3000)); // fresh2 完整（最近窗口）
+    expect(JSON.stringify(out.messages[12])).toContain(big(3000)); // fresh3 完整
   });
 
   it("applies the registered semantic trimmer (valid JSON output) instead of head+tail", () => {
@@ -393,18 +385,13 @@ describe("context tool reducer (第一层)", () => {
       toolCallAssistant(["x"]),
       toolResultMsg("x", big(50)),
     ];
-    const out = reduceToolResults(
-      messages,
-      1,
-      {
-        budgetTokens: 100,
-        headChars: 200,
-        tailChars: 20,
-        keepRecentRounds: 1,
-        semanticTrimmers: { computer_observe: jsonArraySemanticTrim },
-      },
-      { protectedRefs: new Set() },
-    );
+    const out = reduceToolResults(messages, 1, {
+      budgetTokens: 100,
+      headChars: 200,
+      tailChars: 20,
+      keepRecentRounds: 1,
+      semanticTrimmers: { computer_observe: jsonArraySemanticTrim },
+    });
     expect(out.triggered).toBe(true);
     const trimmed = JSON.parse(JSON.stringify(out.messages[3]));
     const resultText = trimmed.content.find((c: { type: string }) => c.type === "text").text as string;
@@ -720,7 +707,7 @@ describe("context transformer (prefix decisions)", () => {
     for (let i = 1; i <= 5; i++) {
       messages.push(...round(`c${i}`, 600));
     }
-    const out = reduceToolResults(messages, 1, { budgetTokens: 10 }, { protectedRefs: new Set() });
+    const out = reduceToolResults(messages, 1, { budgetTokens: 10 });
     expect(out.triggered).toBe(true);
     // 最近 2 轮受保护，最旧 3 轮让出预算（600 字符 < head+tail → 截短无收益 → 整轮移除）
     expect(out.removedRounds).toBe(3);
@@ -821,7 +808,7 @@ describe("context transformer (prefix decisions)", () => {
     expect(JSON.stringify(out)).toContain("<context-summary>");
   });
 
-  it("resume boundary: current-segment messages are never truncated nor summarized (both layers)", async () => {
+  it("加固期第三轮: resume parity — the current segment ages out under the ordinary rules (both layers)", async () => {
     const prompts: string[] = [];
     const transformer = createContextTransformer({
       model: { ...FAKE_MODEL, contextWindow: WINDOW },
@@ -830,7 +817,7 @@ describe("context transformer (prefix decisions)", () => {
         return JSON.stringify(validSummary());
       },
       // 恢复转录 7 条 = 持久化前缀（sys、user1、roundA、user2、roundB）；
-      // user3、roundC 及之后属于当前 Run 段。
+      // user3、roundC 及之后属于当前 Run 段（historyCount 仅作观测）。
       historyCount: 7,
     });
     const bigA = "a".repeat(2000);
@@ -851,11 +838,13 @@ describe("context transformer (prefix decisions)", () => {
     ];
     const out1 = await transformer([...raw]);
     expect(JSON.stringify(out1)).toContain("<context-summary>");
-    expect(JSON.stringify(out1)).toContain("turn 3"); // 当前段消息进入投影
-    expect(JSON.stringify(out1)).toContain(bigC); // 且完整未截短
+    // 当前段最新的轮进入投影且完整；第一次摘要只覆盖持久化前缀里的材料。
+    expect(JSON.stringify(out1)).toContain("turn 3");
+    expect(JSON.stringify(out1)).toContain(bigC);
+    expect(prompts[0]).not.toContain("turn 3");
 
-    // 当前段继续生长：roundD 老化出"当前回合"，roundC 老化出"最近 2 轮"——
-    // 两者都越过了它们的投影下标与 historyCount 的比较线，只能靠引用保护。
+    // 段继续生长：rC/turn3 老化出保护窗口——与 fresh run 同规则，可被折叠；
+    // 最近窗口（rD、rE）照常受保护。
     const msgs2 = [
       ...raw,
       toolCallAssistant(["rD"]),
@@ -865,16 +854,17 @@ describe("context transformer (prefix decisions)", () => {
     ];
     const out2 = await transformer(msgs2);
     expect(JSON.stringify(out2)).toContain("<context-summary>");
-    // 当前段：user3/roundC 不被摘要覆盖（材料在持久化边界处截断，只含 roundB——
-    // task 2 已随请求 1 的摘要离开水位线）……
-    expect(prompts[1]).not.toContain("turn 3");
-    expect(prompts[1]).not.toContain(bigC);
-    expect(prompts[1]).toContain('"rB"');
-    // ……也不被第一层截短（下标位移后引用保护仍然命中）
-    expect(JSON.stringify(out2)).toContain("turn 3");
-    expect(JSON.stringify(out2)).toContain(bigC);
+    // 对等老化：老化的当前段材料进入第二次摘要（旧契约下被 persistedEnd 豁免）。
+    // 注意摘要器把 prompt 里 >2000 字符的字符串截为前 2000 + "…(truncated)"
+    // （summarizer.ts），所以用前缀断言长结果的存在。
+    expect(prompts[1]).toContain("turn 3");
+    expect(prompts[1]).toContain('"rC"');
+    expect(prompts[1]).toContain(bigC.slice(0, 2_000));
+    // 已覆盖 → 离开投影；最近窗口完整保留。
+    expect(JSON.stringify(out2)).not.toContain(bigC);
     expect(JSON.stringify(out2)).toContain(bigD);
-    // 持久化前缀里已覆盖的消息离开投影
+    expect(JSON.stringify(out2)).toContain('"rE"');
+    // 持久化前缀里早已覆盖的消息仍在投影之外。
     expect(JSON.stringify(out2)).not.toContain("task 2");
   });
 

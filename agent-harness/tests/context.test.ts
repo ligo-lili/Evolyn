@@ -684,7 +684,7 @@ describe("context transformer (prefix decisions)", () => {
     expect(events.filter((e) => e.type === "compaction").map((e) => e.trigger)).toEqual(["threshold", "rolling"]);
   });
 
-  it("gate ①: summary failure returns the projection unchanged and never touches originals", async () => {
+  it("gate ①: summary failure injects no summary and never touches originals", async () => {
     const decisions: { decision: string; summarized: boolean; reason: string }[] = [];
     const transformer = createContextTransformer({
       model: { ...FAKE_MODEL, contextWindow: WINDOW },
@@ -698,10 +698,55 @@ describe("context transformer (prefix decisions)", () => {
       ...round("r2", 2000),
       ...round("r3", 2000),
     ];
+    const before = JSON.stringify(messages);
     const out = await transformer(messages);
     expect(decisions[0]!.summarized).toBe(false);
     expect(decisions[0]!.reason).toContain("summarization failed");
-    expect(out.length).toBe(messages.length); // 原样返回
+    // 摘要失败绝不注入摘要，原始历史字节不变。
+    expect(JSON.stringify(out)).not.toContain("<context-summary>");
+    expect(JSON.stringify(messages)).toBe(before);
+    // 加固期语义: 第一层（确定性工具结果整理）真实生效后，摘要失败时投影
+    // 仍会被第一层修剪（最旧轮让出预算）——视图变化来自第一层而非摘要层，
+    // 不变量保护的是原始历史，不是"投影长度必须等于转录长度"。
+    expect(out.length).toBeLessThan(messages.length);
+    expect(JSON.stringify(out)).not.toContain("r1"); // 最旧轮整轮移除
+    expect(JSON.stringify(out)).toContain("r3"); // 全局最近 2 轮保持保护
+  });
+
+  it("加固期修复: layer-1 fires in the fresh-run shape (single task user message, no steering)", () => {
+    // 修复前: isCompactable 豁免"最后一个 user 消息之后"的轮次——单任务 run
+    // 里所有工具轮都落在其之后，第一层是死代码（triggered 恒为 false）。
+    const messages: AgentMessage[] = [m("system", "sys"), m("user", "task")];
+    for (let i = 1; i <= 5; i++) {
+      messages.push(...round(`c${i}`, 600));
+    }
+    const out = reduceToolResults(messages, 1, { budgetTokens: 10 }, { protectedRefs: new Set() });
+    expect(out.triggered).toBe(true);
+    // 最近 2 轮受保护，最旧 3 轮让出预算（600 字符 < head+tail → 截短无收益 → 整轮移除）
+    expect(out.removedRounds).toBe(3);
+    expect(JSON.stringify(out.messages)).not.toContain("c1");
+    expect(JSON.stringify(out.messages)).toContain("c4");
+    expect(JSON.stringify(out.messages)).toContain("c5");
+  });
+
+  it("加固期修复: tiny material below the cutoff extends across protected blocks instead of failing forever", async () => {
+    const decisions: { decision: string; summarized: boolean; coveredMessageCount: number }[] = [];
+    const transformer = createContextTransformer({
+      model: { ...FAKE_MODEL, contextWindow: WINDOW },
+      summaryChat: summaryChat(validSummary()),
+      onDecision: (d) =>
+        decisions.push({ decision: d.decision, summarized: d.summarized, coveredMessageCount: d.coveredMessageCount }),
+    });
+    // 5 个极小对话块（主规则保护最近 4 个 → 切割点前材料 ≈4 tokens）+ 3 个
+    // 大工具轮。修复前: 材料(≈4 tokens) < 任何可能摘要 → gate ③ 永久拒绝，
+    // 每请求白烧一次摘要调用，水位线永不前进。
+    const messages: AgentMessage[] = [m("system", "sys")];
+    for (let i = 1; i <= 5; i++) messages.push(m("user", `u${i}`), m("assistant", `a${i}`));
+    messages.push(...round("t1", 2000), ...round("t2", 2000), ...round("t3", 2000));
+    const out = await transformer(messages);
+    expect(decisions[0]).toMatchObject({ decision: "rebuild", summarized: true });
+    expect(decisions[0]!.coveredMessageCount).toBeGreaterThan(0);
+    expect(JSON.stringify(out)).toContain("<context-summary>");
   });
 
   it("gate ③: a summary that is not smaller than the material is rejected", async () => {

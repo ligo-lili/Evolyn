@@ -5,10 +5,11 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { openDatabase } from "../src/storage/db.js";
 import { MAX_ACTIVE_MEMORIES, MemoryConflictError, MemoryStore } from "../src/memory/store.js";
 import { MemorySearchIndex } from "../src/memory/search.js";
+import { writeFileAtomic, withFileLock } from "../src/memory/atomic.js";
 import { chunkMemory, parseMemory, serializeMemory, type MemoryRecord } from "../src/memory/model.js";
 import { parseCore, renderCore, serializeCore, upsertCoreEntry, type CoreFile } from "../src/memory/core.js";
 import { buildRunDigest, parseReflectionDecision, reflectRunById, shouldReflect } from "../src/memory/reflection.js";
-import { EMBEDDING_MODEL_ID } from "../src/memory/embedding.js";
+import { EMBEDDING_MODEL_ID, type PassageEmbedder } from "../src/memory/embedding.js";
 import { RunManager } from "../src/runtime/run-manager.js";
 import { CollectingReporter } from "../src/runtime/reporter.js";
 import { assistantMessage, FAKE_MODEL, makeTempCwd, scriptedStreamFn } from "./helpers.js";
@@ -849,7 +850,7 @@ describe("hybrid recall wired into runs (向量路接通)", () => {
         return [0, 1];
       },
     };
-    await index.embedRecord(seeded, fake, "fake-e5");
+    await index.embedRecord(seeded, fake, EMBEDDING_MODEL_ID);
     db.close();
 
     const captured: string[] = [];
@@ -937,7 +938,7 @@ describe("hybrid recall wired into runs (向量路接通)", () => {
         embedPassages: async (texts: readonly string[]) => texts.map(() => [0, 1]),
         embedQuery: async () => [0, 1],
       };
-      await index.embedRecord(created, fake, "fake-e5");
+      await index.embedRecord(created, fake, EMBEDDING_MODEL_ID);
 
       const { createMemoryTools } = await import("../src/memory/tools.js");
       const tools = createMemoryTools({ store, index, runId: "run-x", embedder: () => fake });
@@ -1142,6 +1143,133 @@ describe("cross-process atomic id claim", () => {
     expect(store.get("M002")?.title).toBe("T");
     // the next create continues after the claimed max
     expect((await store.create({ title: "U", summary: "s", content: "b", keywords: [] })).id).toBe("M003");
+    tmp.leave();
+  });
+});
+
+describe("加固期修复: file lock / atomic tmp / core clobber guard / FTS rank", () => {
+  it("withFileLock releases on success/failure and steals a stale lock", () => {
+    tmp.enter();
+    const file = path.join(tmp.dir, "lock", "M001.md");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    expect(withFileLock(file, () => 42)).toBe(42);
+    expect(fs.existsSync(file + ".lock")).toBe(false);
+    expect(() =>
+      withFileLock(file, () => {
+        throw new Error("boom");
+      }),
+    ).toThrow("boom");
+    expect(fs.existsSync(file + ".lock")).toBe(false);
+    // 崩溃残留的陈旧锁（> TTL）被接管而不是永久堵死写入
+    fs.writeFileSync(file + ".lock", "", "utf8");
+    const stale = new Date(Date.now() - 60_000);
+    fs.utimesSync(file + ".lock", stale, stale);
+    expect(withFileLock(file, () => "ok")).toBe("ok");
+    tmp.leave();
+  });
+
+  it("atomic writes use unique tmp names and leave no tmp leftovers", () => {
+    tmp.enter();
+    const file = path.join(tmp.dir, "tmpnames", "CORE.md");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    writeFileAtomic(file, "one");
+    writeFileAtomic(file, "two");
+    expect(fs.readFileSync(file, "utf8")).toBe("two");
+    const leftovers = fs.readdirSync(path.dirname(file)).filter((f) => f.includes(".tmp"));
+    expect(leftovers).toEqual([]);
+    tmp.leave();
+  });
+
+  it("coreUpdate refuses to clobber an unparseable CORE.md", async () => {
+    tmp.enter();
+    const store = new MemoryStore(path.join(tmp.dir, "core-broken", "memory"));
+    fs.writeFileSync(store.corePath, "---\nentries: [unclosed\n", "utf8");
+    await expect(store.coreUpdate({ key: "k", content: "c", reason: "r", sourceStatement: "s" })).rejects.toThrow(
+      /refusing to overwrite/,
+    );
+    // 文件原样保留，操作员可以手工修复
+    expect(fs.readFileSync(store.corePath, "utf8")).toContain("unclosed");
+    tmp.leave();
+  });
+
+  it("withFileLock release is owner-token-guarded: a lost lock is never deleted", () => {
+    tmp.enter();
+    const file = path.join(tmp.dir, "lock-token", "M001.md");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    withFileLock(file, () => {
+      // 模拟: 持有者停顿超过 STALE_MS 期间锁被接管者换成自己的 token
+      fs.writeFileSync(file + ".lock", "successor-token", "utf8");
+    });
+    // 原持有者的释放步骤认不出别人的锁——原样保留，由接管者自己释放
+    // (无条件 rmSync 的旧实现会删掉接管者的锁，放第三个进程进来)
+    expect(fs.readFileSync(file + ".lock", "utf8")).toBe("successor-token");
+    fs.rmSync(file + ".lock", { force: true });
+    tmp.leave();
+  });
+
+  it("search with embeddingModel ignores stale-model vectors (mode degrades to fts)", async () => {
+    tmp.enter();
+    const store = new MemoryStore(path.join(tmp.dir, "stale-model", "memory"));
+    const db = openDatabase(path.join(tmp.dir, "stale-model", "harness.db"));
+    try {
+      await store.create({ title: "t", summary: "s", content: "vector content here", keywords: [] });
+      const index = new MemorySearchIndex(db);
+      index.reconcile(store);
+      // Fake embedder: everything embeds to [1,0] — the stale row will cosine-match perfectly
+      const fake: PassageEmbedder = {
+        embedPassages: async (texts) => texts.map(() => [1, 0]),
+        embedQuery: async () => [1, 0],
+      };
+      await index.embedRecord(store.list("active")[0]!, fake, EMBEDDING_MODEL_ID);
+      // 模拟换模型：现存向量全部标记为旧模型
+      db.prepare("UPDATE memory_chunks SET embedding_model = 'old-model'").run();
+      const without = await index.search(store, "vector", { limit: 3, embedder: fake });
+      expect(without[0]!.mode).toBe("hybrid"); // 无过滤: 陈旧向量照常参与余弦
+      const filtered = await index.search(store, "vector", {
+        limit: 3,
+        embedder: fake,
+        embeddingModel: EMBEDDING_MODEL_ID,
+      });
+      // 过滤: 当前模型没有任何向量 → 向量路整体缺席，显式降级 FTS
+      expect(filtered[0]!.mode).toBe("fts");
+      expect(filtered[0]!.degradeReason).toBe("no vectors matched");
+    } finally {
+      db.close();
+    }
+    tmp.leave();
+  });
+
+  it("FTS memory-level ranking follows bm25 rank, not the best chunk index", async () => {
+    tmp.enter();
+    const store = new MemoryStore(path.join(tmp.dir, "fts-rank", "memory"));
+    const db = openDatabase(path.join(tmp.dir, "fts-rank", "harness.db"));
+    try {
+      // M001: 命中落在后段 chunk（长记忆，最佳命中 chunk_index > 0），且词频
+      // 更高 → bm25 名次明确优于 M002（用 node 实测过：fts rank M001 < M002）
+      const filler = Array.from({ length: 8 }, (_, i) => `filler paragraph ${i} ${"z".repeat(150)}`);
+      await store.create({
+        title: "late hit",
+        summary: "target memory with many chunks",
+        content: [...filler, `${"needle ".repeat(8)}sits in the last paragraph`].join("\n\n"),
+        keywords: [],
+      });
+      // M002: 单 chunk 干扰项（命中 chunk_index 0）→ 旧实现按 chunk 下标排序时系统性反超
+      await store.create({
+        title: "decoy",
+        summary: "single chunk decoy with filler",
+        content: `the needle appears here ${"y".repeat(500)}`,
+        keywords: [],
+      });
+      const index = new MemorySearchIndex(db);
+      index.reconcile(store);
+      const hits = await index.search(store, "needle", { limit: 5 });
+      expect(hits.length).toBe(2);
+      // 修复前: 按最佳 chunk 下标排序（M002 的 0 < M001 的 ≥1）→ M002 系统性反超
+      expect(hits[0]!.record.id).toBe("M001");
+      expect(hits[1]!.record.id).toBe("M002");
+    } finally {
+      db.close();
+    }
     tmp.leave();
   });
 });

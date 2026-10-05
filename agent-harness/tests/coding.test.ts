@@ -502,8 +502,89 @@ describe("P1-2 trace reconciliation (阶段 13)", () => {
     fs.writeFileSync(file, events.map((e) => JSON.stringify(e)).join("\n") + "\n" + '{"v":1,"seq":4,"ts":"20', "utf8");
 
     const result = reconcileJsonlTrace(file, events as never);
-    expect(result.rebuilt).toBe(true);
+    // 加固期修复 semantics: the damaged partial LINE is dropped (truncated
+    // counts it) and the complete events survive — the file is rewritten as
+    // the SQLite-union; nothing is lost from the ledger.
+    expect(result.truncated).toBe(1);
     expect(() => readTraceFile(file)).not.toThrow();
+    expect(fs.readFileSync(file, "utf8").trim().split("\n")).toHaveLength(3);
+    tmp.leave();
+  });
+
+  it("加固期修复: a compound failure (mid-log hole + partial final line) still backfills the hole", () => {
+    tmp.enter();
+    const dbPath = path.join(tmp.dir, "recon-compound", "harness.db");
+    const db = openDatabase(dbPath);
+    try {
+      new RunRepo(db).insert({
+        id: "r1",
+        task: "t",
+        modelSpec: "m",
+        status: "running",
+        startedAt: new Date().toISOString(),
+      });
+      const repo = new TraceEventRepo(db);
+      const mk = (seq: number): Record<string, unknown> & { seq: number } => ({
+        v: 1,
+        seq,
+        ts: new Date().toISOString(),
+        runId: "r1",
+        type: seq === 1 ? "run_start" : "message_end",
+        ...(seq === 1 ? { task: "t", modelSpec: "m" } : { message: { role: "user", content: "x", timestamp: seq } }),
+      });
+      // The compound failure: SQLite's sink failed at seq 3 (hole) but recovered;
+      // afterwards the process died mid-append to the JSONL tail (partial seq 5).
+      // 修复前: the parse failure short-circuited into a full rebuild BEFORE the
+      // backfill ran — event 3 was destroyed from both stores and an in-flight
+      // tool call silently evaporated on recovery.
+      const sqlite = [mk(1), mk(2), mk(4)];
+      for (const event of sqlite) repo.append(event as never);
+      const hole = mk(3);
+      const file = path.join(tmp.dir, "recon-compound", "trace.jsonl");
+      fs.writeFileSync(
+        file,
+        [...sqlite.slice(0, 2), hole, sqlite[2], mk(5)].map((e) => JSON.stringify(e)).join("\n") +
+          "\n" +
+          '{"v":1,"seq":5,"ts":"20',
+        "utf8",
+      );
+
+      const backfilledSeqs: number[] = [];
+      const result = reconcileJsonlTrace(file, sqlite as never, (event) => {
+        backfilledSeqs.push(event.seq as number);
+        repo.append(event as never);
+      });
+      expect(result.backfilled).toBe(1);
+      expect(backfilledSeqs).toEqual([3]);
+      const after = new TraceEventRepo(db).getByRun("r1");
+      expect(after.map((e) => e.seq)).toEqual([1, 2, 3, 4]);
+      // the rewritten JSONL is the seq-ordered union: hole filled, damaged tail gone
+      expect(fs.readFileSync(file, "utf8").trim().split("\n")).toHaveLength(4);
+      expect(fs.readFileSync(file, "utf8")).toContain('"seq":3');
+    } finally {
+      db.close();
+    }
+    tmp.leave();
+  });
+
+  it("加固期修复: SQLite empty + JSONL holding complete events → refuse instead of destroying the audit copy", () => {
+    tmp.enter();
+    const file = path.join(tmp.dir, "recon-refuse", "trace.jsonl");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const mk = (seq: number): Record<string, unknown> => ({
+      v: 1,
+      seq,
+      ts: new Date().toISOString(),
+      runId: "r1",
+      type: seq === 1 ? "run_start" : "message_end",
+      ...(seq === 1 ? { task: "t", modelSpec: "m" } : { message: { role: "user", content: "x", timestamp: seq } }),
+    });
+    fs.writeFileSync(file, [mk(1), mk(2)].map((e) => JSON.stringify(e)).join("\n") + "\n", "utf8");
+    // runs row survived, trace_events did not (partial ledger loss): truncating
+    // or rebuilding here would irreversibly delete the only audit copy.
+    expect(() => reconcileJsonlTrace(file, [] as never)).toThrow(/refusing to reconcile/);
+    // the file is untouched
+    expect(fs.readFileSync(file, "utf8").trim().split("\n")).toHaveLength(2);
     tmp.leave();
   });
 });
@@ -1062,13 +1143,24 @@ describe("加固期: rebuild loader gate", () => {
       }
       const verify = await import("../src/skills/verify.js");
       const real = verify.verifyPromotedSkills;
-      const spy = vi
-        .spyOn(verify, "verifyPromotedSkills")
-        .mockImplementation((dir) =>
-          String(dir).includes("bad-skill")
-            ? { ok: false, skills: [], diagnostics: [{ type: "error", message: "pi loader rejects" }] }
-            : real(dir),
-        );
+      // 加固期修复 semantics: rebuild verifies the WHOLE promoted root once
+      // (cross-directory collisions are invisible to per-dir checks), so the
+      // mock is keyed on the root: the loader loaded good-skill, reported an
+      // error diagnostic pointing into bad-skill, and never discovered
+      // bad-skill — both rejection paths must skip it.
+      const spy = vi.spyOn(verify, "verifyPromotedSkills").mockImplementation((dir) =>
+        String(dir) === promoted
+          ? {
+              ok: false,
+              skills: [
+                { name: "good-skill", filePath: path.join(promoted, "good-skill", "SKILL.md"), description: "d" },
+              ],
+              diagnostics: [
+                { type: "error", message: "pi loader rejects", path: path.join(promoted, "bad-skill", "SKILL.md") },
+              ],
+            }
+          : real(dir),
+      );
       try {
         const index = new SkillIndex(db);
         expect(index.rebuild(promoted)).toBe(1);
@@ -1095,6 +1187,24 @@ describe("加固期: switch-flag coercion (--yolo true)", () => {
     );
     // positionals are untouched
     expect(parseArgs(["run", "a", "b"]).positional).toEqual(["a", "b"]);
+  });
+
+  it("加固期修复: a switch flag never swallows the next positional (`resume --yolo <runId>`)", () => {
+    const parsed = parseArgs(["resume", "--yolo", "run-123"]);
+    expect(parsed.flags.yolo).toBe(true);
+    expect(parsed.positional).toEqual(["run-123"]);
+    // the negative spellings coerce to boolean false, not a truthy string
+    expect(parseArgs(["run", "t", "--yolo", "false"]).flags.yolo).toBe(false);
+    expect(parseArgs(["run", "t", "--dry-run=0"]).flags["dry-run"]).toBe(false);
+    // negative numbers stay consumable as value-flag values
+    expect(parseArgs(["memory", "search", "q", "--limit", "-1"]).flags.limit).toBe("-1");
+  });
+
+  it("加固期修复: unknown flags fail loudly (a mistyped safety switch must not fall through)", () => {
+    // `--dryrun` (missing the hyphen) used to be silently ignored and prune
+    // executed the REAL deletion; now it errors before any command runs.
+    expect(() => parseArgs(["prune", "--dryrun"])).toThrow(/unknown option --dryrun/);
+    expect(() => parseArgs(["run", "t", "--yol=1"])).toThrow(/unknown option --yol/);
   });
 });
 

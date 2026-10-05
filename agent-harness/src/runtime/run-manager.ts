@@ -200,8 +200,13 @@ export class RunManager {
   private db?: DatabaseSync;
   /** 在途的记忆向量补全（fire-and-forget）；CLI 在退出前 drain。 */
   private memoryBackfill?: Promise<void>;
-  /** 最近一次 run 的记忆检索上下文——drain 时重查 pending 用。 */
-  private memoryBackfillContext?: { store: MemoryStore; index: MemorySearchIndex; embedder: PassageEmbedder };
+  /** 最近一次 run 的记忆检索上下文——drain 时重查 pending 用。embedder 为
+   * undefined 表示 hybrid 关闭：向量补全不属于该 posture，绝不启动。 */
+  private memoryBackfillContext?: {
+    store: MemoryStore;
+    index: MemorySearchIndex;
+    embedder: PassageEmbedder | undefined;
+  };
 
   private ensureDatabase(spec: string | false | undefined): DatabaseSync | undefined {
     if (spec === false) return undefined;
@@ -250,6 +255,10 @@ export class RunManager {
       const hits = await memoryIndex.search(memoryStore, options.task.slice(0, 1600), {
         limit: options.memory?.limit ?? 5,
         embedder: memoryEmbedder,
+        // 复查补线: only the CURRENT embedding model's vectors may take part
+        // in the cosine ranking — stale-model rows from a mid-backfill window
+        // are meaningless against this query's embedding.
+        embeddingModel: EMBEDDING_MODEL_ID,
       });
       if (hits.length > 0) {
         experienceBlock = renderExperienceBlock(
@@ -300,7 +309,6 @@ export class RunManager {
       experiences: experienceBlock,
     });
     record.systemPrompt = systemPrompt;
-    runRepo?.insert(record);
 
     const limits: Required<RunLimits> = defaultLimitsFor(options.tools, options.limits);
     let limitViolation: LimitViolation | undefined;
@@ -308,6 +316,13 @@ export class RunManager {
     let traceFile: string | undefined;
     let recorder: TraceRecorder | undefined;
     const grantedCapabilities = options.approval?.capabilities ?? ALL_CAPABILITIES;
+    // The durable row lands after every fallible SETUP step (memory index +
+    // recall, skill index, system-prompt assembly) but BEFORE the trace
+    // sinks: trace_events carries an FK to runs(id), so seq 1 (run_start)
+    // must never be attempted without it. Once the row exists, only trace-
+    // file I/O can throw before the try — a much smaller window than the
+    // network-backed setup that used to sit after the insert.
+    runRepo?.insert(record);
     // The controller must exist before the recorder: the between_sinks fault
     // point fires from inside the fan-out (after the JSONL write, before SQLite).
     const faultController = faultSpec ? new FaultController(faultSpec) : undefined;
@@ -438,7 +453,7 @@ export class RunManager {
       // 向量补全触发点：run 结束后 fire-and-forget（宿主经 drainMemoryBackfill
       // 决定是否等待——CLI 在 reflect 之后 drain，长驻宿主可以不理会）。
       this.memoryBackfillContext = memoryIndex
-        ? { store: memoryStore, index: memoryIndex, embedder: memoryEmbedder! }
+        ? { store: memoryStore, index: memoryIndex, embedder: memoryEmbedder }
         : undefined;
       this.beginMemoryBackfill();
     }
@@ -512,7 +527,7 @@ export class RunManager {
     });
     if (reconciled.truncated > 0 || reconciled.rebuilt || reconciled.backfilled > 0) {
       process.stderr.write(
-        `[harness] trace JSONL reconciled with SQLite (authoritative): dropped ${reconciled.truncated} tail event(s), rebuilt=${reconciled.rebuilt}, backfilled=${reconciled.backfilled}\n`,
+        `[harness] trace JSONL reconciled with SQLite (authoritative): dropped ${reconciled.truncated} event(s) (tail/partial), rebuilt=${reconciled.rebuilt}, backfilled=${reconciled.backfilled}\n`,
       );
     }
     // Phase-1 explore subagent: the resolved toolset MUST include explore so a
@@ -797,7 +812,7 @@ export class RunManager {
         );
       }
       this.memoryBackfillContext = memoryIndex
-        ? { store: memoryStore, index: memoryIndex, embedder: memoryEmbedder! }
+        ? { store: memoryStore, index: memoryIndex, embedder: memoryEmbedder }
         : undefined;
       this.beginMemoryBackfill();
     }
@@ -815,6 +830,11 @@ export class RunManager {
   private beginMemoryBackfill(): void {
     const ctx = this.memoryBackfillContext;
     if (this.memoryBackfill || !ctx) return;
+    // hybrid 关闭 = 向量路不属于本 run 的 posture：哪怕有未建向量的记忆，
+    // 也绝不启动注定失败的补全（此前 embedder 缺席时这里会带着 undefined
+    // 一路走进 embedPassages，用 TypeError 烧完三次退避重试，CLI 还会在
+    // drain 处白等约 10s）——零成本 no-op 的承诺由此兑现。
+    if (!ctx.embedder) return;
     try {
       ctx.index.reconcile(ctx.store); // Markdown 为权威的投影兜底（增量同步的保险）
     } catch (err) {

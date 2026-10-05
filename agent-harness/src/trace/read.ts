@@ -101,7 +101,14 @@ export function listTraces(dir: string): TraceFileInfo[] {
     .filter((f) => f.endsWith(".jsonl"))
     .map((f) => {
       const filePath = path.join(dir, f);
-      return { runId: f.replace(/\.jsonl$/, ""), filePath, mtimeMs: statSync(filePath).mtimeMs };
+      try {
+        return { runId: f.replace(/\.jsonl$/, ""), filePath, mtimeMs: statSync(filePath).mtimeMs };
+      } catch {
+        // readdir/stat TOCTOU: the file vanished between the two calls —
+        // skip it instead of crashing the whole listing.
+        return undefined;
+      }
     })
+    .filter((t): t is TraceFileInfo => t !== undefined)
     .sort((a, b) => a.mtimeMs - b.mtimeMs);
 }

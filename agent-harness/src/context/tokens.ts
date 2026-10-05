@@ -13,8 +13,9 @@ import type { Api, Model, Usage } from "@earendil-works/pi-ai";
  * 系数不是拍的：scripts/calibrate_tokens.mjs 用真实 Trace 样本校准
  * （估算/实际 的 P50/P95 分布，node scripts/calibrate_tokens.mjs [--traces dir]）。
  * 旧系数尾部低估时上调，剩余缺口由两层兜底：① 预算线自带安全余量；
- * ② 最后一条 assistant Usage 是实测值，估算与之混合后按大者取值——
- * 即"估算 → 实测 → 校准 → 兜底"的闭环。
+ * ② 最后一条 assistant Usage 是实测 context 值，其后新增尾部用估算【求和】
+ * ——实测是事实，估算只补增量（加固期注释修正：旧注释写的"按大者取值"
+ * 与实现的求和语义不符）。
  */
 
 /** 模型族系数（校准产物；改动须能被校准脚本复现）。 */

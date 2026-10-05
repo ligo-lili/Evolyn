@@ -77,6 +77,18 @@ export class CheckpointWriter {
       messages: this.messages,
       toolCalls: [...this.toolCalls.values()],
     };
-    this.repo.append(this.runId, kind, state);
+    try {
+      this.repo.append(this.runId, kind, state);
+    } catch (err) {
+      // 加固期修复: the recorder deliberately isolates a failing sink so a
+      // transient SQLite error never kills a healthy run — but pi does NOT
+      // guard dispatcher listeners, so an un-isolated checkpoint append was a
+      // side door that degraded the run to failed anyway. A missed checkpoint
+      // only costs crash-recovery granularity, never correctness (the
+      // checkpoint lags the log by design).
+      process.stderr.write(
+        `[harness] checkpoint write failed (recovery granularity degraded): ${err instanceof Error ? err.message : err}\n`,
+      );
+    }
   }
 }

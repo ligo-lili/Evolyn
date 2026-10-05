@@ -7,6 +7,7 @@ import { openDatabase } from "../src/storage/db.js";
 import { RunRepo } from "../src/storage/repos/runs.js";
 import { TraceEventRepo } from "../src/storage/repos/trace-events.js";
 import { CheckpointRepo } from "../src/storage/repos/checkpoints.js";
+import { planPrune } from "../src/storage/prune.js";
 import { readTraceFile } from "../src/trace/read.js";
 import { RunManager } from "../src/runtime/run-manager.js";
 import { CollectingReporter } from "../src/runtime/reporter.js";
@@ -197,5 +198,37 @@ setInterval(() => {}, 1000);
     } finally {
       db.close();
     }
+  });
+});
+
+describe("加固期修复: planPrune keeps a non-finite keepRuns from pruning everything", () => {
+  it("a NaN/invalid keepRuns falls back to the default window instead of beyond=everyone", () => {
+    tmp.enter();
+    const dbPath = path.join(tmp.dir, "prune-nan", "harness.db");
+    const db = openDatabase(dbPath);
+    try {
+      // 25 finished runs, ordered by started_at — keep-runs default 20 leaves 5 beyond.
+      const now = Date.now();
+      for (let i = 0; i < 25; i++) {
+        new RunRepo(db).insert({
+          id: `p-${String(i).padStart(2, "0")}`,
+          task: "t",
+          modelSpec: "m",
+          status: "completed",
+          startedAt: new Date(now - (1000 - i)).toISOString(),
+        });
+      }
+      // 修复前: Math.max(1, NaN) = NaN → slice(NaN) = 全体 → 25 条全部进删除窗口
+      const plan = planPrune(db, { keepRuns: Number.NaN });
+      expect(plan.keepRuns).toBe(20);
+      expect(plan.beyond).toHaveLength(5);
+      expect(plan.beyond.map((r) => r.runId).sort()).toEqual(["p-00", "p-01", "p-02", "p-03", "p-04"]);
+      const plan2 = planPrune(db, { keepRuns: Number.POSITIVE_INFINITY });
+      expect(plan2.keepRuns).toBe(20);
+      expect(plan2.beyond).toHaveLength(5);
+    } finally {
+      db.close();
+    }
+    tmp.leave();
   });
 });

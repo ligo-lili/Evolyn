@@ -131,6 +131,26 @@ export class SkillIndex {
     } catch {
       return 0;
     }
+    // 加固期修复: verification used to run per-DIRECTORY, so a cross-directory
+    // frontmatter-name collision passed rebuild while promote's whole-root
+    // check (the real gate) would have caught it — same gate now, once, over
+    // the whole root. An error diagnostic rejects the directory it points
+    // into; a path-less diagnostic (global) rejects everything.
+    const verification = verifyPromotedSkills(promotedRoot);
+    const loaded = new Set(verification.skills.map((s) => s.name));
+    const errorPaths = verification.diagnostics
+      .filter((d) => d.type === "error" && d.path !== undefined)
+      .map((d) => path.resolve(d.path!));
+    const globalError = verification.diagnostics.some((d) => d.type === "error" && d.path === undefined);
+    const dirRejected = (dir: string, skillName: string): boolean => {
+      if (globalError) return true;
+      const self = path.resolve(dir);
+      if (errorPaths.some((p) => p === self || p.startsWith(self + path.sep))) return true;
+      // Not discovered by the loader at all (a warning-only diagnostic still
+      // means the consumer never accepted the skill — promote's gate checks
+      // the same thing, so rebuild must too).
+      return !loaded.has(skillName);
+    };
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
       const dirPath = path.join(promotedRoot, entry.name);
@@ -151,8 +171,7 @@ export class SkillIndex {
       // 加固期 (P2): the local parser is necessary but not sufficient — a hand
       // dropped directory must pass PI'S OWN loader before it can be indexed
       // and injected into runs (same gate as promote).
-      const verification = verifyPromotedSkills(dirPath);
-      if (!verification.ok) {
+      if (dirRejected(dirPath, doc.name)) {
         const errors = verification.diagnostics
           .filter((d) => d.type === "error")
           .map((d) => d.message)

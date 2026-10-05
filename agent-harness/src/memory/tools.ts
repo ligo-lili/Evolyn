@@ -1,7 +1,7 @@
 import { Type } from "typebox";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { HarnessError } from "../errors.js";
-import type { PassageEmbedder } from "./embedding.js";
+import { EMBEDDING_MODEL_ID, type PassageEmbedder } from "./embedding.js";
 import { MAX_ACTIVE_MEMORIES, MemoryConflictError, MemoryNotFoundError, MemoryStore } from "./store.js";
 import { MemorySearchIndex } from "./search.js";
 import type { AnyAgentTool } from "../runtime/tools/index.js";
@@ -123,6 +123,8 @@ export function createMemoryTools(deps: MemoryToolDeps): AnyAgentTool[] {
       const hits = await deps.index.search(deps.store, args.query, {
         limit: args.limit ?? 5,
         embedder: deps.embedder?.(),
+        // 复查补线: rank only the current embedding model's vectors (see search.ts).
+        embeddingModel: EMBEDDING_MODEL_ID,
       });
       if (hits.length === 0) {
         return textResult("(no matching memory)", { mode: "unavailable", hits: 0 });
@@ -177,7 +179,11 @@ export function createMemoryTools(deps: MemoryToolDeps): AnyAgentTool[] {
           title: args.title,
           summary: args.summary,
           content: args.content,
-          keywords: args.keywords ?? [],
+          // 加固期修复: an omitted array used to become "clear all keywords" —
+          // one forgetful update silently wiped the memory's search anchors.
+          // Omission now keeps the existing keywords (same semantics as the
+          // reflection path); passing [] is still an explicit clear.
+          keywords: args.keywords ?? deps.store.get(args.id)?.keywords ?? [],
         });
         syncProjection(() => deps.index.syncRecord(record));
         return textResult(`updated ${record.id} (rev ${record.revision})`, {

@@ -251,6 +251,9 @@ export function defaultJudge(modelSpec?: string): JudgeFn {
       parse: parseJudgeVerdictStrict,
       complete,
       maxReprompts: 1,
+      // Bounded extraction budget (加固期修复): an unbounded judge call hangs
+      // the whole comparison when a provider stalls.
+      signal: AbortSignal.timeout(120_000),
     });
     return value;
   };
@@ -448,7 +451,11 @@ export interface EvalArmOptions {
 /** Run one arm of the task set, `repeats` times over, resetting fixtures per run.
  * 加固期 (P2): each run is individually fault-isolated — a runner or judge
  * crash records a failed EvalResult and the arm continues, so a partial
- * report still lands. */
+ * report still lands. 加固期修复: the crash paths used to record a plain 0
+ * with the report staying valid — judge/runner/fixture failures ARE
+ * infrastructure (the judge shares the agent's cheap, quota-prone model tier),
+ * so they are now classified into the infra vocabulary and invalidate the
+ * report instead of silently biasing the verdict. */
 export async function runEvalArm(
   taskSet: EvalTaskSet,
   runner: EvalRunner,
@@ -459,7 +466,24 @@ export async function runEvalArm(
   const results: EvalResult[] = [];
   for (let repeat = 1; repeat <= repeats; repeat++) {
     for (const task of taskSet.tasks) {
-      prepareTaskWorkspace(task);
+      // Fixture preparation is harness infrastructure (git clone, template
+      // copy) — its failure must invalidate the report, never count as a
+      // task loss (加固期修复: it used to sit OUTSIDE the try and abort the
+      // whole arm with no report at all).
+      try {
+        prepareTaskWorkspace(task);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        results.push({
+          taskId: task.id,
+          repeat,
+          status: "fixture_error",
+          pass: false,
+          reason: `fixture setup failed: ${message}`,
+          infra: true,
+        });
+        continue;
+      }
       let raw: EvalRawRun;
       let judged: EvalResult;
       try {
@@ -468,12 +492,19 @@ export async function runEvalArm(
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         raw = { taskId: task.id, status: "runner_error", error: message };
-        judged = { ...raw, repeat, pass: false, reason: `runner crashed: ${message}` };
+        judged = {
+          ...raw,
+          repeat,
+          pass: false,
+          reason: `runner crashed: ${message}`,
+          ...(isInfraFailure(raw) ? { infra: true } : {}),
+        };
       }
       if (judged.pass && task.judgeInstructions && opts.judge) {
         // 阶段 11 ordering: deterministic checks already passed; the judge now
         // decides. A deterministic failure never reaches the judge.
         let verdict: { pass: boolean; reason?: string };
+        let judgeInfra = false;
         try {
           verdict = await opts.judge({
             task: task.task,
@@ -483,8 +514,14 @@ export async function runEvalArm(
           });
         } catch (err) {
           verdict = { pass: false, reason: `judge crashed: ${err instanceof Error ? err.message : String(err)}` };
+          judgeInfra = true;
         }
-        results.push({ ...judged, pass: verdict.pass, reason: verdict.pass ? undefined : verdict.reason });
+        results.push({
+          ...judged,
+          pass: verdict.pass,
+          reason: verdict.pass ? undefined : verdict.reason,
+          ...(judgeInfra ? { infra: true } : {}),
+        });
       } else {
         results.push(judged);
       }
@@ -656,16 +693,43 @@ export async function runEvalComparison(taskSet: EvalTaskSet, options: EvalRunOp
           ];
     for (const [arm, skills] of arms) {
       for (const task of taskSet.tasks) {
-        prepareTaskWorkspace(task);
+        // Fixture preparation inside the fault-isolation boundary (加固期修复:
+        // it used to sit outside the try — one network failure aborted the
+        // entire comparison with no report, no artifacts, no INVALID marker).
         let raw: EvalRawRun;
         let judged: EvalResult;
+        try {
+          prepareTaskWorkspace(task);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          raw = { taskId: task.id, status: "fixture_error" };
+          judged = { ...raw, repeat, pass: false, reason: `fixture setup failed: ${message}`, infra: true };
+          seq += 1;
+          session.push({
+            seq,
+            repeat,
+            arm,
+            taskId: task.id,
+            status: raw.status,
+            pass: judged.pass,
+            reason: judged.reason,
+          });
+          (arm === "baseline" ? baselineResults : treatmentResults).push(judged);
+          continue;
+        }
         try {
           raw = await options.runner(task, skills);
           judged = judgeRun(task, raw, repeat);
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
           raw = { taskId: task.id, status: "runner_error", error: message };
-          judged = { ...raw, repeat, pass: false, reason: `runner crashed: ${message}` };
+          judged = {
+            ...raw,
+            repeat,
+            pass: false,
+            reason: `runner crashed: ${message}`,
+            ...(isInfraFailure(raw) ? { infra: true } : {}),
+          };
         }
         if (judged.pass && task.judgeInstructions && options.judge) {
           const verdictInput = {
@@ -675,12 +739,19 @@ export async function runEvalComparison(taskSet: EvalTaskSet, options: EvalRunOp
             status: raw.status,
           };
           let verdict: { pass: boolean; reason?: string };
+          let judgeInfra = false;
           try {
             verdict = await options.judge(verdictInput);
           } catch (err) {
             verdict = { pass: false, reason: `judge crashed: ${err instanceof Error ? err.message : String(err)}` };
+            judgeInfra = true;
           }
-          judged = { ...judged, pass: verdict.pass, reason: verdict.pass ? undefined : verdict.reason };
+          judged = {
+            ...judged,
+            pass: verdict.pass,
+            reason: verdict.pass ? undefined : verdict.reason,
+            ...(judgeInfra ? { infra: true } : {}),
+          };
         }
         seq += 1;
         session.push({

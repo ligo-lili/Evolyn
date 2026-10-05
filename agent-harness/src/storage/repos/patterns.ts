@@ -35,13 +35,27 @@ export class PatternRepo {
   constructor(private readonly db: DatabaseSync) {}
 
   replaceAll(drafts: readonly PatternDraft[]): number {
-    this.db.exec("DELETE FROM patterns");
-    const insert = this.db.prepare(
-      "INSERT INTO patterns (id, kind, signature, support, trace_refs_json, replay_safety, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    );
-    const now = new Date().toISOString();
-    for (const d of drafts)
-      insert.run(d.id, d.kind, d.signature, d.support, JSON.stringify(d.traceRefs), d.replaySafety ?? "unknown", now);
+    // Transactional: DELETE + the INSERT loop used to run as separate
+    // autocommits — a crash (or one UNIQUE collision) in between left the
+    // table empty or half-populated until the next re-mine.
+    this.db.exec("BEGIN");
+    try {
+      this.db.exec("DELETE FROM patterns");
+      const insert = this.db.prepare(
+        "INSERT INTO patterns (id, kind, signature, support, trace_refs_json, replay_safety, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      );
+      const now = new Date().toISOString();
+      for (const d of drafts)
+        insert.run(d.id, d.kind, d.signature, d.support, JSON.stringify(d.traceRefs), d.replaySafety ?? "unknown", now);
+      this.db.exec("COMMIT");
+    } catch (err) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // connection already unwound — nothing to roll back
+      }
+      throw err;
+    }
     return drafts.length;
   }
 

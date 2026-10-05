@@ -49,7 +49,11 @@ function entryField(entry: Omit<CoreEntry, "updated">, field: (typeof CORE_FRONT
 export function parseCore(raw: string, _source = "CORE.md"): CoreFile {
   if (!raw.startsWith("---")) return { entries: [], notes: raw.trim() };
   const end = raw.indexOf("\n---", 3);
-  if (end === -1) return { entries: [], notes: raw.trim() };
+  // 加固期修复: an unterminated frontmatter used to be silently re-interpreted
+  // as freeform notes — a hand-edited broken CORE.md then got clobbered by the
+  // next core_update. Fail loudly: reads degrade to "no core" (readCoreFile
+  // catches), writes refuse via the store's broken-file guard.
+  if (end === -1) throw new Error(`${_source}: unterminated frontmatter`);
   const meta = (parseYaml(raw.slice(3, end)) ?? {}) as Record<string, unknown>;
   const list = Array.isArray(meta.entries) ? meta.entries : [];
   const entries: CoreEntry[] = [];

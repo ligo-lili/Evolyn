@@ -85,6 +85,19 @@ export class SkillEvalRepo {
     const rows = this.db.prepare("SELECT * FROM skill_evals ORDER BY decided_at DESC LIMIT ?").all(limit) as Row[];
     return rows.map(rowToSkillEval);
   }
+
+  /**
+   * All ledger rows for one skill, newest first. 加固期修复: the promote gate
+   * used to scan only the global latest-50 rows — a legitimately accumulating
+   * ledger (any 50 evals of ANY skill) slid the target skill's report out of
+   * the window and the gate silently degraded to a warning.
+   */
+  latestForSkill(skillName: string): SkillEvalRow[] {
+    const rows = this.db
+      .prepare("SELECT * FROM skill_evals WHERE skill_name = ? ORDER BY decided_at DESC")
+      .all(skillName) as Row[];
+    return rows.map(rowToSkillEval);
+  }
 }
 
 export interface EvalBaselineRow {

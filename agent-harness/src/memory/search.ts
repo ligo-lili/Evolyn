@@ -337,6 +337,12 @@ export class MemorySearchIndex {
           for (const record of live) await this.embedRecord(record, embedder, embeddingModel);
           handle.pending = this.backfillPending(embeddingModel);
           if (handle.pending === 0) break;
+          // Still pending without an exception (embedder silently returned
+          // fewer vectors): back off before the next attempt too — the old
+          // code hammered the remaining attempts back-to-back.
+          if (attempt < maxAttempts) {
+            await new Promise((resolve) => setTimeout(resolve, baseDelayMs * 4 ** (attempt - 1)));
+          }
         } catch (err) {
           handle.lastError = err instanceof Error ? err.message : String(err);
           if (attempt >= maxAttempts) {
@@ -350,9 +356,20 @@ export class MemorySearchIndex {
           await new Promise((resolve) => setTimeout(resolve, delay));
         }
       }
-      handle.status = "complete";
+      // 加固期修复: the loop exit used to stamp "complete" unconditionally —
+      // an embedder that silently skipped chunks left status=complete while
+      // backfillPending>0. Report what actually happened.
       handle.pending = this.backfillPending(embeddingModel);
-      this.setMeta("backfill_status", "complete");
+      if (handle.pending > 0) {
+        handle.status = "failed";
+        handle.lastError = handle.lastError ?? `${handle.pending} chunk(s) never received a vector`;
+        this.setMeta("backfill_status", "failed");
+        this.setMeta("backfill_error", handle.lastError);
+        process.stderr.write(`[memory] embedding backfill incomplete: ${handle.lastError}\n`);
+      } else {
+        handle.status = "complete";
+        this.setMeta("backfill_status", "complete");
+      }
     })();
     return handle;
   }
@@ -391,15 +408,20 @@ export class MemorySearchIndex {
   /**
    * 向量路：查询归一化后与全量 chunk 做确定性余弦扫描（非 ANN——active ≤ 25
    * 时全量最准且零额外依赖，§12），min_vector_similarity 过滤弱命中。
+   * 给出 embeddingModel 时只取当前模型的向量——旧模型残留向量（backfill
+   * 未完成窗口）与本次查询向量的余弦没有意义，绝不让它们参与排序。
    */
   private async vectorRankedChunks(
     query: string,
     embedder: PassageEmbedder,
     limit: number,
+    embeddingModel?: string,
   ): Promise<Array<{ memoryId: string; chunkIndex: number; score: number }>> {
-    if (!query.trim() || this.vectorCount() === 0) return [];
+    if (!query.trim() || this.vectorCandidateCount(embeddingModel) === 0) return [];
     const queryVector = await embedder.embedQuery(query);
-    const rows = this.db.prepare("SELECT * FROM memory_chunks WHERE vec IS NOT NULL").all() as unknown as Record<
+    const rows = (embeddingModel
+      ? this.db.prepare("SELECT * FROM memory_chunks WHERE vec IS NOT NULL AND embedding_model = ?").all(embeddingModel)
+      : this.db.prepare("SELECT * FROM memory_chunks WHERE vec IS NOT NULL").all()) as unknown as Record<
       string,
       unknown
     >[];
@@ -415,6 +437,17 @@ export class MemorySearchIndex {
       .filter((s) => s.score >= MIN_VECTOR_SIMILARITY)
       .sort((a, b) => b.score - a.score)
       .slice(0, limit);
+  }
+
+  /** Chunks holding a vector — optionally only the CURRENT model's (the
+   * zero-cost short-circuit must not fire when every vector is stale-model). */
+  private vectorCandidateCount(embeddingModel?: string): number {
+    const row = embeddingModel
+      ? this.db
+          .prepare("SELECT COUNT(*) AS n FROM memory_chunks WHERE vec IS NOT NULL AND embedding_model = ?")
+          .get(embeddingModel)
+      : this.db.prepare("SELECT COUNT(*) AS n FROM memory_chunks WHERE vec IS NOT NULL").get();
+    return Number((row as { n: unknown }).n);
   }
 
   /**
@@ -440,7 +473,7 @@ export class MemorySearchIndex {
     let vectorFailed = false;
     if (opts.embedder) {
       try {
-        const chunks = await this.vectorRankedChunks(query, opts.embedder, pool);
+        const chunks = await this.vectorRankedChunks(query, opts.embedder, pool, opts.embeddingModel);
         // 排名单位是 Memory：每路只取该记忆最相关 chunk 的名次（§7.4.1）。
         const best = new Map<string, number>();
         for (const c of chunks) if (!best.has(c.memoryId)) best.set(c.memoryId, c.chunkIndex);
@@ -458,9 +491,13 @@ export class MemorySearchIndex {
     if (!ftsFailed && fts.length > 0) {
       const best = new Map<string, number>();
       for (const c of fts) if (!best.has(c.memoryId)) best.set(c.memoryId, c.chunkIndex);
-      for (const [id] of best) memoryFts.push({ id, rank: 0 });
-      memoryFts.sort((a, b) => (best.get(a.id) ?? 0) - (best.get(b.id) ?? 0));
-      memoryFts.forEach((m, i) => (m.rank = i + 1));
+      // `fts` is ORDER BY rank, so `best`'s INSERTION ORDER is already the
+      // memory-level FTS ranking. 加固期修复: this used to re-sort by the best
+      // CHUNK INDEX — a multi-chunk memory whose best hit is chunk 5 sank
+      // below every chunk-0 hit, systematically inverting the primary
+      // retrieval path (RRF then fused the inverted ranks).
+      let rank = 0;
+      for (const [id] of best) memoryFts.push({ id, rank: ++rank });
       for (const [id, idx] of best) bestChunkByMemory.set(id, idx);
     }
 

@@ -98,6 +98,13 @@ export function parseMemory(raw: string, source: string): MemoryRecord {
     // NaN 会让乐观锁比较永远走冲突分支——解析期就拒绝，错误更可读。
     throw new Error(`${source}: invalid revision "${String(meta.revision)}"`);
   }
+  const accessCount = Number(meta.access_count ?? 0);
+  if (!Number.isFinite(accessCount) || accessCount < 0) {
+    // 加固期修复: NaN here used to poison the boost arithmetic and make the
+    // ranking comparator non-transitive (a hand-edited file ranked randomly).
+    // Same treatment as revision — reject at parse time with a readable error.
+    throw new Error(`${source}: invalid access_count "${String(meta.access_count)}"`);
+  }
   const content = raw.slice(raw.indexOf("\n", end + 1) + 1).trim();
   return {
     id,
@@ -112,7 +119,7 @@ export function parseMemory(raw: string, source: string): MemoryRecord {
     created: String(meta.created),
     updated: String(meta.updated),
     lastAccessed: meta.last_accessed == null ? undefined : String(meta.last_accessed),
-    accessCount: Number(meta.access_count ?? 0),
+    accessCount,
   };
 }
 

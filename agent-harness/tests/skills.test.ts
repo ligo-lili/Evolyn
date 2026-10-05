@@ -28,7 +28,12 @@ import { promoteCandidate } from "../src/skills/promote.js";
 import { SkillIndex } from "../src/skills/retrieve.js";
 import { verifyPromotedSkills } from "../src/skills/verify.js";
 import { parseSkillMd, serializeSkillMd, validateSkillName, SKILL_DESCRIPTION_MAX } from "../src/skills/format.js";
-import { EvalBaselineRepo, SkillEvalRepo, skillEvalRowFromReport } from "../src/storage/repos/evals.js";
+import {
+  EvalBaselineRepo,
+  SkillEvalRepo,
+  skillEvalRowFromReport,
+  type SkillEvalRow,
+} from "../src/storage/repos/evals.js";
 import {
   buildJudgePrompt,
   isInfraFailure,
@@ -490,6 +495,121 @@ describe("promotion + retrieval (阶段 10)", () => {
     const forced = promoteCandidate(draft.candidate.id, { database: dbPath, skillsRoot, force: true });
     expect(forced.skill.name).toBe(SKILL_JSON.name);
   });
+
+  it("加固期修复: the eval gate scans the skill's whole ledger — newer unrelated reports cannot hide a baseline-wins verdict", async () => {
+    const dbPath = path.join(tmp.dir, "gate-window", "harness.db");
+    const db = openDatabase(dbPath);
+    let patternIdValue = "";
+    try {
+      for (const i of [0, 1, 2]) {
+        seedRun(db, `gw-${i}`, `note file task ${i}`, [
+          toolResultMessage("write_file", false, "wrote"),
+          toolResultMessage("read_file", false, "ok"),
+        ]);
+      }
+      new PatternRepo(db).replaceAll(minePatternsFromDb(db));
+      patternIdValue = new PatternRepo(db).list()[0]!.id;
+    } finally {
+      db.close();
+    }
+    const skillsRoot = path.join(tmp.dir, "gate-window", "skills");
+    const draft = await draftSkillFromPattern(patternIdValue, {
+      database: dbPath,
+      complete: async () => JSON.stringify(SKILL_JSON),
+      skillsRoot,
+    });
+
+    const db2 = openDatabase(dbPath);
+    try {
+      const repo = new SkillEvalRepo(db2);
+      const row = (overrides: {
+        id: string;
+        skillName: string;
+        verdict: SkillEvalRow["verdict"];
+        decidedAt: string;
+      }): SkillEvalRow =>
+        ({
+          evalSet: "file-creation-v1",
+          repeats: 2,
+          baselinePass: 0.5,
+          candidatePass: 0.5,
+          cost: {
+            baseline: { totalTokens: 0, totalDurationMs: 0, avgTokens: 0, avgDurationMs: 0 },
+            treatment: { totalTokens: 0, totalDurationMs: 0, avgTokens: 0, avgDurationMs: 0 },
+          },
+          report: { valid: true } as never,
+          ...overrides,
+        }) as SkillEvalRow;
+      // 55 条更新的无关技能报告：旧实现只查全局最新 50 条，目标技能的
+      // baseline-wins 裁决滑出窗口，门控静默退化为 warning。
+      for (let i = 0; i < 55; i++) {
+        repo.insert(
+          row({
+            id: `noise-${i}`,
+            skillName: "other-skill",
+            verdict: "candidate-wins",
+            decidedAt: new Date(Date.now() + i).toISOString(),
+          }),
+        );
+      }
+      repo.insert(
+        row({
+          id: "loser",
+          skillName: SKILL_JSON.name,
+          verdict: "baseline-wins",
+          decidedAt: new Date(Date.now() - 3_600_000).toISOString(),
+        }),
+      );
+    } finally {
+      db2.close();
+    }
+    expect(() => promoteCandidate(draft.candidate.id, { database: dbPath, skillsRoot })).toThrow(/eval gate/);
+  });
+
+  it("加固期修复: promote checks the DISK for an existing skill, not just the registry projection", async () => {
+    const dbPath = path.join(tmp.dir, "gate-disk", "harness.db");
+    const db = openDatabase(dbPath);
+    let patternIdValue = "";
+    try {
+      for (const i of [0, 1, 2]) {
+        seedRun(db, `gd-${i}`, `note file task ${i}`, [
+          toolResultMessage("write_file", false, "wrote"),
+          toolResultMessage("read_file", false, "ok"),
+        ]);
+      }
+      new PatternRepo(db).replaceAll(minePatternsFromDb(db));
+      patternIdValue = new PatternRepo(db).list()[0]!.id;
+    } finally {
+      db.close();
+    }
+    const skillsRoot = path.join(tmp.dir, "gate-disk", "skills");
+    const draftA = await draftSkillFromPattern(patternIdValue, {
+      database: dbPath,
+      complete: async () => JSON.stringify(SKILL_JSON),
+      skillsRoot,
+    });
+    const draftB = await draftSkillFromPattern(patternIdValue, {
+      database: dbPath,
+      complete: async () => JSON.stringify(SKILL_JSON),
+      skillsRoot,
+    });
+    promoteCandidate(draftA.candidate.id, { database: dbPath, skillsRoot });
+
+    // registry loss: the DB projection vanishes while the file stays on disk
+    const db2 = openDatabase(dbPath);
+    try {
+      db2.exec("DELETE FROM skills_fts");
+      db2.exec("DELETE FROM skills");
+    } finally {
+      db2.close();
+    }
+    // 修复前: 只查 DB → 无 --force 静默覆盖磁盘文件且版本号重置
+    expect(() => promoteCandidate(draftB.candidate.id, { database: dbPath, skillsRoot })).toThrow(/already exists/);
+    // --force 显式覆盖仍然可行，且上报 overwritten
+    const forced = promoteCandidate(draftB.candidate.id, { database: dbPath, skillsRoot, force: true });
+    expect(forced.overwritten).toBe(true);
+    expect(forced.skill.name).toBe(SKILL_JSON.name);
+  });
 });
 
 // ---------- run injection ----------
@@ -923,6 +1043,75 @@ describe("LLM judge (deterministic first, judge second)", () => {
     const rendered = renderEvalReport(report);
     expect(rendered).toContain("⚠ INVALID REPORT");
     expect(rendered).toContain("INVALID — do not use for gating");
+    tmp.leave();
+  });
+
+  it("加固期修复: a judge crash is infrastructure — the run counts as 0 AND the report goes INVALID", async () => {
+    tmp.enter();
+    const report = await runEvalComparison(
+      { name: "s", tasks: [{ id: "t1", task: "x", judgeInstructions: "judge it" }] },
+      {
+        runner: async (task) => ({ taskId: task.id, status: "completed", tokens: 5 }),
+        skillName: "some-skill",
+        judge: async () => {
+          throw new Error("429 rate limit");
+        },
+      },
+    );
+    // 修复前: judge 崩溃被记为干净的 0 且报告保持 valid——judge 与被测 agent
+    // 同一廉价模型档，免费配额 429 可以无声翻转 verdict。
+    expect(report.valid).toBe(false);
+    expect(report.invalidReason).toContain("infrastructure");
+    expect(report.treatment.results[0]!.pass).toBe(false);
+    expect(report.treatment.results[0]!.infra).toBe(true);
+    expect(report.treatment.results[0]!.reason).toContain("judge crashed");
+    tmp.leave();
+  });
+
+  it("加固期修复: a runner crash with a provider-shaped error is classified as infra", async () => {
+    tmp.enter();
+    const report = await runEvalComparison(
+      { name: "s", tasks: [{ id: "t1", task: "x" }] },
+      {
+        runner: async () => {
+          throw new Error('429: {"message":"Rate limit exceeded"}');
+        },
+        skillName: "some-skill",
+      },
+    );
+    expect(report.valid).toBe(false);
+    expect(report.baseline.results[0]!.infra).toBe(true);
+    expect(report.baseline.results[0]!.reason).toContain("runner crashed");
+    tmp.leave();
+  });
+
+  it("加固期修复: a fixture-setup failure is infra and aborts neither the arm nor the report", async () => {
+    tmp.enter();
+    const ran: string[] = [];
+    const report = await runEvalComparison(
+      {
+        name: "s",
+        tasks: [
+          { id: "bad", task: "x", setupRepo: { dir: "repo-x", template: "missing-template-dir" } },
+          { id: "good", task: "x" },
+        ],
+      },
+      {
+        runner: async (task) => {
+          ran.push(task.id);
+          return { taskId: task.id, status: "completed", tokens: 5 };
+        },
+        skillName: "some-skill",
+      },
+    );
+    // 修复前: prepareTaskWorkspace 在 try 之外——一次模板缺失炸掉整个
+    // comparison（无 report、无 session、无 INVALID 标记）。修复后: bad 任务
+    // 记为 infra 失败，good 任务继续跑完（2 repeats × 2 arms）。
+    expect(ran).toEqual(["good", "good", "good", "good"]);
+    expect(report.valid).toBe(false);
+    const badBaseline = report.baseline.results.find((r) => r.taskId === "bad")!;
+    expect(badBaseline.infra).toBe(true);
+    expect(badBaseline.reason).toContain("fixture setup failed");
     tmp.leave();
   });
 });

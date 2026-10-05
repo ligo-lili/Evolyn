@@ -61,15 +61,23 @@ export function promoteCandidate(candidateId: string, options: PromoteOptions = 
     const doc = parseSkillMd(raw, candidate.skillMdPath);
 
     // Eval-ledger gate (阶段 12): refuse skills whose latest valid measurement lost to the baseline.
+    // 加固期修复: the query now targets the skill across its WHOLE ledger
+    // (the old global-latest-50 window silently expired under legitimate
+    // use), and reports version/tie honestly.
     if (!options.skipGate) {
-      const latestValid = new SkillEvalRepo(db)
-        .list(50)
-        .find((r) => r.skillName === doc.name && r.report.valid !== false);
+      const latestValid = new SkillEvalRepo(db).latestForSkill(doc.name).find((r) => r.report.valid !== false);
       if (latestValid) {
         if (latestValid.verdict === "baseline-wins" && !options.force) {
           throw new HarnessError(
             `eval gate: "${doc.name}" last measured baseline-wins ` +
               `(${Math.round(latestValid.baselinePass * 100)}% vs ${Math.round(latestValid.candidatePass * 100)}% at ${latestValid.decidedAt}) — promotion refused; fix the skill or pass --force`,
+          );
+        }
+        // A tie means the eval could not see the skill at all (see eval.ts
+        // header) — promoting on it is allowed, but never silently.
+        if (latestValid.verdict === "tie") {
+          process.stderr.write(
+            `[skills] warning: latest eval of "${doc.name}" was a TIE (${Math.round(latestValid.baselinePass * 100)}% vs ${Math.round(latestValid.candidatePass * 100)}%) — the eval likely could not see the skill; promoting on inconclusive evidence\n`,
           );
         }
       } else {
@@ -83,12 +91,27 @@ export function promoteCandidate(candidateId: string, options: PromoteOptions = 
     const dirPath = path.join(root, doc.name);
     const skillMdPath = path.join(dirPath, "SKILL.md");
     const existing = new SkillIndex(db).getByName([doc.name])[0];
-    if (existing && !options.force) {
+    // 加固期修复: existence used to be checked against the DB projection only
+    // — an empty/rotated registry let promote silently overwrite a SKILL.md
+    // that still exists on disk (and reset its version to 1).
+    const fileExists = fs.existsSync(skillMdPath);
+    if ((existing || fileExists) && !options.force) {
       throw new HarnessError(
-        `a promoted skill named "${doc.name}" already exists (v${existing.version}) — edit the draft or pass force to overwrite`,
+        `a promoted skill named "${doc.name}" already exists${existing ? ` (v${existing.version})` : " on disk (not in the registry)"} — edit the draft or pass force to overwrite`,
       );
     }
-    if (existing && options.force && options.confirm && !options.confirm()) {
+    // 加固期修复: surface WHEN the evidence was measured — a verdict for an
+    // older skillVersion says nothing about the build being promoted.
+    if (!options.skipGate && (existing || fileExists)) {
+      const nextVersion = (existing?.version ?? 0) + 1;
+      const latestValid = new SkillEvalRepo(db).latestForSkill(doc.name).find((r) => r.report.valid !== false);
+      if (latestValid && latestValid.skillVersion !== undefined && latestValid.skillVersion !== nextVersion) {
+        process.stderr.write(
+          `[skills] warning: the latest eval evidence for "${doc.name}" measured v${latestValid.skillVersion}, not the v${nextVersion} being promoted — re-eval the new version before trusting it\n`,
+        );
+      }
+    }
+    if ((existing || fileExists) && options.force && options.confirm && !options.confirm()) {
       throw new HarnessError(`promotion of "${doc.name}" cancelled by the operator`);
     }
 
@@ -96,7 +119,8 @@ export function promoteCandidate(candidateId: string, options: PromoteOptions = 
     // 阶段 13 (P1-4): on a failed pi-loader check the written file must not
     // linger (rebuild would index a rejected skill) — restore the previous
     // version when overwriting, remove the directory otherwise.
-    const previousRaw = existing && fs.existsSync(skillMdPath) ? fs.readFileSync(skillMdPath, "utf8") : undefined;
+    const previousRaw =
+      (existing || fileExists) && fs.existsSync(skillMdPath) ? fs.readFileSync(skillMdPath, "utf8") : undefined;
     fs.writeFileSync(skillMdPath, raw, "utf8");
 
     // pi-loader gate: the consumer contract, not just our parser.
@@ -123,7 +147,7 @@ export function promoteCandidate(candidateId: string, options: PromoteOptions = 
       body: doc.body,
     });
     repo.setStatus(candidate.id, "promoted");
-    return { skill, skillMdPath, overwritten: existing !== undefined };
+    return { skill, skillMdPath, overwritten: existing !== undefined || fileExists };
   } finally {
     db.close();
   }

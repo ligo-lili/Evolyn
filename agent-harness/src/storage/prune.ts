@@ -27,7 +27,11 @@ export interface PrunePlan {
 }
 
 export function planPrune(db: DatabaseSync, options: { keepRuns?: number; deep?: boolean } = {}): PrunePlan {
-  const keepRuns = Math.max(1, options.keepRuns ?? 20);
+  // Library-side guard, layered under the CLI's --keep-runs validation: NaN
+  // would poison slice() below (slice(NaN) keeps nothing) and delete the
+  // traces of EVERY finished run — fall back to the default window instead.
+  const raw = options.keepRuns ?? 20;
+  const keepRuns = Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 20;
   const rows = db.prepare("SELECT id, status FROM runs ORDER BY started_at DESC, rowid DESC").all() as Array<{
     id: string;
     status: string;

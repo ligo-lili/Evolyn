@@ -4,6 +4,18 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 
 const MAX_OUTPUT_CHARS = 8_000;
 const MAX_TIMEOUT_MS = 600_000;
+/**
+ * 加固期修复: the outer withToolTimeout wrapper used to fire at the run-wide
+ * default (120s), so a model-requested `timeout_ms: 300000` (documented up to
+ * 600000) was killed long before its own timer. exec now declares its own
+ * override — the wrapper ceiling sits just above the clamp so the INNER timer
+ * (the one that reports timedOut) is always the one that fires.
+ */
+const OUTER_TIMEOUT_MS = MAX_TIMEOUT_MS + 5_000;
+/** OOM guard: a streaming command (`yes`, cat bigfile) must not accumulate
+ * without bound inside the timeout window; the 8K result clip happens only
+ * after the child exits. */
+const MAX_ACCUMULATED_CHARS = 1_000_000;
 
 const parameters = Type.Object({
   command: Type.String({ description: "Shell command to run in the workspace root" }),
@@ -107,8 +119,14 @@ export const execTool: AgentTool<typeof parameters, ExecDetails> = {
     }>((resolve) => {
       let stdout = "";
       let stderr = "";
-      child.stdout?.on("data", (chunk) => (stdout += String(chunk)));
-      child.stderr?.on("data", (chunk) => (stderr += String(chunk)));
+      // Accumulation caps: once over the ceiling the stream is dropped (head
+      // kept) — output past 1MB is useless to the model and fatal to memory.
+      child.stdout?.on("data", (chunk) => {
+        if (stdout.length < MAX_ACCUMULATED_CHARS) stdout += String(chunk);
+      });
+      child.stderr?.on("data", (chunk) => {
+        if (stderr.length < MAX_ACCUMULATED_CHARS) stderr += String(chunk);
+      });
       let settled = false;
       const finish = (code: number | null, timedOut: boolean, aborted: boolean) => {
         if (settled) return;
@@ -145,3 +163,8 @@ export const execTool: AgentTool<typeof parameters, ExecDetails> = {
     };
   },
 };
+
+// tools/timeout.ts reads the per-tool override via a structural cast — pi's
+// AgentTool has no such field, so it rides outside the typed literal above
+// (same pattern as the explore subagent).
+(execTool as { timeoutMs?: number }).timeoutMs = OUTER_TIMEOUT_MS;

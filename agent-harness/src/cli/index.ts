@@ -150,6 +150,20 @@ function parseRepeatsFlag(value: string | boolean | undefined): number | undefin
   return Number(raw);
 }
 
+/** Parse `--keep-runs` at the CLI boundary. An unparseable value used to flow
+ *  into planPrune as NaN where Math.max(1, NaN) = NaN and slice(NaN) kept
+ *  NOTHING — a typo like `--keep-runs abc` deleted the traces of ALL finished
+ *  runs. Same contract as parseRepeatsFlag: undefined = flag absent. */
+function parseKeepRunsFlag(value: string | boolean | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const raw = typeof value === "string" ? value.trim() : "";
+  if (!/^\d+$/.test(raw) || Number(raw) < 1) {
+    console.error(`invalid --keep-runs value: ${String(value)} (expected a positive integer)`);
+    return undefined;
+  }
+  return Number(raw);
+}
+
 async function main(): Promise<number> {
   const { command, positional, flags } = parseArgs(process.argv.slice(2));
 
@@ -241,7 +255,11 @@ async function main(): Promise<number> {
         const capped = Number.isFinite(limit) && limit > 0 ? limit : 5;
         // HYBRID with the documented degrade chain — mode/degrade_reason are
         // part of the result, not a CLI flag.
-        const hits = await index.search(store, query, { limit: capped, embedder: localEmbedder() });
+        const hits = await index.search(store, query, {
+          limit: capped,
+          embedder: localEmbedder(),
+          embeddingModel: EMBEDDING_MODEL_ID,
+        });
         if (hits.length === 0) {
           console.log("(no matching memory — try `memory rebuild` if you edited the .md files)");
           return 0;
@@ -871,6 +889,17 @@ async function main(): Promise<number> {
       console.error(`unknown --tools "${toolsFlag}" (expected demo | coding)`);
       return 2;
     }
+    const resumeApprovalMode: ApprovalMode =
+      flags.yolo === true
+        ? "auto-approve"
+        : ((typeof flags.approval === "string" ? (flags.approval as ApprovalMode) : undefined) ?? "interactive");
+    if (resumeApprovalMode === "interactive" && !process.stdin.isTTY) {
+      // Same warning as run() — a scripted resume would otherwise auto-deny
+      // every mutating tool with no visible explanation.
+      console.warn(
+        "[approval] interactive mode in a non-interactive shell: mutating tools will be auto-denied (use --yolo to override)",
+      );
+    }
     const result = await manager.resume(targetId, {
       reporter: new ConsoleReporter(),
       // 阶段 13: recovered tool executions go through the same approval gate AND
@@ -878,10 +907,7 @@ async function main(): Promise<number> {
       // is restored automatically; --tools overrides it.
       tools: toolsFlag as ToolsetSpec | undefined,
       approval: {
-        mode:
-          flags.yolo === true
-            ? "auto-approve"
-            : ((typeof flags.approval === "string" ? (flags.approval as ApprovalMode) : undefined) ?? "interactive"),
+        mode: resumeApprovalMode,
         capabilities: capabilities as readonly Capability[] | undefined,
       },
     });
@@ -921,7 +947,8 @@ async function main(): Promise<number> {
   if (command === "prune") {
     // 加固期 (P2) retention: checkpoints of finished runs are dead weight;
     // traces/evidence are kept for the newest keep-runs finished runs.
-    const keepFlag = typeof flags["keep-runs"] === "string" ? Number(flags["keep-runs"]) : undefined;
+    if (flags["keep-runs"] !== undefined && parseKeepRunsFlag(flags["keep-runs"]) === undefined) return 2;
+    const keepFlag = parseKeepRunsFlag(flags["keep-runs"]);
     const db = openDatabase(defaultDbPath());
     try {
       const plan = planPrune(db, { keepRuns: keepFlag, deep: flags.deep === true });
@@ -1037,6 +1064,10 @@ async function main(): Promise<number> {
 main()
   .then((code) => process.exit(code))
   .catch((err: unknown) => {
-    console.error(err instanceof HarnessError || err instanceof Error ? err.message : err);
+    // HarnessError carries a polished message; anything else is a bug — keep
+    // the stack so unexpected TypeErrors are debuggable at all.
+    if (err instanceof HarnessError) console.error(err.message);
+    else if (err instanceof Error) console.error(err.stack ?? err.message);
+    else console.error(err);
     process.exit(1);
   });

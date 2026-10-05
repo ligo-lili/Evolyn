@@ -56,12 +56,25 @@ export class SkillRegistry {
   }
 
   replaceAll(rows: readonly SkillRow[]): void {
-    this.db.exec("DELETE FROM skills");
-    const insert = this.db.prepare(
-      "INSERT INTO skills (id, name, version, dir_path, source_candidate_id, status, promoted_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-    );
-    for (const r of rows)
-      insert.run(r.id, r.name, r.version, r.dirPath, r.sourceCandidateId ?? null, r.status, r.promotedAt);
+    // Transactional — same reasoning as PatternRepo.replaceAll: a crash mid
+    // rebuild must not leave the registry empty or half-populated.
+    this.db.exec("BEGIN");
+    try {
+      this.db.exec("DELETE FROM skills");
+      const insert = this.db.prepare(
+        "INSERT INTO skills (id, name, version, dir_path, source_candidate_id, status, promoted_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      );
+      for (const r of rows)
+        insert.run(r.id, r.name, r.version, r.dirPath, r.sourceCandidateId ?? null, r.status, r.promotedAt);
+      this.db.exec("COMMIT");
+    } catch (err) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // connection already unwound — nothing to roll back
+      }
+      throw err;
+    }
   }
 
   getByName(name: string): SkillRow | undefined {

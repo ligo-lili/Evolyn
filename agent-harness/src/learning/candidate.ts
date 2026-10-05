@@ -164,6 +164,11 @@ export async function draftSkillFromPattern(patternKey: string, options: DraftOp
         parse: (raw) => parseSkillDraftStrict(raw),
         complete,
         maxReprompts: 1,
+        // 加固期修复: an extraction call with no signal hangs the whole CLI
+        // forever when a provider stalls (same tier as the judge — free-quota
+        // 429s and dead connections included). A bounded budget turns the
+        // hang into the mechanical fallback path below.
+        signal: AbortSignal.timeout(120_000),
         schemaTool: {
           name: "store_skill_draft",
           description: "Store the skill draft. Call this with the complete JSON payload.",

@@ -39,7 +39,12 @@ export function buildWorkspaceTree(root: string = process.cwd(), maxDepth = 2, m
     }
     const visible = entries
       .filter((e) => !e.name.startsWith(".") && !(e.isDirectory() && SKIP_DIRECTORIES.has(e.name)))
-      .sort((a, b) => Number(b.isFile()) - Number(a.isFile()) || a.name.localeCompare(b.name));
+      // 加固期修复: localeCompare varies with the system's ICU/locale — the
+      // same workspace sorted differently across machines would byte-drift the
+      // system prompt and silently void the prompt cache. Plain codepoint
+      // compare is machine-independent (and ties break by file/dir order,
+      // which the sort key above already handles deterministically).
+      .sort((a, b) => Number(b.isFile()) - Number(a.isFile()) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     for (const entry of visible) {
       if (lines.length >= maxEntries) {
         lines.push(`${prefix}…`);

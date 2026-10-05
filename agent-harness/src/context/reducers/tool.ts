@@ -7,13 +7,18 @@ import { estimateMessageTokens, estimateMessagesTokens } from "../tokens.js";
  *
  * 触发条件：未受保护的旧工具轮的结果 token 合计超过独立小账本
  * （tool_result_budget）。最近 keep_recent_tool_rounds（默认 2）轮是"当前
- * 工作证据"，绝不截短不删除；最后一个 user 消息之后的轮次是当前回合，
- * resume 边界（historyCount）之后的轮次属于当前 Run 新增消息——全部豁免。
- * 其余旧轮按两步走：
+ * 工作证据"，绝不截短不删除；resume 边界（historyCount）之后的轮次属于当前
+ * Run 新增消息——全部豁免。其余旧轮按两步走：
  *
  *  1. 截短：保留 head + tail 字符，中间插入标记（保留 tool 与 tool_call_id，
  *     配合 Evidence 库可回查全文）；
  *  2. 仍超预算 → 最旧优先整轮移除（assistant + 结果一起），删一个测一次，够就停。
+ *
+ * 加固期修复：旧规则额外豁免"最后一个 user 消息之后"的轮次（视为当前回合），
+ * 但 fresh run 全程只有位于消息 0/1 的一条任务 user 消息（不接 steering），于是
+ * 所有工具轮都落在"最后一个 user 消息之后"——第一层在整个生产运行形态下是
+ * 死代码，全部减压负担都压到模型摘要层。豁免收敛为全局最近 keep 轮
+ * （protectedFrom）：正在进行的回合由它覆盖，更早的旧轮可被整理。
  *
  * 特例：注册了语义裁剪器的工具（如结构化 JSON 观测结果）不走头尾截断，
  * 而是解析后保留元数据、按预算贪心装填 elements 数组，始终输出合法 JSON。
@@ -132,13 +137,15 @@ export function reduceToolResults(
   const rounds = blocks.filter((b): b is ToolRoundBlock => b.kind === "toolRound");
   if (rounds.length === 0) return { messages, trimmedRounds: 0, removedRounds: 0, savedTokens: 0, triggered: false };
 
-  const lastUserIndex = findLastIndex(messages, (m) => m.role === "user");
   const protectedFrom = rounds.length - keep; // 全局序数 ≥ 此值 = 全局最近 keep 轮
   const touchesProtected = (block: ToolRoundBlock): boolean =>
     boundary.protectedRefs.has(block.assistant as object) ||
     block.results.some((r) => boundary.protectedRefs.has(r as object));
+  // 加固期修复：不再豁免"最后一个 user 消息之后"的轮次——单任务 run 里那
+  // 覆盖了全部工具轮（见模块头注释）。进行中的工作由全局最近 keep 轮保护，
+  // in-flight 回合里更早的轮次同样需要让出预算。
   const isCompactable = (ordinal: number, block: ToolRoundBlock): boolean =>
-    ordinal < protectedFrom && block.end <= lastUserIndex && !touchesProtected(block);
+    ordinal < protectedFrom && !touchesProtected(block);
   const oldRounds: RoundPlan[] = [];
   for (let ordinal = 0; ordinal < rounds.length; ordinal++) {
     const block = rounds[ordinal]!;
@@ -192,11 +199,6 @@ export function reduceToolResults(
   }
 
   return { messages: output, trimmedRounds: trimmed, removedRounds: removed, savedTokens: saved, triggered: true };
-}
-
-function findLastIndex(messages: readonly AgentMessage[], pred: (m: AgentMessage) => boolean): number {
-  for (let i = messages.length - 1; i >= 0; i--) if (pred(messages[i]!)) return i;
-  return -1;
 }
 
 /** 单条结果的截短/语义裁剪。只动 text 块；image 块原样保留。无可裁内容时原引用返回。 */

@@ -266,14 +266,30 @@ export function createContextTransformer(
   > {
     const cutoff = summaryCutoffBlockIndex(blocks, { keepConversationBlocks: ctx.keepConversationBlocks });
     if (cutoff === null) return { ok: false, error: "no summarizable conversation blocks" };
-    const cutoffEnd = blocks[cutoff]!.start;
-    // 当前 Run 新增的消息（resume 边界之后）不进材料——水位线永不覆盖它们。
-    const materialEnd = Math.min(cutoffEnd, ctx.persistedEnd);
     const boundary = coveredBoundaryIndex(messages, watermark?.coveredCount ?? 0);
+    // 材料窗口 + 材料下限（加固期 P1-2）。切割点保护"最近 N 个对话块"，但一
+    // 旦水位线越过切割点、或切割点前的材料本身极小，gate ③ / "material is
+    // empty" 会在每次请求上永久失败——水位线推不动，估算单调上涨直到
+    // provider 窗口报错。受保护偏好让位于功能：材料低于下限时，窗口向切割
+    // 点之后扩展（绝不越过 resume 边界），让摘要器有真正可压缩的东西。
+    const MIN_MATERIAL_TOKENS = 256;
+    let materialEnd = Math.min(blocks[cutoff]!.start, ctx.persistedEnd);
+    let material = messages.slice(boundary, materialEnd).filter((m) => m.role !== "system");
+    let materialEstimate = estimateMessagesTokens(material, ctx.coeff);
+    if (materialEstimate < MIN_MATERIAL_TOKENS) {
+      for (let i = cutoff + 1; i < blocks.length; i++) {
+        const b = blocks[i]!;
+        if (b.kind === "system") continue;
+        const end = Math.min(b.end, ctx.persistedEnd);
+        if (end <= materialEnd) continue;
+        materialEnd = end;
+        material = messages.slice(boundary, materialEnd).filter((m) => m.role !== "system");
+        materialEstimate = estimateMessagesTokens(material, ctx.coeff);
+        if (materialEstimate >= MIN_MATERIAL_TOKENS) break;
+      }
+    }
     if (materialEnd <= boundary) return { ok: false, error: "material is empty (all covered or protected)" };
-    const material = messages.slice(boundary, materialEnd).filter((m) => m.role !== "system");
     if (material.length === 0) return { ok: false, error: "material is empty (system-only)" };
-    const materialEstimate = estimateMessagesTokens(material, ctx.coeff);
     const target = ctx.deep ? ctx.budget.targetTokens : ctx.budget.forcedTarget;
     const span = Math.max(materialEstimate - target, 0);
 

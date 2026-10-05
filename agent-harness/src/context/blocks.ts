@@ -59,7 +59,11 @@ function countersEqual(a: Map<string, number>, b: Map<string, number>): boolean 
 }
 
 export function toolCallIdsOf(message: AgentMessage): string[] {
-  if (message.role !== "assistant") return [];
+  // Array.isArray guard (加固期): pi's transformContext contract says a
+  // transformer must never throw — a hand-built transcript with string
+  // assistant content used to TypeError out of partitionMessages and kill
+  // the whole request.
+  if (message.role !== "assistant" || !Array.isArray(message.content)) return [];
   return message.content.filter((b) => b.type === "toolCall").map((b) => (b as { id: string }).id);
 }
 

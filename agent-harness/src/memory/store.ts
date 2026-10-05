@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { HarnessError } from "../errors.js";
-import { writeFileAtomic } from "./atomic.js";
+import { writeFileAtomic, withFileLock } from "./atomic.js";
 import {
   readCoreFile,
   writeCoreFile,
@@ -26,8 +26,10 @@ import { parseMemory, serializeMemory, isValidMemoryId, type MemoryRecord, type 
  *   legacy/           — v2 布局（ordinary/<slug>.md）一次性导入后的原件留存
  *
  * 写入全部采用 临时文件 + fsync + rename 原子替换（atomic.ts，CORE.md 共用）；
- * 单文件上限 512KB；并发经进程内互斥（promise 队列）串行——Windows 无 fcntl，
- * 跨进程文件锁是已知边界。
+ * 单文件上限 512KB；并发分两层：进程内经互斥（promise 队列）串行，跨进程
+ * 经 withFileLock 的 wx lockfile + 过期接管——乐观锁与容量硬顶的临界区都
+ * 在锁内，冲突真正可被检测（加固期修复：此前跨进程只靠 nextId 的 wx 认领，
+ * updateIfRevision 的 read-check-write 与容量检查对其它进程完全透明）。
  */
 
 export const MAX_ACTIVE_MEMORIES = 25;
@@ -57,8 +59,9 @@ export class MemoryNotFoundError extends HarnessError {
   }
 }
 
-/** 进程内互斥：写操作串行化。跨进程文件锁不存在（Windows 无 fcntl），
- * 跨进程写一致性因此是已知边界——见 create() 的原子认领说明。 */
+/** 进程内互斥：写操作串行化。跨进程一致性由 atomic.ts 的 withFileLock
+ * （wx lockfile + 过期接管）承担——两者叠加，MutationGuard 免去进程内
+ * 无谓的锁自旋。 */
 class MutationGuard {
   private tail: Promise<unknown> = Promise.resolve();
 
@@ -88,7 +91,11 @@ export class MemoryStore {
   }
 
   /** v2 (ordinary/<slug>.md) → v3 one-time import: convert into active/M###.md
-   * and move the original into legacy/ so nothing authoritative is destroyed. */
+   * and move the original into legacy/ so nothing authoritative is destroyed.
+   * 加固期修复: the import used to bypass the capacity cap and run its
+   * nextId→write sequence with no cross-process serialization — now it runs
+   * under the store-wide lock and stops at MAX_ACTIVE_MEMORIES (remaining
+   * files stay in ordinary/ for the next start, where capacity allows). */
   private importLegacyLayout(): void {
     const legacyDir = path.join(this.dir, "ordinary");
     let files: string[];
@@ -97,35 +104,46 @@ export class MemoryStore {
     } catch {
       return;
     }
-    for (const name of files) {
-      const file = path.join(legacyDir, name);
-      try {
-        const legacy = parseLegacyMemory(fs.readFileSync(file, "utf8"), file);
-        const id = this.nextId();
-        const record: MemoryRecord = {
-          id,
-          title: legacy.summaryEn || legacy.taskType,
-          summary: legacy.summaryZh || legacy.summaryEn,
-          content: [legacy.approach, legacy.pitfalls].filter(Boolean).join("\n\n"),
-          keywords: legacy.keywordsEn,
-          revision: 1,
-          status: "active",
-          sourceRunId: legacy.runId || undefined,
-          model: legacy.model,
-          created: legacy.created,
-          updated: legacy.updated,
-          accessCount: 0,
-        };
-        writeFileAtomic(this.pathOf(id, "active"), serializeMemory(record));
-        fs.mkdirSync(path.join(this.dir, "legacy"), { recursive: true });
-        fs.renameSync(file, path.join(this.dir, "legacy", name));
-        process.stderr.write(`[memory] imported legacy memory ${name} as ${id}\n`);
-      } catch (err) {
-        process.stderr.write(
-          `[memory] legacy import skipped for ${file}: ${err instanceof Error ? err.message : err}\n`,
-        );
+    withFileLock(this.indexPath, () => {
+      let imported = 0;
+      for (const name of files) {
+        const file = path.join(legacyDir, name);
+        try {
+          if (this.activeCount() >= MAX_ACTIVE_MEMORIES) {
+            process.stderr.write(
+              `[memory] legacy import paused at the ${MAX_ACTIVE_MEMORIES}-memory cap — ` +
+                `${files.length - imported} file(s) remain in ordinary/ and will import on a later start\n`,
+            );
+            return;
+          }
+          const legacy = parseLegacyMemory(fs.readFileSync(file, "utf8"), file);
+          const id = this.nextId();
+          const record: MemoryRecord = {
+            id,
+            title: legacy.summaryEn || legacy.taskType,
+            summary: legacy.summaryZh || legacy.summaryEn,
+            content: [legacy.approach, legacy.pitfalls].filter(Boolean).join("\n\n"),
+            keywords: legacy.keywordsEn,
+            revision: 1,
+            status: "active",
+            sourceRunId: legacy.runId || undefined,
+            model: legacy.model,
+            created: legacy.created,
+            updated: legacy.updated,
+            accessCount: 0,
+          };
+          writeFileAtomic(this.pathOf(id, "active"), serializeMemory(record));
+          fs.mkdirSync(path.join(this.dir, "legacy"), { recursive: true });
+          fs.renameSync(file, path.join(this.dir, "legacy", name));
+          imported++;
+          process.stderr.write(`[memory] imported legacy memory ${name} as ${id}\n`);
+        } catch (err) {
+          process.stderr.write(
+            `[memory] legacy import skipped for ${file}: ${err instanceof Error ? err.message : err}\n`,
+          );
+        }
       }
-    }
+    });
   }
 
   get corePath(): string {
@@ -158,8 +176,23 @@ export class MemoryStore {
   /** 按 key upsert 单条 Core entry —— 模型唯一合法的 Core 修改方式（禁整份覆盖）。 */
   async coreUpdate(entry: { key: string; content: string; reason: string; sourceStatement: string }): Promise<void> {
     await this.guard.run(() => {
-      const file = readCoreFile(this.corePath) ?? defaultCoreFile();
-      writeCoreFile(this.corePath, upsertCoreEntry(file, entry));
+      withFileLock(this.corePath, () => {
+        const existing = readCoreFile(this.corePath);
+        let file: CoreFile;
+        if (existing) {
+          file = existing;
+        } else if (fs.existsSync(this.corePath)) {
+          // CORE.md 在盘但解析失败：此时写默认骨架会静默销毁操作员的全部
+          // entries 与 notes（CORE.md 没有 history 快照，不可恢复）——拒绝并
+          // 让操作员手工修复，绝不盲目覆盖。
+          throw new HarnessError(
+            `CORE.md exists but failed to parse — refusing to overwrite it with a fresh skeleton (${this.corePath}); fix or remove the file by hand`,
+          );
+        } else {
+          file = defaultCoreFile();
+        }
+        writeCoreFile(this.corePath, upsertCoreEntry(file, entry));
+      });
       return undefined;
     });
   }
@@ -240,41 +273,46 @@ export class MemoryStore {
     sourceRunId?: string;
     model?: string;
   }): Promise<MemoryRecord> {
-    return this.guard.run(() => {
-      const active = this.activeCount();
-      if (active >= MAX_ACTIVE_MEMORIES) throw new MemoryCapacityError(MAX_ACTIVE_MEMORIES);
-      let claimed: string | undefined;
-      for (let attempt = 0; attempt < 5 && !claimed; attempt++) {
-        const candidate = this.nextId();
-        try {
-          fs.closeSync(fs.openSync(this.pathOf(candidate, "active"), "wx"));
-          claimed = candidate;
-        } catch (err) {
-          if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    return this.guard.run(() =>
+      // 全店锁（INDEX.md 双重身份：每次 mutation 都以重建它收尾）：容量检查 +
+      // nextId + wx 认领三步在跨进程下必须原子，否则两进程可同时以 24 条通过
+      // 容量检查、各自认领——硬顶 25 被突破。
+      withFileLock(this.indexPath, () => {
+        const active = this.activeCount();
+        if (active >= MAX_ACTIVE_MEMORIES) throw new MemoryCapacityError(MAX_ACTIVE_MEMORIES);
+        let claimed: string | undefined;
+        for (let attempt = 0; attempt < 5 && !claimed; attempt++) {
+          const candidate = this.nextId();
+          try {
+            fs.closeSync(fs.openSync(this.pathOf(candidate, "active"), "wx"));
+            claimed = candidate;
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+          }
         }
-      }
-      if (!claimed) {
-        throw new HarnessError("could not claim a memory id after 5 attempts — active set is churning");
-      }
-      const now = new Date().toISOString();
-      const record: MemoryRecord = {
-        id: claimed,
-        title: input.title.trim(),
-        summary: input.summary.trim(),
-        content: input.content.trim(),
-        keywords: input.keywords,
-        revision: 1,
-        status: "active",
-        sourceRunId: input.sourceRunId,
-        model: input.model,
-        created: now,
-        updated: now,
-        accessCount: 0,
-      };
-      writeFileAtomic(this.pathOf(record.id, "active"), serializeMemory(record)); // rename 覆盖占位文件
-      this.rebuildIndex();
-      return record;
-    });
+        if (!claimed) {
+          throw new HarnessError("could not claim a memory id after 5 attempts — active set is churning");
+        }
+        const now = new Date().toISOString();
+        const record: MemoryRecord = {
+          id: claimed,
+          title: input.title.trim(),
+          summary: input.summary.trim(),
+          content: input.content.trim(),
+          keywords: input.keywords,
+          revision: 1,
+          status: "active",
+          sourceRunId: input.sourceRunId,
+          model: input.model,
+          created: now,
+          updated: now,
+          accessCount: 0,
+        };
+        writeFileAtomic(this.pathOf(record.id, "active"), serializeMemory(record)); // rename 覆盖占位文件
+        this.rebuildIndex();
+        return record;
+      }),
+    );
   }
 
   /**
@@ -288,46 +326,53 @@ export class MemoryStore {
     expectedRevision: number,
     patch: { title: string; summary: string; content: string; keywords: string[] },
   ): Promise<MemoryRecord> {
-    return this.guard.run(() => {
-      const record = this.get(id);
-      if (!record) throw new MemoryNotFoundError(id);
-      if (record.revision !== expectedRevision) throw new MemoryConflictError(id, expectedRevision);
-      if (record.status !== "active") throw new HarnessError(`memory "${id}" is archived and cannot be updated`);
-      this.snapshotHistory(record);
-      const next: MemoryRecord = {
-        ...record,
-        title: patch.title.trim(),
-        summary: patch.summary.trim(),
-        content: patch.content.trim(),
-        keywords: patch.keywords,
-        revision: record.revision + 1,
-        updated: new Date().toISOString(),
-      };
-      writeFileAtomic(this.pathOf(id, "active"), serializeMemory(next));
-      this.rebuildIndex();
-      return next;
-    });
+    return this.guard.run(() =>
+      // 跨进程临界区（加固期修复）：get → 校验 → 写 三步原本对其它进程透明，
+      // 两进程可同时通过 rev N 校验、后写者静默覆盖前者——"永不盲目覆盖"只
+      // 有把临界区锁起来才成立。
+      withFileLock(this.pathOf(id, "active"), () => {
+        const record = this.get(id);
+        if (!record) throw new MemoryNotFoundError(id);
+        if (record.revision !== expectedRevision) throw new MemoryConflictError(id, expectedRevision);
+        if (record.status !== "active") throw new HarnessError(`memory "${id}" is archived and cannot be updated`);
+        this.snapshotHistory(record);
+        const next: MemoryRecord = {
+          ...record,
+          title: patch.title.trim(),
+          summary: patch.summary.trim(),
+          content: patch.content.trim(),
+          keywords: patch.keywords,
+          revision: record.revision + 1,
+          updated: new Date().toISOString(),
+        };
+        writeFileAtomic(this.pathOf(id, "active"), serializeMemory(next));
+        this.rebuildIndex();
+        return next;
+      }),
+    );
   }
 
   /** 归档必须基于最新快照（archive_if_unchanged）；归档前同样留 history 快照。 */
   async archiveIfUnchanged(id: string, expectedRevision: number): Promise<MemoryRecord> {
-    return this.guard.run(() => {
-      const record = this.get(id);
-      if (!record) throw new MemoryNotFoundError(id);
-      if (record.status === "archive") return record;
-      if (record.revision !== expectedRevision) throw new MemoryConflictError(id, expectedRevision);
-      this.snapshotHistory(record);
-      const next: MemoryRecord = {
-        ...record,
-        status: "archive",
-        revision: record.revision + 1,
-        updated: new Date().toISOString(),
-      };
-      writeFileAtomic(this.pathOf(id, "archive"), serializeMemory(next));
-      fs.rmSync(this.pathOf(id, "active"), { force: true });
-      this.rebuildIndex();
-      return next;
-    });
+    return this.guard.run(() =>
+      withFileLock(this.pathOf(id, "active"), () => {
+        const record = this.get(id);
+        if (!record) throw new MemoryNotFoundError(id);
+        if (record.status === "archive") return record;
+        if (record.revision !== expectedRevision) throw new MemoryConflictError(id, expectedRevision);
+        this.snapshotHistory(record);
+        const next: MemoryRecord = {
+          ...record,
+          status: "archive",
+          revision: record.revision + 1,
+          updated: new Date().toISOString(),
+        };
+        writeFileAtomic(this.pathOf(id, "archive"), serializeMemory(next));
+        fs.rmSync(this.pathOf(id, "active"), { force: true });
+        this.rebuildIndex();
+        return next;
+      }),
+    );
   }
 
   /**
@@ -385,18 +430,20 @@ export class MemoryStore {
 
   /** 显式读取的副作用（§8）：计入 access_count / last_accessed_at。 */
   async recordAccess(id: string): Promise<void> {
-    await this.guard.run(() => {
-      const record = this.get(id);
-      if (!record) throw new MemoryNotFoundError(id);
-      if (record.status !== "active") return undefined;
-      const next: MemoryRecord = {
-        ...record,
-        accessCount: record.accessCount + 1,
-        lastAccessed: new Date().toISOString(),
-      };
-      writeFileAtomic(this.pathOf(id, "active"), serializeMemory(next));
-      return undefined;
-    });
+    await this.guard.run(() =>
+      withFileLock(this.pathOf(id, "active"), () => {
+        const record = this.get(id);
+        if (!record) throw new MemoryNotFoundError(id);
+        if (record.status !== "active") return undefined;
+        const next: MemoryRecord = {
+          ...record,
+          accessCount: record.accessCount + 1,
+          lastAccessed: new Date().toISOString(),
+        };
+        writeFileAtomic(this.pathOf(id, "active"), serializeMemory(next));
+        return undefined;
+      }),
+    );
   }
 
   /** INDEX.md（投影）: active 记忆索引，每次写操作后重建；容忍人工编辑的陈旧。 */

@@ -95,7 +95,10 @@ environment. Tool calls default to **interactive approval**; `--yolo` opts out.
   The model gets `memory_read / memory_search / memory_create /
   memory_update / memory_archive / core_memory_update` (coding toolset by
   default). Retrieval quality is gated in CI by `npm run eval:memory`
-  (recall@5 + blind-spot check over `evals/memory-retrieval.json`).
+  (recall@5 + precision@5 + a blind-spot check over
+  `evals/memory-retrieval.json`); the real-model chain (download → run →
+  backfill complete → next run recalls hybrid) is `npm run
+  e2e:memory-hybrid` — ledger-only, not CI (30MB model download).
 - **Skill self-evolution** — recurring patterns are mined from traces
   (support ≥ 3 hard gate), distilled into pi-compatible `SKILL.md` files,
   verified with Pi's own loader, and injected as `<available_skills>` into

@@ -19,6 +19,7 @@
     "format:check": "prettier --check src tests",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "eval:memory": "node --disable-warning=ExperimentalWarning scripts/eval-memory.mjs",
+    "e2e:memory-hybrid": "node --disable-warning=ExperimentalWarning scripts/e2e-memory-hybrid.mjs",
     "chaos": "node --disable-warning=ExperimentalWarning scripts/chaos.mjs"
   },
   "dependencies": {

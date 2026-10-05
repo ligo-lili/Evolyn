@@ -353,6 +353,7 @@ export async function reflectRunById(runId: string, options: ReflectOptions = {}
         content: decision.content ?? existing.content,
         keywords: decision.keywords ?? existing.keywords,
       });
+      syncProjection(() => index.syncRecord(record));
       return { action: "updated", reason: decision.reason, record, file: store.pathOf(id, "active") };
     }
 
@@ -365,6 +366,7 @@ export async function reflectRunById(runId: string, options: ReflectOptions = {}
         sourceRunId: runId,
         model: spec,
       });
+      syncProjection(() => index.syncRecord(record));
       return { action: "created", reason: decision.reason, record, file: store.pathOf(record.id, "active") };
     } catch (err) {
       if (err instanceof MemoryCapacityError) {
@@ -374,5 +376,16 @@ export async function reflectRunById(runId: string, options: ReflectOptions = {}
     }
   } finally {
     db.close();
+  }
+}
+
+/** 写后增量同步搜索投影——失败只降级检索（下次启动对账补齐），绝不推翻已成功的写入。 */
+function syncProjection(sync: () => void): void {
+  try {
+    sync();
+  } catch (err) {
+    process.stderr.write(
+      `[memory] projection sync failed (degraded until next reconcile): ${err instanceof Error ? err.message : err}\n`,
+    );
   }
 }

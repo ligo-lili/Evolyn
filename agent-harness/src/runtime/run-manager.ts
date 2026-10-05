@@ -200,6 +200,8 @@ export class RunManager {
   private db?: DatabaseSync;
   /** 在途的记忆向量补全（fire-and-forget）；CLI 在退出前 drain。 */
   private memoryBackfill?: Promise<void>;
+  /** 最近一次 run 的记忆检索上下文——drain 时重查 pending 用。 */
+  private memoryBackfillContext?: { store: MemoryStore; index: MemorySearchIndex; embedder: PassageEmbedder };
 
   private ensureDatabase(spec: string | false | undefined): DatabaseSync | undefined {
     if (spec === false) return undefined;
@@ -435,7 +437,10 @@ export class RunManager {
       }
       // 向量补全触发点：run 结束后 fire-and-forget（宿主经 drainMemoryBackfill
       // 决定是否等待——CLI 在 reflect 之后 drain，长驻宿主可以不理会）。
-      this.beginMemoryBackfill(memoryStore, memoryIndex, memoryEmbedder);
+      this.memoryBackfillContext = memoryIndex
+        ? { store: memoryStore, index: memoryIndex, embedder: memoryEmbedder! }
+        : undefined;
+      this.beginMemoryBackfill();
     }
 
     return { record, messages, usage: sumAgentUsage(messages), tracePath: traceFile };
@@ -791,33 +796,42 @@ export class RunManager {
           `[harness] failed to persist resumed run status: ${err instanceof Error ? err.message : err}\n`,
         );
       }
-      this.beginMemoryBackfill(memoryStore, memoryIndex, memoryEmbedder);
+      this.memoryBackfillContext = memoryIndex
+        ? { store: memoryStore, index: memoryIndex, embedder: memoryEmbedder! }
+        : undefined;
+      this.beginMemoryBackfill();
     }
 
     return { record, messages, usage: sumAgentUsage(messages), tracePath: traceFile };
   }
 
   /**
-   * Run 结束后的记忆向量补全触发点：有 pending 且尚未在跑时才启动，
-   * fire-and-forget——补全自身带有限退避并把失败写进 search_meta/stderr。
-   * 没有检索 index、hybrid 关闭、或全部向量都已就绪时是零成本 no-op。
+   * Run 结束后的记忆向量补全触发点：先对账一次（工具/反思在 run 中或
+   * reflect 阶段写入的记忆由此进入投影），再查 pending；有 pending 且尚未
+   * 在跑时才启动，fire-and-forget——补全自身带有限退避并把失败写进
+   * search_meta/stderr。没有检索 index、hybrid 关闭、或全部向量都已就绪时
+   * 是零成本 no-op。
    */
-  private beginMemoryBackfill(
-    store: MemoryStore,
-    index: MemorySearchIndex | undefined,
-    embedder: PassageEmbedder | undefined,
-  ): void {
-    if (this.memoryBackfill || !index || !embedder) return;
-    if (index.backfillPending(EMBEDDING_MODEL_ID) === 0) return;
-    const handle = index.startBackfill(store, embedder, EMBEDDING_MODEL_ID);
-    this.memoryBackfill = handle.promise;
+  private beginMemoryBackfill(): void {
+    const ctx = this.memoryBackfillContext;
+    if (this.memoryBackfill || !ctx) return;
+    try {
+      ctx.index.reconcile(ctx.store); // Markdown 为权威的投影兜底（增量同步的保险）
+    } catch (err) {
+      process.stderr.write(`[memory] pre-backfill reconcile failed: ${err instanceof Error ? err.message : err}\n`);
+      return;
+    }
+    if (ctx.index.backfillPending(EMBEDDING_MODEL_ID) === 0) return;
+    this.memoryBackfill = ctx.index.startBackfill(ctx.store, ctx.embedder, EMBEDDING_MODEL_ID).promise;
   }
 
   /**
-   * 等待在途的记忆向量补全（没有则立即返回）。短生命周期宿主（CLI）在
-   * reflect 之后调用，让补全在进程退出前完成；返回是否真的等待了一次。
+   * 等待在途的记忆向量补全（没有则先重查一次 pending——reflect / 工具可能在
+   * run 结束后才写入记忆）。短生命周期宿主（CLI）在 reflect 之后调用，让
+   * 补全在进程退出前完成；返回是否真的等待了一次。
    */
   async drainMemoryBackfill(): Promise<boolean> {
+    this.beginMemoryBackfill();
     const task = this.memoryBackfill;
     if (!task) return false;
     this.memoryBackfill = undefined;

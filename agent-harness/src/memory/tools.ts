@@ -5,7 +5,6 @@ import type { PassageEmbedder } from "./embedding.js";
 import { MAX_ACTIVE_MEMORIES, MemoryConflictError, MemoryNotFoundError, MemoryStore } from "./store.js";
 import { MemorySearchIndex } from "./search.js";
 import type { AnyAgentTool } from "../runtime/tools/index.js";
-
 /**
  * 模型工具面——信任分层在工具层的落实：
  *
@@ -34,6 +33,22 @@ export interface MemoryToolDeps {
 
 function textResult<T>(text: string, details: T): { content: [{ type: "text"; text: string }]; details: T } {
   return { content: [{ type: "text", text }], details };
+}
+
+/**
+ * 写操作后的增量投影同步：SQLite chunk 索引立刻跟上，同一次 run 里的
+ * memory_search 就能看到刚写的记忆；run 结束的 backfill 也因此能发现
+ * pending chunk。投影失败只降级检索（下次启动对账补齐），绝不推翻
+ * 已成功的 Markdown 写入。
+ */
+function syncProjection(sync: () => void): void {
+  try {
+    sync();
+  } catch (err) {
+    process.stderr.write(
+      `[memory] projection sync failed (degraded until next reconcile): ${err instanceof Error ? err.message : err}\n`,
+    );
+  }
 }
 
 const readParams = Type.Object({
@@ -138,6 +153,7 @@ export function createMemoryTools(deps: MemoryToolDeps): AnyAgentTool[] {
         content: args.content,
         keywords: args.keywords ?? [],
       });
+      syncProjection(() => deps.index.syncRecord(record));
       return textResult(`created ${record.id} (rev ${record.revision})`, { id: record.id, revision: record.revision });
     },
   };
@@ -163,6 +179,7 @@ export function createMemoryTools(deps: MemoryToolDeps): AnyAgentTool[] {
           content: args.content,
           keywords: args.keywords ?? [],
         });
+        syncProjection(() => deps.index.syncRecord(record));
         return textResult(`updated ${record.id} (rev ${record.revision})`, {
           id: record.id,
           revision: record.revision,
@@ -185,6 +202,7 @@ export function createMemoryTools(deps: MemoryToolDeps): AnyAgentTool[] {
     parameters: archiveParams,
     execute: async (_toolCallId, args) => {
       const record = await deps.store.archiveIfUnchanged(args.id, args.revision);
+      syncProjection(() => deps.index.removeRecord(args.id)); // 归档默认不可检索
       return textResult(`archived ${record.id} (rev ${record.revision})`, {
         id: record.id,
         revision: record.revision,

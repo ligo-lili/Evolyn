@@ -923,6 +923,55 @@ describe("阶段 14 coding eval mechanics", () => {
     tmp.leave();
   });
 
+  it("build-eval 审计防绕过: judgeRun restores pristine test files from the template before grading", () => {
+    tmp.enter();
+    // A minimal template + working copy, then the classic cheat: "fix" the
+    // grading by rewriting the test suite instead of the source.
+    const tpl = path.join(tmp.dir, "tpl");
+    const repo = path.join(tmp.dir, "repos", "cheater");
+    fs.mkdirSync(tpl, { recursive: true });
+    fs.writeFileSync(
+      path.join(tpl, "package.json"),
+      JSON.stringify({ name: "cheater", scripts: { test: "node test.js" } }),
+      "utf8",
+    );
+    fs.writeFileSync(path.join(tpl, "test.js"), "process.exit(1);\n", "utf8");
+    prepareRepoFixture({ dir: repo, template: tpl });
+    const task = {
+      id: "cheater",
+      task: "x",
+      setupRepo: { dir: "repos/cheater", template: tpl },
+      testCommand: "node test.js",
+      cwd: "repos/cheater",
+    };
+    const completed = { taskId: "cheater", status: "completed" };
+
+    // Tampered test.js: without the guard this suite would be "green".
+    fs.writeFileSync(path.join(repo, "test.js"), "console.log('ok');\n", "utf8");
+    const tampered = judgeRun(task, completed);
+    expect(tampered.pass).toBe(false); // the restored red test decides
+    expect(tampered.restored).toEqual(["test.js"]);
+
+    // Tampered package.json test script: the guard covers it too.
+    prepareRepoFixture({ dir: repo, template: tpl });
+    fs.writeFileSync(
+      path.join(repo, "package.json"),
+      JSON.stringify({ name: "cheater", scripts: { test: "exit 0" } }),
+      "utf8",
+    );
+    const pkg = judgeRun(task, completed);
+    expect(pkg.pass).toBe(false);
+    expect(pkg.restored).toEqual(["package.json"]);
+
+    // A legit run (test files untouched) grades normally, no restore reported.
+    fs.writeFileSync(path.join(tpl, "test.js"), "console.log('ok');\n", "utf8");
+    prepareRepoFixture({ dir: repo, template: tpl }); // workspace synced AFTER the template change
+    const legit = judgeRun(task, completed);
+    expect(legit.pass).toBe(true);
+    expect(legit.restored).toBeUndefined();
+    tmp.leave();
+  });
+
   it("an eval arm over a coding taskset judges via the repo tests end-to-end", async () => {
     tmp.enter();
     for (const [name, fixture] of Object.entries(FIXTURES)) {

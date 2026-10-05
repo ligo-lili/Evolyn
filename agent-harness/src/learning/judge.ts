@@ -164,8 +164,37 @@ export function judgeRun(task: EvalTask, run: EvalRawRun, repeat = 1): EvalResul
   }
   // 阶段 14: the coding gate — the repo's own tests decide. Exit 0 passes;
   // anything else fails with the output tail. Fully deterministic.
+  //
+  // build-eval 审计防绕过: the fixture's test files live in the agent's
+  // workspace, so an edit to test.js / package.json could make `npm test`
+  // trivially green without fixing anything — "never test.js" in the task
+  // text is a prompt, not a defence. Before the test command runs, restore
+  // both from the pristine template; the restore is recorded on the result
+  // so reports can surface it. Runs without a template setupRepo are
+  // unaffected (nothing to restore from).
+  const restored: string[] = [];
   if (task.testCommand) {
     const cwd = task.cwd ? path.resolve(task.cwd) : process.cwd();
+    if (task.setupRepo?.template) {
+      for (const rel of ["test.js", "package.json"]) {
+        let want: Buffer | undefined;
+        try {
+          want = fs.readFileSync(path.join(path.resolve(task.setupRepo.template), rel));
+        } catch {
+          continue; // the template does not ship this file — nothing to restore
+        }
+        const dst = path.join(cwd, rel);
+        let have: Buffer | undefined;
+        try {
+          have = fs.readFileSync(dst);
+        } catch {
+          have = undefined; // absent (or unreadable) counts as needing the restore
+        }
+        if (have !== undefined && have.equals(want)) continue;
+        fs.writeFileSync(dst, want);
+        restored.push(rel);
+      }
+    }
     try {
       execSync(task.testCommand, {
         cwd,
@@ -177,8 +206,11 @@ export function judgeRun(task: EvalTask, run: EvalRawRun, repeat = 1): EvalResul
     } catch (err) {
       const e = err as { stdout?: string; stderr?: string; message?: string };
       const tail = `${e.stderr ?? ""}\n${e.stdout ?? ""}\n${e.message ?? ""}`.trim().split("\n").slice(-8).join("\n");
-      return fail(`test command failed: ${task.testCommand}\n${tail.slice(0, 600)}`);
+      return {
+        ...fail(`test command failed: ${task.testCommand}\n${tail.slice(0, 600)}`),
+        ...(restored.length ? { restored } : {}),
+      };
     }
   }
-  return { ...run, repeat, pass: true };
+  return { ...run, repeat, pass: true, ...(restored.length ? { restored } : {}) };
 }

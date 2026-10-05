@@ -211,6 +211,12 @@ export interface EvalResult extends EvalRawRun {
   reason?: string;
   /** True when the run died to provider infrastructure (rate limit/quota/auth), not the task. */
   infra?: boolean;
+  /**
+   * Fixture test files the grader restored from the template before running
+   * the test command (build-eval 审计防绕过): agent edits to test.js /
+   * package.json cannot make the suite green. Empty ⇒ nothing was restored.
+   */
+  restored?: string[];
 }
 
 export type EvalRunner = (task: EvalTask, skills: SkillInjection | false) => Promise<EvalRawRun>;

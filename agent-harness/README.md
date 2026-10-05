@@ -10,7 +10,7 @@ English | [简体中文](README.zh-CN.md)
 git clone https://github.com/ligo-lili/Evolyn
 cd Evolyn\agent-harness
 npm install
-npm test          # 229 tests — every one runs without an API key
+npm test          # full suite — every test runs without an API key
 npm run harness -- run "<task>" --model deepseek/deepseek-flash --tools coding --yolo
 ```
 

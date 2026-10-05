@@ -48,6 +48,7 @@ import {
   stableStringify,
   wilsonInterval,
   type EvalRunner,
+  type EvalTask,
 } from "../src/learning/eval.js";
 import { assistantMessage, FAKE_MODEL, makeTempCwd, scriptedStreamFn, USAGE } from "./helpers.js";
 
@@ -963,6 +964,34 @@ describe("阶段 14 coding eval mechanics", () => {
 describe("阶段 14 protocol + session artifacts", () => {
   it("stableStringify is key-order independent", () => {
     expect(stableStringify({ b: 1, a: { d: 2, c: 3 } })).toBe(stableStringify({ a: { c: 3, d: 2 }, b: 1 }));
+  });
+
+  it("加固期第三轮: stableStringify sorts keys by codepoint (locale-independent protocol sha)", () => {
+    // "B" (0x42) < "_" (0x5f) < "a" (0x61): the old ICU collation ordered
+    // case-insensitively (a < B before underscore-free letters), making the
+    // protocol sha depend on the grading machine.
+    expect(stableStringify({ a: 2, B: 1, _z: 3 })).toBe('{"B":1,"_z":3,"a":2}');
+  });
+
+  it("加固期第三轮: expectSorted grades codepoint order, locale-independent (judge v3)", () => {
+    const file = path.join(tmp.dir, "sorted-lines.txt");
+    const task = {
+      id: "t-sorted",
+      task: "write the lines in order",
+      expectFile: file,
+      expectSorted: "asc",
+    } as unknown as EvalTask;
+    const run = { taskId: "t-sorted", status: "completed" };
+    // The check compares lowercased forms, so case never enters the sort — the
+    // codepoint/ICU divergence shows on non-ASCII: codepoint puts "z" (0x7a)
+    // before "é" (0xe9), while ICU collates é with "e" (é < z). The old judge
+    // graded the REVERSE order, machine-dependently.
+    fs.writeFileSync(file, "z\né\n", "utf8");
+    expect(judgeRun(task, run).pass).toBe(true);
+    fs.writeFileSync(file, "é\nz\n", "utf8");
+    const verdict = judgeRun(task, run);
+    expect(verdict.pass).toBe(false);
+    expect(verdict.reason).toContain("alphabetical order");
   });
 
   it("buildProtocol: deterministic sha, sensitive to task/model changes", () => {

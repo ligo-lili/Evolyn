@@ -334,9 +334,14 @@ export function judgeRun(task: EvalTask, run: EvalRawRun, repeat = 1): EvalResul
     }
     if (task.expectSorted) {
       const descending = task.expectSorted === "desc";
-      const sorted = [...lines].sort((a, b) =>
-        descending ? b.toLowerCase().localeCompare(a.toLowerCase()) : a.toLowerCase().localeCompare(b.toLowerCase()),
-      );
+      // 加固期第三轮: codepoint compare on the lowercased forms — the old
+      // locale-collated verdict varied with the grading machine's ICU.
+      const sorted = [...lines].sort((a, b) => {
+        const x = a.toLowerCase();
+        const y = b.toLowerCase();
+        const cmp = x < y ? -1 : x > y ? 1 : 0;
+        return descending ? -cmp : cmp;
+      });
       const unsorted = lines.findIndex((l, i) => l.toLowerCase() !== sorted[i]?.toLowerCase());
       if (unsorted !== -1) {
         return fail(
@@ -590,17 +595,19 @@ function validityOf(baseline: EvalArmResult, treatment: EvalArmResult): { valid:
 
 // ---------- 阶段 14: pinned protocol + session artifacts (pi evals §27 borrow) ----------
 
-/** Bump when judging SEMANTICS change — the sha pins protocol + judge era. */
-export const EVAL_JUDGE_VERSION = 2;
+/** Bump when judging SEMANTICS change — the sha pins protocol + judge era.
+ * v3 (加固期第三轮): expectSorted grades codepoint order — locale-independent. */
+export const EVAL_JUDGE_VERSION = 3;
 
-/** Key-sorted JSON — the canonical form the protocol sha is computed over. */
+/** Key-sorted JSON — the canonical form the protocol sha is computed over.
+ * 加固期第三轮: codepoint key order, locale-independent (cross-machine shas). */
 export function stableStringify(value: unknown): string {
   const sort = (v: unknown): unknown => {
     if (Array.isArray(v)) return v.map(sort);
     if (v !== null && typeof v === "object") {
       return Object.fromEntries(
         Object.entries(v as Record<string, unknown>)
-          .sort(([a], [b]) => a.localeCompare(b))
+          .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
           .map(([k, vv]) => [k, sort(vv)]),
       );
     }
@@ -627,7 +634,8 @@ export function buildProtocol(
 ): { protocol: EvalProtocol; sha256: string } {
   const protocol: EvalProtocol = {
     taskSet: taskSet.name,
-    tasks: [...taskSet.tasks].sort((a, b) => a.id.localeCompare(b.id)),
+    // codepoint order — the protocol sha must not depend on the machine's ICU (加固期第三轮)
+    tasks: [...taskSet.tasks].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
     model: opts.model,
     toolset: opts.toolset,
     repeats: opts.repeats,

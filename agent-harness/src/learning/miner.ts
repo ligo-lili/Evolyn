@@ -112,17 +112,21 @@ function buildPatterns(
   minSupport: number,
   toolReplay?: Record<string, string>,
 ): PatternDraft[] {
-  return [...acc.values()]
-    .filter((a) => a.runs.size >= minSupport)
-    .map((a) => ({
-      id: patternId(kind, a.signature),
-      kind,
-      signature: a.signature,
-      support: a.runs.size,
-      traceRefs: [...a.runs].sort(),
-      replaySafety: replaySafetyOf(kind, a.signature, toolReplay),
-    }))
-    .sort((a, b) => b.support - a.support || a.signature.localeCompare(b.signature));
+  return (
+    [...acc.values()]
+      .filter((a) => a.runs.size >= minSupport)
+      .map((a) => ({
+        id: patternId(kind, a.signature),
+        kind,
+        signature: a.signature,
+        support: a.runs.size,
+        traceRefs: [...a.runs].sort(),
+        replaySafety: replaySafetyOf(kind, a.signature, toolReplay),
+      }))
+      // 加固期第三轮: tie-break by codepoint, not localeCompare — the mined
+      // order must be machine-independent (ICU collation varies across systems).
+      .sort((a, b) => b.support - a.support || (a.signature < b.signature ? -1 : a.signature > b.signature ? 1 : 0))
+  );
 }
 
 /**

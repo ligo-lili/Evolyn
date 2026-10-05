@@ -123,7 +123,9 @@ export function renderCore(file: CoreFile, maxTokens = CORE_MAX_TOKENS): string 
   const notes = file.notes ? `# Notes\n${file.notes}` : "";
   // Entries first (they are the contract); oldest-updated dropped first when
   // the budget overflows. At least one entry always survives.
-  const ordered = [...file.entries].sort((a, b) => a.updated.localeCompare(b.updated));
+  // codepoint order (加固期第三轮): ISO-8601 compares identically, and the
+  // rendered core block must stay byte-stable across machines (prompt cache).
+  const ordered = [...file.entries].sort((a, b) => (a.updated < b.updated ? -1 : a.updated > b.updated ? 1 : 0));
   const kept: CoreEntry[] = [];
   for (let i = ordered.length - 1; i >= 0; i--) {
     const entry = ordered[i]!;

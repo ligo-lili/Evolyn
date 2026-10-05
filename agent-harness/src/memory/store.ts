@@ -249,7 +249,7 @@ export class MemoryStore {
       const record = this.readAt(file);
       if (record) records.push(record);
     }
-    return records.sort((a, b) => a.id.localeCompare(b.id));
+    return records.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   }
 
   activeCount(): number {

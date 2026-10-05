@@ -542,7 +542,7 @@ export class MemorySearchIndex {
       const boost = 1 + ACCESS_BOOST_WEIGHT * Math.min(Math.log2(1 + record.accessCount), ACCESS_BOOST_CAP);
       boosted.push({ id: fused.id, score: fused.score * boost, boost });
     }
-    boosted.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
+    boosted.sort((a, b) => b.score - a.score || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 
     const hits: MemoryHit[] = [];
     const chunkTextById = this.chunkLookup();

@@ -127,5 +127,5 @@ export function rrfCombine(
   }
   return [...scores.entries()]
     .map(([id, score]) => ({ id, score }))
-    .sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
+    .sort((a, b) => b.score - a.score || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }

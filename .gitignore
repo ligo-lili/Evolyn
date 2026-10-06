@@ -1,3 +1,5 @@
 # workspace-local tooling and design docs — never commit
 .zcodeignore
+.zcode/
 memory-design.md
+docs/

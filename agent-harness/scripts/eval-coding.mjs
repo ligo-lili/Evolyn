@@ -177,10 +177,15 @@ function prepareSandbox(flow) {
 /** Return the list of input cases. Each must have a stable `id`. */
 async function loadCases(args) {
   sandboxDir = prepareSandbox(args.flow);
+  // Default = the three family sets; --sets "file[:family],..." overrides
+  // (a per-task `tag` field in the task set wins over the set-level family).
+  const sets = args.sets
+    ? args.sets.split(',').map((s) => { const [file, family = 'other'] = s.trim().split(':'); return { file, family }; })
+    : SETS;
   const only = args.cases ? new Set(args.cases.split(',').map(s => s.trim()).filter(Boolean)) : null;
   const cases = [];
-  for (const { file, family } of SETS) {
-    const set = loadTaskSet(join(REPO_ROOT, file));
+  for (const { file, family } of sets) {
+    const set = loadTaskSet(resolve(REPO_ROOT, file));
     for (const t of set.tasks) {
       if (only && !only.has(t.id)) continue;
       const task = { ...t };
@@ -189,10 +194,10 @@ async function loadCases(args) {
       if (task.setupRepo?.template) {
         task.setupRepo = { ...task.setupRepo, template: resolve(REPO_ROOT, task.setupRepo.template) };
       }
-      cases.push({ id: t.id, prompt: t.task, tags: [family], task });
+      cases.push({ id: t.id, prompt: t.task, tags: [t.tag ?? family], task });
     }
   }
-  if (!cases.length) throw new Error('no cases loaded - check --cases / the task-set files');
+  if (!cases.length) throw new Error('no cases loaded - check --sets / --cases / the task-set files');
   return cases;
 }
 
@@ -363,7 +368,7 @@ function toTranscript(systemPrompt, messages) {
 function parseArgs(argv) {
   const a = { flow: '.claude/hillclimb/coding-tasks', variant: 'baseline',
               model: 'deepseek/deepseek-flash', reps: 1, concurrency: 1, timeoutS: 600,
-              cases: undefined, approveHarness: false };
+              cases: undefined, sets: undefined, approveHarness: false };
   // A flag at the end of argv would otherwise consume undefined - which for
   // --model equals the default and silently disables the served-model check.
   const val = (i) => { if (argv[i] === undefined) { eprint(`missing value for ${argv[i - 1]}`); usage(); process.exit(2); } return argv[i]; };
@@ -376,6 +381,7 @@ function parseArgs(argv) {
     else if (k === '--concurrency') a.concurrency = +val(++i);
     else if (k === '--timeout-s') a.timeoutS = +val(++i);
     else if (k === '--cases') a.cases = val(++i);
+    else if (k === '--sets') a.sets = val(++i);
     else if (k === '--approve-harness') a.approveHarness = true;
     else if (k === '-h' || k === '--help') { usage(); process.exit(0); }
     else { eprint(`unknown argument: ${k}`); usage(); process.exit(2); }

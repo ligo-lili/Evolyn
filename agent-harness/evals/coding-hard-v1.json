@@ -1,0 +1,220 @@
+{
+  "name": "coding-hard-v1",
+  "description": "Hard family — quality headroom for a near-ceiling model. Zero-dep fixture repos with deeper bug chains (key drift behind a two-hop call chain, pagination off-by-one, swapped clamps through a view layer, a leaky reference whose damage surfaces in a cached report) and two repairs that need a SECOND iteration (the first failing assertion hides the next). File tasks push scale x compound constraints (40 items, 24 mixed-case acronyms, 25 reverse-sorted exclusions), messy-input cleanup and transform chains with exact outputs. Reference solutions verified: every fixture fails as shipped, passes after the intended fix ladder (A: one fix; B: two fixes), and every file task's expected lines pass judgeRun.",
+  "tasks": [
+    {
+      "id": "deploy-config",
+      "task": "The project in repos/deploy-config has a failing test suite. Run `npm test` inside that directory, find the failing assertion, fix the SOURCE files (never test.js), and re-run `npm test` until it passes. Do not git commit.",
+      "setupRepo": {
+        "dir": "repos/deploy-config",
+        "template": "evals/fixtures/deploy-config"
+      },
+      "testCommand": "npm test",
+      "cwd": "repos/deploy-config",
+      "testTimeoutMs": 60000,
+      "tag": "deep-fix"
+    },
+    {
+      "id": "pager",
+      "task": "The project in repos/pager has a failing test suite. Run `npm test` inside that directory, find the failing assertion, fix the SOURCE files (never test.js), and re-run `npm test` until it passes. Do not git commit.",
+      "setupRepo": {
+        "dir": "repos/pager",
+        "template": "evals/fixtures/pager"
+      },
+      "testCommand": "npm test",
+      "cwd": "repos/pager",
+      "testTimeoutMs": 60000,
+      "tag": "deep-fix"
+    },
+    {
+      "id": "gauge",
+      "task": "The project in repos/gauge has a failing test suite. Run `npm test` inside that directory, find the failing assertion, fix the SOURCE files (never test.js), and re-run `npm test` until it passes. Do not git commit.",
+      "setupRepo": {
+        "dir": "repos/gauge",
+        "template": "evals/fixtures/gauge"
+      },
+      "testCommand": "npm test",
+      "cwd": "repos/gauge",
+      "testTimeoutMs": 60000,
+      "tag": "deep-fix"
+    },
+    {
+      "id": "ledger",
+      "task": "The project in repos/ledger has a failing test suite. Run `npm test` inside that directory, find the failing assertion, fix the SOURCE files (never test.js), and re-run `npm test` until it passes. Do not git commit.",
+      "setupRepo": {
+        "dir": "repos/ledger",
+        "template": "evals/fixtures/ledger"
+      },
+      "testCommand": "npm test",
+      "cwd": "repos/ledger",
+      "testTimeoutMs": 60000,
+      "tag": "deep-fix"
+    },
+    {
+      "id": "checkout-cart",
+      "task": "The project in repos/checkout-cart has a failing test suite. Run `npm test` inside that directory and fix the SOURCE files (never test.js) until it passes. The suite has more than one defect to find — keep re-running it after each fix. Do not git commit.",
+      "setupRepo": {
+        "dir": "repos/checkout-cart",
+        "template": "evals/fixtures/checkout-cart"
+      },
+      "testCommand": "npm test",
+      "cwd": "repos/checkout-cart",
+      "testTimeoutMs": 60000,
+      "tag": "iterative-fix"
+    },
+    {
+      "id": "table-summary",
+      "task": "The project in repos/table-summary has a failing test suite. Run `npm test` inside that directory and fix the SOURCE files (never test.js) until it passes. The suite has more than one defect to find — keep re-running it after each fix. Do not git commit.",
+      "setupRepo": {
+        "dir": "repos/table-summary",
+        "template": "evals/fixtures/table-summary"
+      },
+      "testCommand": "npm test",
+      "cwd": "repos/table-summary",
+      "testTimeoutMs": 60000,
+      "tag": "iterative-fix"
+    },
+    {
+      "id": "big-words",
+      "task": "Create big-words.txt with exactly 40 lowercase English words, one per line, alphabetically sorted (A to Z), no duplicates, and none of the words may start with a vowel (a, e, i, o, u).",
+      "expectFile": "big-words.txt",
+      "expectLines": 40,
+      "expectSorted": true,
+      "expectUnique": true,
+      "expectLineRegex": "^[^aeiou][a-z]*$",
+      "tag": "precision-scale"
+    },
+    {
+      "id": "acronyms-24",
+      "task": "Create acronyms.txt with exactly 24 technology acronyms or short names (e.g. API, BMW), one per line, in uppercase, alphabetically sorted (A to Z), no duplicates.",
+      "expectFile": "acronyms.txt",
+      "expectLines": 24,
+      "expectSorted": true,
+      "expectUnique": true,
+      "expectLineRegex": "^[A-Z][A-Z0-9+.#-]{1,11}$",
+      "tag": "precision-scale"
+    },
+    {
+      "id": "countries-25",
+      "task": "Create countries-25.txt with exactly 25 country names, one per line, in REVERSE alphabetical order (Z to A), no duplicates, and none of the names may contain the letter 'u' (upper or lower case).",
+      "expectFile": "countries-25.txt",
+      "expectLines": 25,
+      "expectSorted": "desc",
+      "expectUnique": true,
+      "expectLineRegex": "^[^Uu]*$",
+      "tag": "precision-scale"
+    },
+    {
+      "id": "clean-34",
+      "task": "The file raw-lines.txt contains a messy list. Create clean.txt: each distinct line of raw-lines.txt exactly once, with surrounding whitespace (spaces and tabs) removed, empty lines dropped, sorted alphabetically (A to Z), one per line and nothing else.",
+      "setupFiles": {
+        "raw-lines.txt": "apple\n  banana\ncherry\n\ndate  \nelderberry\nfig\ngrape\nhoneydew\n\tkiwi\nlemon\n\nmango\n  banana\nnectarine\norange\npapaya\napple\ncherry\n fig \ndate\ngrape\nkiwi\nlemon\nmango\n\nnectarine\norange\npapaya\nelderberry\nfig\nhoneydew\n  banana\ngrape\n"
+      },
+      "expectFile": "clean.txt",
+      "expectLinesExact": [
+        "apple",
+        "banana",
+        "cherry",
+        "date",
+        "elderberry",
+        "fig",
+        "grape",
+        "honeydew",
+        "kiwi",
+        "lemon",
+        "mango",
+        "nectarine",
+        "orange",
+        "papaya"
+      ],
+      "tag": "precision-scale"
+    },
+    {
+      "id": "sections-merge",
+      "tag": "precision-scale",
+      "task": "Three files each hold one name per line: fruits.txt, veg.txt, grains.txt. Create summary.txt containing, in order, one line per entry and nothing else: first the line FRUITS, then every distinct fruit from fruits.txt — surrounding whitespace (spaces and tabs) removed, blank lines dropped, each name kept exactly once — sorted alphabetically (A to Z); then the line VEGETABLES, then every distinct vegetable from veg.txt (same cleanup rules) sorted in REVERSE alphabetical order (Z to A); then the line GRAINS, then every distinct grain from grains.txt (same cleanup rules) sorted alphabetically (A to Z).",
+      "setupFiles": {
+        "fruits.txt": "peach\n  apple\nmango\nbanana\napple\ncherry\ngrape\n\nblueberry\norange\nkiwi\n",
+        "veg.txt": "potato\nzucchini\nlettuce\nspinach\ncarrot\npepper\nspinach\nonion\n",
+        "grains.txt": "rice\nbarley\nwheat\noats\ncorn\n"
+      },
+      "expectFile": "summary.txt",
+      "expectLinesExact": [
+        "FRUITS",
+        "apple",
+        "banana",
+        "blueberry",
+        "cherry",
+        "grape",
+        "kiwi",
+        "mango",
+        "orange",
+        "peach",
+        "VEGETABLES",
+        "zucchini",
+        "spinach",
+        "potato",
+        "pepper",
+        "onion",
+        "lettuce",
+        "carrot",
+        "GRAINS",
+        "barley",
+        "corn",
+        "oats",
+        "rice",
+        "wheat"
+      ]
+    },
+    {
+      "id": "totals-18",
+      "task": "The file orders.csv holds lines of the form name,qty,price (prices are whole dollars). Create totals.txt containing, for each row whose qty is at least 4, one line: the name, a colon, a space, then that row's total cost (qty multiplied by price) as a plain integer, ordered by total cost from largest to smallest; break ties by name (A to Z).",
+      "setupFiles": {
+        "orders.csv": "widget,4,7\ngasket,10,3\nbolt,2,9\nnut,5,2\nwasher,8,1\nsprocket,4,11\nflange,7,5\ncoupler,3,13\nvalve,6,4\npiston,4,6\nbearing,9,8\nshaft,5,10\nspring,2,12\nhose,6,3\nclamp,12,2\nrotor,4,9\nseal,7,6\nplug,5,7\n"
+      },
+      "expectFile": "totals.txt",
+      "expectLinesExact": [
+        "bearing: 72",
+        "shaft: 50",
+        "sprocket: 44",
+        "seal: 42",
+        "rotor: 36",
+        "flange: 35",
+        "plug: 35",
+        "gasket: 30",
+        "widget: 28",
+        "clamp: 24",
+        "piston: 24",
+        "valve: 24",
+        "hose: 18",
+        "nut: 10",
+        "washer: 8"
+      ],
+      "tag": "transform-chain"
+    },
+    {
+      "id": "indexed-18",
+      "task": "The file words.txt holds one word per line, some repeated with different casing. Create indexed.txt with one line per DISTINCT word — two words are the same if they differ only in case, and the output form is lowercase — sorted alphabetically, each line formatted as the 1-based position, a period, a space, then the word (so the first line is `1. apple`).",
+      "setupFiles": {
+        "words.txt": "Delta\nalpha\nBravo\nalpha\ncharlie\nECHO\nbravo\nfoxtrot\nGolf\necho\nhotel\nIndia\ngolf\njuliet\nkilo\nLima\nindia\nmike\n"
+      },
+      "expectFile": "indexed.txt",
+      "expectLinesExact": [
+        "1. alpha",
+        "2. bravo",
+        "3. charlie",
+        "4. delta",
+        "5. echo",
+        "6. foxtrot",
+        "7. golf",
+        "8. hotel",
+        "9. india",
+        "10. juliet",
+        "11. kilo",
+        "12. lima",
+        "13. mike"
+      ],
+      "tag": "transform-chain"
+    }
+  ]
+}

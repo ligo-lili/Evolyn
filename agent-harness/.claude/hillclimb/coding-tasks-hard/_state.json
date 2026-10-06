@@ -1,0 +1,67 @@
+{
+  "metrics": [
+    {
+      "id": "pass",
+      "kind": "binary",
+      "label": "Task pass"
+    },
+    {
+      "id": "verified",
+      "kind": "binary",
+      "label": "Write→read"
+    }
+  ],
+  "perf_fields": [
+    {
+      "id": "latency_s",
+      "label": "latency",
+      "unit": "s"
+    },
+    {
+      "id": "tool_calls",
+      "label": "tools"
+    },
+    {
+      "id": "in_tokens",
+      "label": "tok in"
+    },
+    {
+      "id": "out_tokens",
+      "label": "tok out"
+    }
+  ],
+  "harness_paths": [
+    "evals/coding-hard-v1.json",
+    "evals/fixtures/deploy-config/package.json",
+    "evals/fixtures/deploy-config/lib/defaults.js",
+    "evals/fixtures/deploy-config/lib/plan.js",
+    "evals/fixtures/deploy-config/lib/summary.js",
+    "evals/fixtures/deploy-config/test.js",
+    "evals/fixtures/pager/package.json",
+    "evals/fixtures/pager/lib/pager.js",
+    "evals/fixtures/pager/lib/api.js",
+    "evals/fixtures/pager/test.js",
+    "evals/fixtures/gauge/package.json",
+    "evals/fixtures/gauge/lib/bounds.js",
+    "evals/fixtures/gauge/lib/scale.js",
+    "evals/fixtures/gauge/lib/view.js",
+    "evals/fixtures/gauge/test.js",
+    "evals/fixtures/ledger/package.json",
+    "evals/fixtures/ledger/lib/ledger.js",
+    "evals/fixtures/ledger/lib/report.js",
+    "evals/fixtures/ledger/test.js",
+    "evals/fixtures/checkout-cart/package.json",
+    "evals/fixtures/checkout-cart/lib/pricing.js",
+    "evals/fixtures/checkout-cart/lib/discount.js",
+    "evals/fixtures/checkout-cart/lib/checkout.js",
+    "evals/fixtures/checkout-cart/test.js",
+    "evals/fixtures/table-summary/package.json",
+    "evals/fixtures/table-summary/lib/parse.js",
+    "evals/fixtures/table-summary/lib/summarize.js",
+    "evals/fixtures/table-summary/test.js",
+    "src/learning/eval.ts",
+    "src/learning/judge.ts",
+    "src/learning/protocol.ts"
+  ],
+  "harness_sha": "ea7a7904f7987bccd3cb6b7dc2c127012fb55990f181b74e6ee7799b1e5a7545"
+}

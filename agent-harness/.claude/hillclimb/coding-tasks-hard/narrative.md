@@ -6,9 +6,70 @@ Environment fingerprint: harness_sha `ea7a7904f798` (runner + coding-hard-v1.jso
 
 Purpose: the companion flow to `coding-tasks` (98.9% saturated) — **quality headroom**.
 
+## Hillclimb plan (2026-10-06)
+
+Goal: **raise pass**, hold out_tokens ≤ +10% (664 → ≤730 — a verification-flavored
+fix pays its own round cost; that is its account). Scope: coding system prompt +
+tool descriptions; model/params, context policy, harness code and the eval
+infrastructure are off-limits (the gate enforces the last). Gates: a round wins
+with **≥ +1 net pass converted** and no new failure family; **stop after 2
+consecutive rounds with no conversion** (cap 6). No split — 13 cases; all scores
+directional. Cadence: a fresh analyzer per round reads the full baseline traces; I
+apply, run 13×6 (~10 min), report one headline + status table. Close-out: a
+no-change control + winner confirmation run; headline uses the confirmation.
+
+**Round 1 (v1 — verdict-bearing constraint checks):** decisive on both axes and
+rejected by its own pre-registered rule. Quality: **78/78 = 100%** — all 3 known
+failures converted; the census-separation held (precision runs with a real
+comparison check went 24/30 → 30/30; the was-failing rows converted with the
+predicted tool_call pattern). Cost: **out_tokens +70.8%** (664 → 1134) — the ≤730
+guardrail breached sevenfold (prediction missed by ~30×: the check-and-recheck loops
+are the bill). Rule reverted; the incumbent stays round 0. Round 2: a
+cost-constrained refinement of the same lever, or the honest "can't have both".
+
+**Round 2 (v2 — scoped, compact, non-expanding checks):** the refinement cut v1's
+spillover from +70.8% to +18.0% and made the converted rows themselves cheap
+(big-words rep1 788 → 482), but the three registered cost lines fired anyway
+(out 783 > 730; the already-checking in-scope rows paid +310/run — the load-bearing
+K2 assumption failed; +5,251 scope leak). **REJECTED; reverted.** Conclusion of the
+climb: the quality lever is real (a verdict-bearing check is present in 100% of
+converted runs) but class-wide check mandates cannot be held inside the +10% cost
+envelope — a non-mandatory hint-strength variant is the only untried form, at the
+cost of probabilistic conversions. The prompt ships as the pre-climb incumbent;
+v2's text is archived in `v2/change.patch` if the guardrail is ever renegotiated.
+
+## Final summary (close-out, 2026-10-06)
+
+**Recommended change:** none — the climb adopted nothing; the prompt ships as the
+pre-climb incumbent (the committed rule-(4) confirmation-round ban). Two
+mandatory-check formulations each reached 100% quality and each breached the
+registered cost envelope.
+
+**Versus baseline (directional):** round 1: +3 passes (75 → 78) at +70.8%
+out-tokens; round 2 (scoped/compact): +3 passes at +18.0%. The converted rows
+themselves were cheap in round 2 (big-words rep1 788 → 482, one check + one fix);
+the unavoidable premium sat in the already-checking population (+310/run — the
+registered K2 line was +130).
+
+**Why trust this:** every round ran the full set ×6 under a pinned protocol; the
+adoption rules were registered before each run and executed mechanically; the
+mechanism was measured at trace level (precision runs with a comparison check
+24/30 → 30/30; the was-failing rows' tool-call patterns as predicted); two
+independent formulations bound the lever from both directions.
+
+**What else was tried / what I'd try next:** the full cost anatomy (v2/change.md:
+85% of v1's spend went to 30 non-converting checking runs); the hint-strength
+variant ("suggest, don't mandate") is the only untried form — expected to make
+conversions probabilistic; a finer per-run violation metric would buy resolution
+before another thin-signal quality attempt; the generation-params sweep remains
+untried on either flow. Any future prompt-level change should re-run `coding-tasks`
+once to price the shared-prompt cross-flow effect.
+
 | round | change | pass | out toks | in toks | s/run | tools |
 |-------|--------|------|----------|---------|-------|-------|
 | 0 | baseline (deepseek-flash) | **75/78 (96.2%)** | 664 | 1401 | 7.9 | 5.8 |
+| 1 | rule (4)+(6): verdict-bearing checks — **REJECTED (guardrail)** | **78/78** | 1134 | — | 10.0 | 7.3 |
+| 2 | rule (4): scoped/compact checks — **REJECTED (K1/K2/K3)** | **78/78** | 783 | — | 7.8 | 6.4 |
 
 ## By family
 

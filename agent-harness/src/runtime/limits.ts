@@ -79,6 +79,20 @@ export class LimitEnforcer {
     this.totalTokens += usage.totalTokens;
   }
 
+  /**
+   * Interactive sessions (src/runtime/session.ts) call this on every user
+   * submit: turns / tool-calls / repeats / error-strikes measure ONE prompt
+   * cycle, while the money fuses (cost / total tokens) stay cumulative for
+   * the whole session — a long conversation must not trip the turn budget,
+   * but runaway spend must still be capped.
+   */
+  resetCycle(): void {
+    this.turns = 0;
+    this.toolCalls = 0;
+    this.consecutiveErrors = 0;
+    this.callHashes.clear();
+  }
+
   beforeToolCall(toolName: string, args: unknown): BeforeToolCallResult | undefined {
     const deny = (kind: LimitViolation["kind"], reason: string): BeforeToolCallResult => {
       this.audit({ type: "limit_exceeded", kind, reason });

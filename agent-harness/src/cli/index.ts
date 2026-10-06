@@ -15,6 +15,7 @@ import { TraceEventRepo } from "../storage/repos/trace-events.js";
 import { harnessDataDir, tracesDir } from "../runtime/paths.js";
 import { ConsoleReporter } from "../runtime/reporter.js";
 import { RunManager } from "../runtime/run-manager.js";
+import { ChatApp, type ChatExitSummary } from "../modes/interactive/chat.js";
 import { type ApprovalMode } from "../runtime/approval.js";
 import { ALL_CAPABILITIES, type Capability } from "../runtime/permissions.js";
 import type { ToolsetSpec } from "../runtime/run-manager.js";
@@ -50,11 +51,19 @@ import { parseArgs } from "./parse-args.js";
 const HELP = `agent-harness — durable execution harness on top of Pi Agent Runtime
 
 Usage:
+  agent-harness [chat] [--model provider/model-id] [--tools demo|coding]
+                    [--yolo] [--approval auto-approve|auto-deny|interactive]
+                    [--capabilities fs:read,fs:write,...]
+                                           interactive coding agent (REPL over
+                                           one durable run; /help inside for
+                                           slash commands)
   agent-harness run "<task>" [--model provider/model-id] [--tools demo|coding]
                     [--yolo] [--approval auto-approve|auto-deny|interactive]
                     [--capabilities fs:read,fs:write,...] [--fault point:tool]
   agent-harness resume [runId]           recover an interrupted run (default: latest)
                     [--yolo] — approval gates apply to recovered tool executions too
+  agent-harness resume [runId] --chat    recover AND continue the same conversation
+                    interactively (trace continues on the same run id)
   agent-harness memory core              show/create the always-resident Core Memory (key entries + evidence)
   agent-harness memory list [--all]      list active (or all incl. archived) memories (authoritative markdown)
   agent-harness memory search <query> [--limit <n>]   hybrid FTS5+vector with the documented degrade chain
@@ -152,9 +161,9 @@ function parseRepeatsFlag(value: string | boolean | undefined): number | undefin
 }
 
 /** Parse `--keep-runs` at the CLI boundary. An unparseable value used to flow
- *  into planPrune as NaN where Math.max(1, NaN) = NaN and slice(NaN) kept
- *  NOTHING — a typo like `--keep-runs abc` deleted the traces of ALL finished
- *  runs. Same contract as parseRepeatsFlag: undefined = flag absent. */
+ * into planPrune as NaN where Math.max(1, NaN) = NaN and slice(NaN) kept
+ * NOTHING — a typo like `--keep-runs abc` deleted the traces of ALL finished
+ * runs. Same contract as parseRepeatsFlag: undefined = flag absent. */
 function parseKeepRunsFlag(value: string | boolean | undefined): number | undefined {
   if (value === undefined) return undefined;
   const raw = typeof value === "string" ? value.trim() : "";
@@ -163,6 +172,178 @@ function parseKeepRunsFlag(value: string | boolean | undefined): number | undefi
     return undefined;
   }
   return Number(raw);
+}
+
+/**
+ * Interactive mode (chat): pi-tui REPL over one durable run per conversation.
+ * Same flags as `run` (--model/--tools/--yolo/--approval/--capabilities). The
+ * exit epilogue mirrors run(): reflect the run into memory, drain the
+ * embedding backfill, close the database.
+ */
+async function runChat(
+  flags: Record<string, string | boolean>,
+  capabilities: readonly Capability[] | undefined,
+): Promise<number> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.error('interactive mode requires a TTY — use: agent-harness run "<task>"');
+    return 2;
+  }
+  const flagModel = typeof flags.model === "string" ? flags.model : undefined;
+  const spec = flagModel ?? defaultModelSpec();
+  if (!spec) {
+    console.error("no model selected: pass --model provider/model-id or set HARNESS_MODEL (see: agent-harness models)");
+    return 2;
+  }
+  const model = resolveModel(spec);
+  const toolsFlag = typeof flags.tools === "string" ? flags.tools : undefined;
+  if (toolsFlag !== undefined && toolsFlag !== "demo" && toolsFlag !== "coding") {
+    console.error(`unknown --tools "${toolsFlag}" (expected demo | coding)`);
+    return 2;
+  }
+  const chatApprovalMode: ApprovalMode =
+    flags.yolo === true
+      ? "auto-approve"
+      : ((typeof flags.approval === "string" ? (flags.approval as ApprovalMode) : undefined) ?? "interactive");
+
+  const manager = new RunManager();
+  let summary: ChatExitSummary;
+  try {
+    const app = new ChatApp({
+      manager,
+      model,
+      tools: toolsFlag as ToolsetSpec | undefined,
+      approvalMode: chatApprovalMode,
+      capabilities,
+    });
+    summary = await app.run();
+  } catch (err) {
+    manager.close();
+    throw err;
+  }
+
+  console.log("");
+  if (summary.runId) {
+    console.log(`run ${summary.runId}`);
+    console.log(`status: ${summary.status ?? "unknown"} (${summary.cycles} cycle(s))`);
+    if (summary.error) console.error(`error: ${summary.error}`);
+  }
+  if (summary.runId && flags["no-distill"] !== true) {
+    try {
+      const outcome = await reflectRunById(summary.runId);
+      if (outcome.action === "created" || outcome.action === "updated") {
+        console.log(
+          `memory: ${outcome.action} ${outcome.record.id} (rev ${outcome.record.revision}) — ${outcome.reason}`,
+        );
+      } else {
+        console.log(`memory: ${outcome.action} — ${outcome.reason}`);
+      }
+    } catch (err) {
+      console.error(`memory: reflection failed (${err instanceof Error ? err.message : err})`);
+    }
+    if (await manager.drainMemoryBackfill()) {
+      console.log("memory: embedding backfill complete (vector recall now effective)");
+    }
+  }
+  manager.close();
+  return summary.status === "completed" || summary.status === undefined ? 0 : 1;
+}
+
+/**
+ * `resume [runId] --chat`: recover an interrupted run and continue the SAME
+ * conversation in the interactive TUI (trace seq continues on the run). The
+ * model/toolset come from the run row unless overridden by flags.
+ */
+async function resumeIntoChat(
+  flags: Record<string, string | boolean>,
+  capabilities: readonly Capability[] | undefined,
+  targetId: string | undefined,
+): Promise<number> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    console.error("interactive resume requires a TTY — use: agent-harness resume [runId]");
+    return 2;
+  }
+  const toolsFlag = typeof flags.tools === "string" ? flags.tools : undefined;
+  if (toolsFlag !== undefined && toolsFlag !== "demo" && toolsFlag !== "coding") {
+    console.error(`unknown --tools "${toolsFlag}" (expected demo | coding)`);
+    return 2;
+  }
+  const chatApprovalMode: ApprovalMode =
+    flags.yolo === true
+      ? "auto-approve"
+      : ((typeof flags.approval === "string" ? (flags.approval as ApprovalMode) : undefined) ?? "interactive");
+
+  const manager = new RunManager();
+  const runId = targetId ?? manager.listInterrupted().at(-1)?.id;
+  if (!runId) {
+    console.log("(no interrupted runs to resume)");
+    manager.close();
+    return 0;
+  }
+  let summary: ChatExitSummary;
+  try {
+    // The run row carries the crashed run's model + toolset (migration 012).
+    let modelSpec: string | undefined;
+    let toolset: ToolsetSpec | undefined;
+    {
+      const db = openDatabase(defaultDbPath());
+      try {
+        const row = new RunRepo(db).get(runId);
+        if (row) {
+          modelSpec = row.modelSpec;
+          toolset = row.toolset;
+        }
+      } finally {
+        db.close();
+      }
+    }
+    const spec = modelSpec ?? (typeof flags.model === "string" ? flags.model : defaultModelSpec());
+    if (!spec) {
+      console.error(
+        "no model selected: pass --model provider/model-id or set HARNESS_MODEL (see: agent-harness models)",
+      );
+      manager.close();
+      return 2;
+    }
+    const model = resolveModel(spec);
+    const app = new ChatApp({
+      manager,
+      model,
+      tools: (toolsFlag as ToolsetSpec | undefined) ?? toolset,
+      approvalMode: chatApprovalMode,
+      capabilities,
+      resumeRunId: runId,
+    });
+    summary = await app.run();
+  } catch (err) {
+    manager.close();
+    throw err;
+  }
+
+  console.log("");
+  if (summary.runId) {
+    console.log(`run ${summary.runId}`);
+    console.log(`status: ${summary.status ?? "unknown"} (${summary.cycles} cycle(s))`);
+    if (summary.error) console.error(`error: ${summary.error}`);
+  }
+  if (summary.runId && flags["no-distill"] !== true) {
+    try {
+      const outcome = await reflectRunById(summary.runId);
+      if (outcome.action === "created" || outcome.action === "updated") {
+        console.log(
+          `memory: ${outcome.action} ${outcome.record.id} (rev ${outcome.record.revision}) — ${outcome.reason}`,
+        );
+      } else {
+        console.log(`memory: ${outcome.action} — ${outcome.reason}`);
+      }
+    } catch (err) {
+      console.error(`memory: reflection failed (${err instanceof Error ? err.message : err})`);
+    }
+    if (await manager.drainMemoryBackfill()) {
+      console.log("memory: embedding backfill complete (vector recall now effective)");
+    }
+  }
+  manager.close();
+  return summary.status === "completed" || summary.status === undefined ? 0 : 1;
 }
 
 async function main(): Promise<number> {
@@ -192,6 +373,10 @@ async function main(): Promise<number> {
       return 2;
     }
     capabilities = requested;
+  }
+
+  if (command === "chat" || (process.argv.length <= 2 && process.stdin.isTTY)) {
+    return runChat(flags, capabilities);
   }
 
   if (command === "models") {
@@ -870,6 +1055,10 @@ async function main(): Promise<number> {
       "usage: agent-harness trace list | trace show <runId> [--all] | trace summary <runId> | trace replay <runId> [--until <seq>] | trace query <runId> [--tool <name>] [--errors]",
     );
     return 2;
+  }
+
+  if (command === "resume" && flags.chat === true) {
+    return resumeIntoChat(flags, capabilities, positional[0]);
   }
 
   if (command === "resume") {

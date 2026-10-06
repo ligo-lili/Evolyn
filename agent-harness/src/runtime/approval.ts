@@ -82,7 +82,10 @@ export function createPermissionGate(
   options: ApprovalOptions | undefined,
   audit: (event: HarnessAuditEvent) => void,
 ): Gate {
-  const mode = options?.mode ?? "auto-approve";
+  // Mode is read PER CALL, not captured at gate creation: the interactive
+  // session's slash commands (/yolo, /approval) mutate the SAME options object
+  // to flip the live gate without rebuilding the run.
+  const modeOf = (): ApprovalMode => options?.mode ?? "auto-approve";
   const granted: readonly Capability[] = options?.capabilities ?? ALL_CAPABILITIES;
   const approver = options?.approveFn ?? defaultApproveFn();
 
@@ -99,6 +102,7 @@ export function createPermissionGate(
 
     let allowed: boolean;
     let reason: string;
+    const mode = modeOf();
     if (mode === "auto-approve" || assessment.risk === "readonly") {
       allowed = true;
       reason = `mode=${mode} risk=${assessment.risk}`;

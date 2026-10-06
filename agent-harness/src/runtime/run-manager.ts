@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
-import type { AgentEvent, AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
+import type { Agent, AgentEvent, AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
 import type { Api, AssistantMessage, Model, Usage } from "@earendil-works/pi-ai";
 import type { DatabaseSync } from "node:sqlite";
-import { CODING_SYSTEM_PROMPT, DEFAULT_SYSTEM_PROMPT } from "../config.js";
+import { CODING_SYSTEM_PROMPT, DEFAULT_SYSTEM_PROMPT, INTERACTIVE_CONVERSATION_SUPPLEMENT } from "../config.js";
 import { HarnessError } from "../errors.js";
 import { resolveModel } from "../providers.js";
 import { openDatabase, defaultDbPath } from "../storage/db.js";
@@ -155,6 +155,12 @@ export interface RunOptions {
   limits?: RunLimits;
   /** Tiered retry policy for idempotent tools (transient errors only). */
   retry?: RetryPolicy;
+  /**
+   * Interactive-session posture: appends the multi-turn conversation
+   * supplement to the base system prompt. One-shot runs leave it unset so
+   * eval baselines stay byte-comparable.
+   */
+  interactive?: boolean;
 }
 
 export interface ResumeOptions {
@@ -249,6 +255,43 @@ function finalizeRun(input: {
 }
 
 /**
+ * One assembled agent conversation: the durable row, the agent, the trace and
+ * everything needed to close them. Shared by the one-shot `run()` and by the
+ * interactive session (src/runtime/session.ts) — the difference is only the
+ * DRIVING: run() does one prompt cycle and finalizes; a session keeps the
+ * same durable run open across many submit cycles and finalizes on exit.
+ */
+export interface RunSessionHandle {
+  readonly record: RunRecord;
+  readonly agent: Agent;
+  readonly tracePath?: string;
+  readonly limits: Required<RunLimits>;
+  /** Reset the per-cycle runaway counters (turns/tool-calls/repeats/strikes); money fuses stay cumulative. */
+  beginCycle(): void;
+  /** The current cycle's limit violation, if the fuses tripped (cleared by beginCycle). */
+  takeLimitViolation(): LimitViolation | undefined;
+  /** Classify the transcript's terminal state (conservative: dangling toolUse / error stop = failed). */
+  classify(): { status: RunStatus; error: string | undefined };
+  /** Transcript snapshot after the last completed cycle. */
+  messages(): AgentMessage[];
+  /**
+   * Request a manual compaction: the NEXT transformContext call (the next
+   * request) folds the context regardless of the budget lines.
+   */
+  requestCompact(): void;
+  /**
+   * Build the interactive cycle-refresh system message (fresh workspace map +
+   * newly promoted skills) for a user query, or undefined when nothing
+   * changed. Best-effort — never throws.
+   */
+  buildRefreshBlock(query: string): Promise<AgentMessage | undefined>;
+  /** Close the durable run: run_end trace event + status row. Idempotent — run_end must land exactly once. */
+  finalize(status: RunStatus, error: string | undefined): void;
+  /** Fire-and-forget embedding backfill (after finalize; no-op without an index or hybrid). */
+  beginMemoryBackfill(): void;
+}
+
+/**
  * Owns the run lifecycle (id, status, timing, trace, durable rows) and drives
  * one Agent per run. Checkpoint/Recovery (阶段 5/6) attach here next.
  */
@@ -271,10 +314,18 @@ export class RunManager {
     return this.db;
   }
 
-  async run(options: RunOptions): Promise<RunResult> {
+  /**
+   * Assemble everything one conversation needs (durable row, memory recall,
+   * skills, system prompt, composed tool chain, compaction, agent, trace +
+   * checkpoint wiring) WITHOUT driving it. The caller drives prompt cycles and
+   * MUST finalize exactly once — run_end is what keeps the trace bracket
+   * valid for resume.
+   */
+  async createRunSession(options: RunOptions): Promise<RunSessionHandle> {
     const faultSpec = parseFaultSpec(options.fault); // validates before anything is written
-    const basePrompt =
+    let basePrompt =
       options.systemPrompt ?? (options.tools === "coding" ? CODING_SYSTEM_PROMPT : DEFAULT_SYSTEM_PROMPT);
+    if (options.interactive) basePrompt += `\n\n${INTERACTIVE_CONVERSATION_SUPPLEMENT}`;
     const record: RunRecord = {
       id: randomUUID(),
       task: options.task,
@@ -347,21 +398,26 @@ export class RunManager {
     // 阶段 10 skill injection: promoted skills enter as <available_skills> —
     // the model reads the SKILL.md body on demand, mirroring pi's mechanism.
     let skillBlock: string | undefined;
+    let skillIndex: SkillIndex | undefined;
+    const initialSkillNames = new Set<string>();
     if (database && options.skills !== false) {
-      const index = new SkillIndex(database);
+      skillIndex = new SkillIndex(database);
       const only = options.skills?.only;
       const hits = only?.length
-        ? index.getByName(only)
-        : index.search(options.task, options.skills?.limit ?? DEFAULT_SKILL_LIMIT);
+        ? skillIndex.getByName(only)
+        : skillIndex.search(options.task, options.skills?.limit ?? DEFAULT_SKILL_LIMIT);
+      for (const hit of hits) initialSkillNames.add(hit.name);
       if (hits.length > 0) skillBlock = renderSkillBlock(toAssemblerEntries(hits, process.cwd()));
     }
+    // Computed once and reused as the refresh baseline (交互模式每轮刷新的签名基线).
+    const workspaceBlock = options.tools === "coding" ? renderWorkspaceBlock(buildWorkspaceTree()) : undefined;
     const systemPrompt = assembleSystemPrompt({
       base: basePrompt,
       // 加固期 (P1): core.md content is model-writable via the tools — escape
       // structural tags in the CONTENT; the wrapper is built here, unescaped.
       core: core ? `<core_memory>\n${escapeStructuralTags(core)}\n</core_memory>` : undefined,
       // 阶段 13: the coding toolset gets a deterministic workspace map.
-      workspace: options.tools === "coding" ? renderWorkspaceBlock(buildWorkspaceTree()) : undefined,
+      workspace: workspaceBlock,
       skills: skillBlock,
       experiences: experienceBlock,
     });
@@ -444,6 +500,8 @@ export class RunManager {
     // write half of the resume optimization (in-memory state dies with the
     // process; a resumed run continues the rolling summary from the record).
     const watermarkRepo = database ? new ContextWatermarkRepo(database) : undefined;
+    // 手动 /compact：置位后的一次 transformContext 无视预算线直接压缩。
+    const compactRequest = { requested: false };
     const contextTransformer = createContextTransformer({
       ...options.context,
       model: options.model,
@@ -452,6 +510,13 @@ export class RunManager {
       onEvent: (event) => recorder?.record(event),
       evidenceBase: path.join(".harness", "evidence", record.id),
       onWatermark: watermarkRepo ? (watermark) => watermarkRepo.save(record.id, watermark) : undefined,
+      manualCompact: {
+        take: () => {
+          const requested = compactRequest.requested;
+          compactRequest.requested = false;
+          return requested;
+        },
+      },
     });
     const agent = createAgent({
       model: options.model,
@@ -477,39 +542,103 @@ export class RunManager {
     };
     const unsubscribe = agent.subscribe(dispatch);
 
+    // 交互模式每轮刷新（interactive cycle refresh）：工作区地图 + 会话开始后
+    // 新晋升的技能，打包成一条 system 消息与用户消息批量 prompt——追加在转录
+    // 尾部，不动缓存前缀，也进 checkpoint。签名与上次相同时跳过（不变的树 /
+    // 无新技能 = 零注入）。记忆线索刻意不在刷新块里：system 块对两层压缩免疫，
+    // 每轮变化的线索会在投影里永久累积；新鲜检索由 memory_search 工具覆盖。
+    let lastRefreshSignature: string | undefined = [workspaceBlock, skillBlock]
+      .filter((b): b is string => b !== undefined)
+      .join("\n\n");
+    const buildRefreshBlock = async (query: string): Promise<AgentMessage | undefined> => {
+      try {
+        const sections: string[] = [];
+        if (workspaceBlock !== undefined) sections.push(renderWorkspaceBlock(buildWorkspaceTree()));
+        if (database && skillIndex && options.skills !== false) {
+          const hits = skillIndex.search(query, DEFAULT_SKILL_LIMIT + 2);
+          const fresh = hits.filter((hit) => !initialSkillNames.has(hit.name));
+          if (fresh.length > 0) sections.push(renderSkillBlock(toAssemblerEntries(fresh, process.cwd())));
+        }
+        if (sections.length === 0) return undefined;
+        const body = sections.join("\n\n");
+        if (body === lastRefreshSignature) return undefined;
+        lastRefreshSignature = body;
+        return {
+          role: "system",
+          content: `<session_refresh>\n${body}\n</session_refresh>`,
+          timestamp: Date.now(),
+        } as AgentMessage;
+      } catch {
+        return undefined; // refresh is best-effort — never break a submit
+      }
+    };
+
+    const startedMs = Date.now();
+    let finalized = false;
+    const handle: RunSessionHandle = {
+      record,
+      agent,
+      tracePath: traceFile,
+      limits,
+      beginCycle: () => {
+        limitViolation = undefined;
+        composed.limitEnforcer.resetCycle();
+      },
+      takeLimitViolation: () => limitViolation,
+      classify: () => classifyTerminal([...agent.state.messages]),
+      messages: () => [...agent.state.messages],
+      requestCompact: () => {
+        compactRequest.requested = true;
+      },
+      buildRefreshBlock,
+      finalize: (status, error) => {
+        if (finalized) return; // run_end must land exactly once (trace bracket invariant)
+        finalized = true;
+        finalizeRun({
+          record,
+          status,
+          error,
+          limitViolation,
+          end: (s, e) => recorder?.runEnd(s, e, Date.now() - startedMs),
+          unsubscribe,
+          runRepo,
+          label: "run",
+        });
+      },
+      beginMemoryBackfill: () => {
+        this.memoryBackfillContext = memoryIndex
+          ? { store: memoryStore, index: memoryIndex, embedder: memoryEmbedder }
+          : undefined;
+        this.beginMemoryBackfill();
+      },
+    };
+    return handle;
+  }
+
+  /**
+   * One-shot run: one assembled session, one prompt cycle, finalize at the
+   * end. Interactive sessions reuse createRunSession and keep the same
+   * durable run open across many user turns (src/runtime/session.ts).
+   */
+  async run(options: RunOptions): Promise<RunResult> {
+    const session = await this.createRunSession(options);
+    const { agent, record } = session;
     let status: RunStatus = "running";
     let error: string | undefined;
     let messages: AgentMessage[] = [];
-    const startedMs = Date.now();
-
     try {
       await agent.prompt(options.task);
       await agent.waitForIdle();
-      messages = [...agent.state.messages];
-      ({ status, error } = classifyTerminal(messages));
+      messages = session.messages();
+      ({ status, error } = session.classify());
     } catch (err) {
       status = "failed";
       error = err instanceof Error ? err.message : String(err);
     } finally {
-      finalizeRun({
-        record,
-        status,
-        error,
-        limitViolation,
-        end: (s, e) => recorder?.runEnd(s, e, Date.now() - startedMs),
-        unsubscribe,
-        runRepo,
-        label: "run",
-      });
-      // 向量补全触发点：run 结束后 fire-and-forget（宿主经 drainMemoryBackfill
-      // 决定是否等待——CLI 在 reflect 之后 drain，长驻宿主可以不理会）。
-      this.memoryBackfillContext = memoryIndex
-        ? { store: memoryStore, index: memoryIndex, embedder: memoryEmbedder }
-        : undefined;
-      this.beginMemoryBackfill();
+      session.finalize(status, error);
+      session.beginMemoryBackfill();
     }
-
-    return { record, messages, usage: sumAgentUsage(messages), tracePath: traceFile };
+    return { record, messages, usage: sumAgentUsage(messages), tracePath: session.tracePath };
   }
 
   get(id: string): RunRecord | undefined {
@@ -527,13 +656,20 @@ export class RunManager {
   }
 
   /**
-   * 阶段 6: rebuild a crashed run from trace + checkpoint, resolve every
-   * unresolved tool call (rebuild / re-execute / synthesize error), then drive
-   * the agent to completion on the SAME run id — trace seq continues, the
-   * transcript and tool-call state machine are stitched back exactly where
-   * the crash left them.
+   * Recover a crashed run WITHOUT driving it: reconcile the trace, rebuild the
+   * transcript, resolve every unresolved tool call (rebuild / re-execute /
+   * synthesize error), wire agent/trace/checkpoints — and hand the LIVE agent
+   * back. Shared by resume() (which drives to completion and finalizes) and
+   * the interactive session (which attaches the TUI and keeps the SAME run
+   * going — trace seq continues across the recovery).
    */
-  async resume(runId: string, options: ResumeOptions = {}): Promise<RunResult> {
+  async recoverRunSession(
+    runId: string,
+    options: ResumeOptions = {},
+  ): Promise<
+    | { kind: "recovered"; handle: RunSessionHandle; synthetic: AgentMessage[]; initialMessages: AgentMessage[] }
+    | { kind: "zombie"; record: RunRecord; tracePath: string }
+  > {
     const faultSpec = parseFaultSpec(options.fault); // validates before anything is written
     const database = this.ensureDatabase(options.database);
     if (!database) throw new HarnessError("resume requires the SQLite database (do not pass database: false)");
@@ -548,6 +684,8 @@ export class RunManager {
     const runRepo = new RunRepo(database);
     // 加固期第四轮: the read side of watermark persistence.
     const watermarkRepo = new ContextWatermarkRepo(database);
+    // 手动 /compact 触发器（交互式恢复路径）。
+    const compactRequest = { requested: false };
     const storedRow = runRepo.get(runId);
     if (!storedRow) throw new HarnessError(`run "${runId}" not found`);
     mkdirSync(traceDir, { recursive: true });
@@ -565,9 +703,11 @@ export class RunManager {
         process.stderr.write(
           `[harness] zombie run ${runId}: trace already ends with run_end (${healed.status}) — backfilled runs.status, nothing to recover\n`,
         );
-        return { record: healed, messages: [], tracePath: traceFile };
+        return { kind: "zombie", record: healed, tracePath: traceFile };
       }
     }
+    // Already-terminal rows (completed/failed) fall through to loadCrashedRun,
+    // which rejects them with the explicit "not resumable" contract.
     // 阶段 13 (P1-2): the two sinks are written per-event (JSONL first, SQLite
     // second) — a kill between the writes leaves a JSONL tail SQLite never saw.
     // SQLite is the resume authority; reconcile the JSONL BEFORE rebuilding, or
@@ -804,6 +944,14 @@ export class RunManager {
         // messages it never described. Re-summarizing is the safe direction.
         restoredWatermark: crashed.degradations.length === 0 ? watermarkRepo.get(runId) : undefined,
         onWatermark: (watermark) => watermarkRepo.save(runId, watermark),
+        // 交互式恢复同样支持 /compact（一次性消费触发器）。
+        manualCompact: {
+          take: () => {
+            const requested = compactRequest.requested;
+            compactRequest.requested = false;
+            return requested;
+          },
+        },
       }),
     });
     const checkpointWriter = new CheckpointWriter(new CheckpointRepo(database), record.id, () => recorder.lastSeq, {
@@ -830,9 +978,96 @@ export class RunManager {
     };
     const unsubscribe = agent.subscribe(dispatch);
 
+    // Cycle-refresh closure for the interactive path: fresh workspace map +
+    // skills promoted since the session started (same rules as
+    // createRunSession's refresh; memory cues deliberately excluded — see
+    // there for the reasoning). The baseline is the state at recovery time,
+    // so the first cycle injects only what actually changed.
+    const baselineSections: string[] = [];
+    if (toolsetSpec === "coding") baselineSections.push(renderWorkspaceBlock(buildWorkspaceTree()));
+    const resumeSkillIndex = new SkillIndex(database);
+    const baselineSkillHits = resumeSkillIndex.search(record.task, DEFAULT_SKILL_LIMIT + 2);
+    if (baselineSkillHits.length > 0)
+      baselineSections.push(renderSkillBlock(toAssemblerEntries(baselineSkillHits, process.cwd())));
+    let lastRefreshSignature: string | undefined =
+      baselineSections.length > 0 ? baselineSections.join("\n\n") : undefined;
+    const buildRefreshBlock = async (query: string): Promise<AgentMessage | undefined> => {
+      try {
+        const sections: string[] = [];
+        if (toolsetSpec === "coding") sections.push(renderWorkspaceBlock(buildWorkspaceTree()));
+        const hits = resumeSkillIndex.search(query, DEFAULT_SKILL_LIMIT + 2);
+        if (hits.length > 0) sections.push(renderSkillBlock(toAssemblerEntries(hits, process.cwd())));
+        if (sections.length === 0) return undefined;
+        const body = sections.join("\n\n");
+        if (body === lastRefreshSignature) return undefined;
+        lastRefreshSignature = body;
+        return {
+          role: "system",
+          content: `<session_refresh>\n${body}\n</session_refresh>`,
+          timestamp: Date.now(),
+        } as AgentMessage;
+      } catch {
+        return undefined; // refresh is best-effort — never break a submit
+      }
+    };
+
+    let finalized = false;
+    const handle: RunSessionHandle = {
+      record,
+      agent,
+      tracePath: traceFile,
+      limits,
+      beginCycle: () => {
+        limitViolation = undefined;
+        composed.limitEnforcer.resetCycle();
+      },
+      takeLimitViolation: () => limitViolation,
+      classify: () => classifyTerminal([...agent.state.messages]),
+      messages: () => [...agent.state.messages],
+      requestCompact: () => {
+        compactRequest.requested = true;
+      },
+      buildRefreshBlock,
+      finalize: (status, error) => {
+        if (finalized) return; // run_end must land exactly once (trace bracket invariant)
+        finalized = true;
+        finalizeRun({
+          record,
+          status,
+          error,
+          limitViolation,
+          end: (s, e) => recorder.runEnd(s, e, Date.now() - startedMs),
+          unsubscribe,
+          runRepo,
+          label: "resumed run",
+        });
+      },
+      beginMemoryBackfill: () => {
+        this.memoryBackfillContext = { store: memoryStore, index: memoryIndex, embedder: memoryEmbedder };
+        this.beginMemoryBackfill();
+      },
+    };
+    return { kind: "recovered", handle, synthetic, initialMessages: [...transcript, ...synthetic] };
+  }
+
+  /**
+   * 阶段 6: rebuild a crashed run from trace + checkpoint, resolve every
+   * unresolved tool call (rebuild / re-execute / synthesize error), then drive
+   * the agent to completion on the SAME run id — trace seq continues, the
+   * transcript and tool-call state machine are stitched back exactly where
+   * the crash left them.
+   */
+  async resume(runId: string, options: ResumeOptions = {}): Promise<RunResult> {
+    const recovered = await this.recoverRunSession(runId, options);
+    if (recovered.kind === "zombie") {
+      return { record: recovered.record, messages: [], tracePath: recovered.tracePath };
+    }
+    const { handle, synthetic, initialMessages } = recovered;
+    const { agent, record } = handle;
+
     let status: RunStatus = "running";
     let error: string | undefined;
-    let messages: AgentMessage[] = [...transcript, ...synthetic];
+    let messages: AgentMessage[] = initialMessages;
 
     try {
       if (synthetic.length > 0) {
@@ -851,7 +1086,7 @@ export class RunManager {
         if (messages.some((m) => m.role === "user")) {
           await agent.continue();
         } else {
-          await agent.prompt(crashed.record.task);
+          await agent.prompt(record.task);
         }
         await agent.waitForIdle();
       } else if (messages.at(-1)?.role === "toolResult") {
@@ -867,23 +1102,11 @@ export class RunManager {
       status = "failed";
       error = err instanceof Error ? err.message : String(err);
     } finally {
-      finalizeRun({
-        record,
-        status,
-        error,
-        limitViolation,
-        end: (s, e) => recorder.runEnd(s, e, Date.now() - startedMs),
-        unsubscribe,
-        runRepo,
-        label: "resumed run",
-      });
-      this.memoryBackfillContext = memoryIndex
-        ? { store: memoryStore, index: memoryIndex, embedder: memoryEmbedder }
-        : undefined;
-      this.beginMemoryBackfill();
+      handle.finalize(status, error);
+      handle.beginMemoryBackfill();
     }
 
-    return { record, messages, usage: sumAgentUsage(messages), tracePath: traceFile };
+    return { record, messages, usage: sumAgentUsage(messages), tracePath: handle.tracePath };
   }
 
   /**

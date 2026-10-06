@@ -82,6 +82,12 @@ export interface ContextManagementOptions {
   onEvent?: (event: HarnessAuditEvent) => void;
   /** 每次请求的完整决策记录（前端/测试消费）。 */
   onDecision?: (decision: ContextDecision) => void;
+  /**
+   * 手动压缩触发器（交互模式 /compact）：take() 返回 true 时，本次请求无视
+   * 预算线直接走压缩路径（前缀完整 → compact 到 forcedTarget；断裂 → rebuild
+   * 深压到 target）。一次性消费，由调用方负责置位。
+   */
+  manualCompact?: { take: () => boolean };
 }
 
 const DEFAULT_MAX_UNSUMMARIZED_BLOCKS = 12;
@@ -171,19 +177,23 @@ export function createContextTransformer(
     let summaryAttempts: number | undefined;
     let tokensAfter: number | undefined;
     let summarized = false;
+    // 手动 /compact：置位后的一次请求无视预算线直接压缩（一次性消费）。
+    const manual = options.manualCompact?.take() ?? false;
 
-    if (!overSoft && !overBlocks) {
+    if (!overSoft && !overBlocks && !manual) {
       decision = "reuse";
       reason = `estimate ${estimate.tokens} ≤ soft line ${budget.triggerTokens}`;
-    } else if (overSoft && !overForced && !overInput && !overBlocks) {
+    } else if (overSoft && !overForced && !overInput && !overBlocks && !manual) {
       decision = "defer";
       reason = `estimate ${estimate.tokens} over soft line ${budget.triggerTokens} but under forced line ${budget.compactCeiling} — keep appending`;
     } else {
-      const hard = overInput
-        ? `estimate ${estimate.tokens} exceeds input budget ${budget.inputBudget}`
-        : overForced
-          ? `estimate ${estimate.tokens} exceeds forced line ${budget.compactCeiling}`
-          : `unsummarized conversation blocks ${unsummarized} exceed limit ${maxUnsummarized}`;
+      const hard = manual
+        ? "manual /compact requested"
+        : overInput
+          ? `estimate ${estimate.tokens} exceeds input budget ${budget.inputBudget}`
+          : overForced
+            ? `estimate ${estimate.tokens} exceeds forced line ${budget.compactCeiling}`
+            : `unsummarized conversation blocks ${unsummarized} exceed limit ${maxUnsummarized}`;
       decision = intact ? "compact" : "rebuild";
       reason = intact
         ? `${hard}; prefix intact — compact back to forced target`

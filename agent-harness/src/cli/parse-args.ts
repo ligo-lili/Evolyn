@@ -24,6 +24,7 @@ export interface ParsedArgs {
 /** Flags that are pure switches — `--flag` alone is the intended usage. */
 const SWITCH_FLAGS = new Set([
   "yolo",
+  "chat",
   "no-distill",
   "force",
   "yes",

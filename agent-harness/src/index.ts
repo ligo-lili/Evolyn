@@ -8,8 +8,10 @@ export {
   type ResumeOptions,
   type RunRecord,
   type RunResult,
+  type RunSessionHandle,
   type RunStatus,
 } from "./runtime/run-manager.js";
+export { InteractiveSession, type CycleOutcome, type SessionPhase } from "./runtime/session.js";
 export { ConsoleReporter, CollectingReporter, type RunReporter } from "./runtime/reporter.js";
 export {
   createPermissionGate,

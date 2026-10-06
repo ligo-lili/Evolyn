@@ -22,3 +22,15 @@ export const CODING_SYSTEM_PROMPT =
 export function defaultModelSpec(): string | undefined {
   return process.env.HARNESS_MODEL || undefined;
 }
+
+/**
+ * Interactive-mode supplement (chat): appended to the coding prompt for
+ * multi-turn sessions. Kept OUT of CODING_SYSTEM_PROMPT so one-shot eval
+ * baselines stay byte-comparable.
+ */
+export const INTERACTIVE_CONVERSATION_SUPPLEMENT =
+  "You are in an interactive conversation with the user that may span many turns. " +
+  "Work already completed in earlier turns is done — never repeat it; build on it. " +
+  "Keep each turn focused on what the user last asked, report outcomes concisely " +
+  "(what changed, where, how it was verified), and adapt immediately when the user " +
+  "interrupts or steers you toward a different instruction.";

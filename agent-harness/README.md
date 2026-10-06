@@ -1,6 +1,6 @@
 # agent-harness
 
-English | [简体中文](README.zh-CN.md)
+English | [简体中文](../README.md)
 
 **A durable, self-improving coding agent — built on [Pi](https://github.com/earendil-works/pi)'s low-level agent runtime (loop, tools, streaming are reused), adding the layers Pi does not provide: run-level durability, a queryable execution trace, permissions & budgets, experience memory, and a self-evolving skill loop.**
 

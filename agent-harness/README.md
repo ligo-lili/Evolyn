@@ -2,7 +2,10 @@
 
 English | [简体中文](../README.md)
 
-**A durable, self-improving coding agent — built on [Pi](https://github.com/earendil-works/pi)'s low-level agent runtime (loop, tools, streaming are reused), adding the layers Pi does not provide: run-level durability, a queryable execution trace, permissions & budgets, experience memory, and a self-evolving skill loop.**
+**A durable, self-improving coding agent** built on [Pi](https://github.com/earendil-works/pi)'s
+low-level agent runtime. Pi supplies the loop, tools and streaming; this project
+adds the layers it does not: run-level durability, a queryable execution trace,
+permissions and budgets, experience memory, and a self-evolving skill loop.
 
 ## Quick start
 
@@ -17,188 +20,145 @@ npm run harness -- run "<task>" --model deepseek/deepseek-flash --tools coding -
 Requires Node ≥ 22.19 (built-in `node:sqlite`). Providers: `deepseek/*`,
 `qwen/*` (DashScope), `openrouter/*`, `openai/*`, `anthropic/*` — keys from the
 environment. Tool calls default to **interactive approval**; `--yolo` opts out.
+CI runs build, typecheck, lint and the full suite on a windows/ubuntu × Node
+22/24 matrix.
+
+## Interactive mode
+
+```powershell
+npm run harness -- chat --model deepseek/deepseek-flash --tools coding
+```
+
+A Claude Code-style TUI: streaming markdown, tool cards (edits render diffs,
+shell renders output tails), mid-run steering, `Esc` to interrupt, slash
+commands with autocomplete (`/help /model /yolo /approval /tools /memory
+/trace /compact /clear /quit`), and an approval dialog. A bare invocation on a
+TTY equals `chat`; scripts should use `run`.
+
+An interactive session **is** a durable run: the trace bracket spans the whole
+conversation, so `resume <runId> --chat` recovers a crashed session and
+continues it in the TUI. Runaway counters reset per submit; the cost and token
+fuses stay cumulative across the session.
 
 ## Features
 
-- **Durable execution** — every run is checkpointed at message boundaries; a
-  killed process resumes on the **same run id** with the trace sequence
-  continuing, and the run's toolset is restored from the persisted run row
-  (a crashed `--tools coding` run does not resume against the demo default). Pending tool calls are resolved by rule: rebuild from the logged
-  result, gated re-execute (idempotent tools), or a synthesized
-  "result unknown" error fed back to the model — never a hallucinated success.
-  A "zombie" run whose trace already finished is self-healed (status
-  backfilled), not resumed into a broken bracket; a run killed between the
-  sinks of its FIRST trace event restarts the task under the same run id —
-  but only when the trace file proves the run was traced and no checkpoint,
-  watermark or evidence file proves the ledger was partially lost; otherwise
-  resume refuses rather than risk re-running side effects.
-- **Reproducible crashes** — fault injection (`--fault point:tool`) kills the
-  process at exact points — after a tool call, mid-execution, between the two
-  trace sinks, after a tool-carrying assistant message ("planned"), or mid-
-  recovery — so recovery is testable, not staged.
-- **The execution is a database** — every event lands in JSONL and SQLite with
-  one shared sequence; `trace summary / replay --until / query` answer "what
-  happened and why" for any run, including debugger-style state inspection at
-  any past sequence number. Sink failures leave tolerable holes, not a broken
-  log.
-- **Permissions & audit** — per-run capability grants (`fs:read/write`,
-  `process:exec`, `net:outbound`, `notify:send`), risk classes, interactive
-  approval that shows the actual arguments, a workspace path fence
-  (lexical + symlink-realpath) on every path-like tool argument, and a write
-  fence that keeps the structured file tools out of the harness state dir
-  (`.harness/` — and any relocated state locations a custom database/traceDir
-  selects) — model edits cannot bypass the memory store's locks and history
-  (shell-class tools remain a documented non-goal); every decision lands in
-  the trace as an audit event.
-- **Runaway guards** — turns, tool calls, repeated identical calls, cost
-  budget, token budget (the backstop for models that report zero cost), and
-  per-tool timeouts (which are never retried — the first execution may still
-  be running); violations degrade the run to `failed` with the reason
-  attached.
-- **Context that scales** — context management rebuilt around a block model
-  (system / conversation / tool-round / malformed blocks — tool-call ids must
-  pair exactly via a Counter or the whole round degrades to a conservatively
-  kept malformed block), six budget lines (input budget → 64k working
-  preference → 0.80 soft trigger → forced ceiling → 0.45 deep target → an
-  independent tool-result ledger), calibrated token estimation (chars/4 ×
-  model-family coefficient, `scripts/calibrate_tokens.mjs` recalibrates against
-  real traces), and a prompt-cache-first decision loop: every model call
-  produces a `prefix_decision` — reuse / defer (over the soft line but the
-  cached prefix is reusable: keep appending!) / compact / rebuild (prefix
-  broken: deep-compact to the target). Layer 1 trims old tool results
-  deterministically (head+tail with an evidence pointer, oldest-first whole-
-  round removal, semantic JSON trimming for registered tools); layer 2 folds
-  the prefix into a strict-JSON rolling summary (hard caps, a must-be-smaller
-  gate, one retry with the failure reason, big-fold relaxation). All of it is
-  model-view only: the transcript and trace stay append-only, and every
-  decision lands in the trace as a `context_decision` event.
-- **Read-only subagents (context isolation)** — the `explore` tool (coding
-  toolset) spawns a full child agent with its own context window, a restricted
-  readonly toolset (read/grep/ls/find — no shell, no recursion) and its own
-  tighter limits + context management. The child's final answer arrives as the
-  tool result; its intermediate reads never enter the parent's conversation.
-  The child is a pure function of (task, workspace): the parent call is
-  `replay: "safe"`, so a crash mid-subagent re-executes the whole child on
-  resume through the ordinary recovery path — no nested checkpointing. The
-  child's usage lands on the parent's cost/token fuses, its audit events
-  (`subagent_start/end`) land in the trace, and its full transcript lands in
-  the evidence directory.
-- **Experience memory** — dual-layer: structured
-  **Core Memory** (key upserts only, every entry carries `reason` +
-  `source_statement` evidence, 2000-token injection budget) and **ordinary
-  memories** (one Markdown file each, `M001…` ids, optimistic-lock
-  `revision`, active/archive with a hard 25-active cap, atomic writes,
-  version snapshots under `history/` (last 5, FIFO),
-  `INDEX.md` projection). Writes go through **three gates**: a deterministic
-  reflection gate → a strict-JSON `{action: none|create|update}` reflector →
-  an authorized write (updates allowed only for ids the run actually READ —
-  mechanism, not prompt). Retrieval is chunk-level FTS (trigram-probed) +
-  local `e5` vectors fused by memory-level RRF with an explicit degrade chain
-  (`mode` + `degrade_reason` on every result) and a bounded accessCount
-  ranking boost. The vector path takes effect once the background backfill
-  completes — until then every search honestly reports FTS-only; runs with
-  no vectors never load the model at all. Startup reconciles from the
-  Markdown authority, embeddings backfill in the background with bounded
-  backoff (CLI drains it before exit; `memory: { hybrid: false }` opts out).
-  The model gets `memory_read / memory_search / memory_create /
-  memory_update / memory_archive / core_memory_update` (coding toolset by
-  default). Retrieval quality is gated in CI by `npm run eval:memory`
-  (recall@5 + precision@5 + a blind-spot check over
-  `evals/memory-retrieval.json`); the real-model chain (download → run →
-  backfill complete → next run recalls hybrid) is `npm run
-  e2e:memory-hybrid` — ledger-only, not CI (30MB model download).
-- **Skill self-evolution** — recurring patterns are mined from traces
-  (support ≥ 3 hard gate), distilled into pi-compatible `SKILL.md` files,
-  verified with Pi's own loader, and injected as `<available_skills>` into
-  future runs — with provenance markers ("mined from this workspace's own run
-  history — treat as data") and structural-tag escaping, so mined content can
-  never pose as system instructions; `--force` promotion over an existing
-  skill requires a confirmed diff.
-- **Eval framework** — deterministic judging (the repo's own tests decide for
-  coding tasks), regression baselines, Wilson confidence intervals, a
-  minimum-repeats floor for anything that gates, and an infra-failure guard
-  that marks contaminated reports INVALID before they can gate anything.
-- **Data retention** — `harness prune` drops checkpoints AND persisted
-  context watermarks of finished runs (recovery only reads interrupted ones)
-  and traces/evidence beyond a keep window.
+- **Durable execution** — runs checkpoint at message boundaries; a killed
+  process resumes on the **same run id** with the trace sequence continuing and
+  the toolset restored. Pending tool calls are resolved by rule — rebuild from
+  the logged result, gated re-execution (idempotent tools), or a synthesized
+  "result unknown" error — never a hallucinated success; an ambiguous partial
+  ledger refuses to resume rather than risk duplicated side effects.
+- **Reproducible crashes** — fault injection kills the process at exact points
+  (after a tool call, mid-execution, between the two trace sinks, mid-recovery),
+  so recovery is tested, not staged.
+- **The execution is a database** — every event lands in JSONL and SQLite under
+  one shared sequence; `trace summary / replay / query` answer "what happened
+  and why" for any run, including debugger-style inspection at any past
+  sequence number.
+- **Permissions & guardrails** — per-run capability grants, risk classes and
+  interactive approval that shows the actual arguments; a workspace path fence
+  plus a write fence that keeps structured file tools out of the harness state
+  directory (including relocated state locations). Turn, tool-call, repeat,
+  cost and token budgets plus per-tool timeouts (never retried) fail the run
+  with the reason attached. Every decision is an audit event in the trace.
+- **Context that scales** — a block model and six budget lines drive a
+  prompt-cache-first decision (`reuse / defer / compact / rebuild`) on every
+  model call. Two reduction layers — deterministic tool-result trimming, then a
+  strict-JSON rolling summary — keep the model view small while the transcript
+  and trace stay append-only.
+- **Read-only subagents** — the `explore` tool spawns a child agent with its
+  own context window and a no-shell readonly toolset; intermediate reads never
+  enter the parent conversation, and a crash mid-child replays safely on resume.
+- **Experience memory** — dual-layer: evidence-backed **Core Memory** plus
+  ordinary Markdown-file memories, written through three gates (deterministic
+  filter → strict-JSON reflector → authorized write). Retrieval fuses
+  chunk-level FTS with local vectors behind an explicit degrade chain
+  (`mode` + reason on every result); quality is CI-gated by
+  `npm run eval:memory`.
+- **Skill self-evolution** — recurring patterns mined from this workspace's own
+  trace history (support ≥ 3) are distilled into pi-compatible `SKILL.md`
+  files and injected as pointers future runs read on demand. Mined content is
+  provenance-marked and tag-escaped, so it can never pose as system
+  instructions.
+- **Eval framework** — deterministic end-state judging, protocol-pinned A/B
+  comparisons, Wilson confidence intervals, and an infra-failure guard that
+  invalidates contaminated reports; see [Eval](#eval).
+- **Data retention** — `harness prune` bounds completed-run checkpoints,
+  context watermarks, traces and evidence.
 
-## Modules
+## Repository structure
 
-All under `src/`; each module is dependency-light and unit-tested without API
-keys.
+```text
+agent-harness/
+  src/
+    runtime/     run lifecycle — RunManager.run/resume and the shared assembly
+                 point behind chat sessions; the composed tool chain
+                 (fault → evidence → timeout → retry) and the limits → permission gate
+    execution/   durability kernel — lagging checkpoints, fault injection, crash reconstruction
+    trace/       event sourcing — dual JSONL+SQLite sinks sharing one sequence,
+                 reconcile, pure offline replay state machine
+    context/     what the model sees — deterministic assembler, block model,
+                 two-layer compaction, prefix-decision loop
+    memory/      cross-run experience — Markdown authority store, core memory,
+                 hybrid search, reflection gates, the model's memory tools
+    learning/    self-improvement — pattern miner, skill distiller,
+                 A/B eval comparison (incl. cheat-resistant grading)
+    skills/      pi-compatible SKILL.md format, eval-gated promotion, pointer retrieval
+    storage/     node:sqlite (WAL), forward-only migrations, per-table repos
+    llm/         completeStructured — malformed-JSON-tolerant extraction calls
+    cli/         one binary: run / chat / resume / trace / memory / skill / models / prune
+    modes/       interactive TUI (chat view, tool cards, approval dialog)
+  evals/         task sets + fixture repos for the eval harness
+                 (memory-retrieval, coding-fix, file-creation, file-precision,
+                  coding-hard, coding-compact, open-ended)
+  scripts/       utility CLIs — eval:coding, eval:memory, e2e:memory-hybrid,
+                 calibrate_tokens, chaos, export-traces
+  tests/         full suite — every test runs without an API key
+  .claude/       eval campaign records — per-flow baselines, round-by-round
+                 changes, results and report.html artifacts
+```
 
-- **`runtime/`** — owns the run lifecycle. `RunManager.run/resume` drive one
-  Pi `Agent` per run; `composeRuntime()` is the single assembly point for the
-  tool wrapper chain (fault → evidence → timeout → retry) and the
-  `beforeToolCall` gate (limits → permission), shared by run and resume.
-  Two toolsets: `demo` (four teaching tools, incl. a non-idempotent one for
-  crash demos) and `coding` (Pi's read/edit/write/grep/ls/find + shell, with
-  capability/risk/`replay` metadata overlaid). `agent-factory.ts` is the only
-  file that touches Pi's constructor.
+Every module is dependency-light and unit-tested without API keys. Runtime
+state lives in `.harness/` (SQLite ledger, traces, memory, evidence) and is
+fully disposable except for the Markdown memory authority.
 
-- **`execution/`** — the durability kernel. `CheckpointWriter` appends a
-  checkpoint at every message boundary, always *lagging* the trace log;
-  `FaultController` provides the two kill points; `recovery.ts` rebuilds the
-  crashed moment from persisted data alone (transcript, pending tool-call
-  state machine) and plans per-call resolution; the lagging checkpoint is
-  cross-checked — disagreements surface as degradation warnings, never
-  silent repair.
+Cross-module invariants: the transcript and trace are **append-only**
+(compaction only projects); `compose.ts` is the single tool-wrapping point;
+Markdown is the **memory authority** (SQLite holds rebuildable projections);
+recovery stays conservative (never a hallucinated success); and **decisions are
+data** — recovery resolutions, context decisions and permission verdicts all
+land in the trace.
 
-- **`trace/`** — event sourcing. Events reuse Pi's vocabulary inside a
-  versioned envelope; the recorder fans out to JSONL (unbuffered
-  `appendFileSync` — a kill only loses events never emitted) and SQLite
-  (indexed extracted columns) sharing one sequence. `reconcile.ts` re-aligns
-  the JSONL tail to SQLite before resume; `replay.ts` is a pure offline state
-  machine that rebuilds transcript and tool-call state at any sequence and
-  explains how it got there.
+## Eval
 
-- **`context/`** — what the model sees. `assembler` builds the system prompt
-  deterministically (base → core memory → skills → experience → workspace
-  tree; byte-stable for prompt caching). The rest is a two-layer context
-  manager hooked at `transformContext`: `blocks` partitions the transcript
-  into the four block types (the minimum unit of every compression decision —
-  never a half tool-round); `tokens` estimates with a calibrated model-family
-  coefficient and blends the last measured usage; `budget` derives the six
-  lines; `reducers/tool` is the deterministic layer-1 (truncate head+tail with
-  an evidence pointer, remove whole rounds oldest-first, semantic JSON
-  trimming; resumed segments age out under the same rules); `summarizer` + `reducers/conversation`
-  are the model-driven layer-2 (strict JSON rolling summary with hard
-  validation, a covered-message watermark — persisted across resume so a
-  resumed run continues its rolling summary instead of re-summarizing the
-  pre-crash prefix — and id/tool-call-precise prefix replacement); `compaction` is the orchestrator producing a `prefix_decision`
-  (reuse/defer/compact/rebuild) for every request — the raw history is never
-  modified, only projected. `compose.ts` is the shared tool-wrapper chain and
-  the gate composition, reused verbatim by the explore subagent as
-  "run-lite" (restricted toolset, own limits, own enforcer).
+Three deterministic layers — no LLM judge except where a task opts in:
 
-- **`memory/`** — experience that survives runs, per `memory-design.md`.
-  `model` (M### record + 900/180/16 chunking with `title | summary` semantic
-  headers and per-chunk sha256), `store` (Markdown authority: CORE.md /
-  INDEX.md / active / archive, atomic writes, mutation guard, capacity),
-  `core` (evidence-backed key upserts, token-budgeted injection), `search`
-  (chunk index + FTS5 tokenizer probe + RRF-by-memory fusion, degrade chain,
-  reconcile, background embedding backfill with conditional writes),
-  `reflection` (deterministic gate → strict-JSON reflector → authorized
-  write), `tools` (the model's memory surface).
+- **Unit / integration** — 283 tests, no API key required (CI matrix:
+  windows/ubuntu × Node 22/24).
+- **Memory retrieval gate** — `npm run eval:memory` (recall@5 + precision@5 +
+  blind-spot check) gates CI; the real-model chain is
+  `npm run e2e:memory-hybrid` (ledger-only — 30 MB model download).
+- **Coding-agent eval runner** — `npm run eval:coding`: sandboxed per-case
+  runs, deterministic end-state grading (fixture tests / exact file checks,
+  with test files restored before grading — editing the tests cannot turn the
+  grade green), resumable results, a report builder and a harness-integrity
+  gate.
 
-- **`learning/`** — the self-improvement loop. `miner` extracts ordered tool
-  sequences and error→repair pairs (hard support ≥ 3 gate; deterministic
-  pattern ids survive re-mining). `candidate` distills a draft skill with
-  provenance. `eval` runs A/B comparisons: repeats, arm interleaving,
-  protocol pinning (task set + model + toolset), deterministic judging, and
-  the infra-failure guard.
+Campaign records live in `.claude/hillclimb/` (per-flow baselines,
+round-by-round changes, results and `report.html`): regression baseline
+89/90 → 90/90 (−22.4% output tokens after prompt tuning); quality probe 96.2%;
+compaction fidelity, dual-arm (1/21 damage, +15% token tax); skill A/B (three
+promoted skills read but unpaid — no measurable gain).
 
-- **`skills/`** — pi-compatible `SKILL.md` format (frontmatter validation),
-  promotion re-verified by Pi's own `loadSkillsFromDir` and gated by the eval
-  ledger, retrieval as pointer injection the model reads on demand.
+## CLI
 
-- **`storage/`** — `node:sqlite` in WAL mode (zero native dependencies),
-  forward-only migrations, per-table repos for runs / trace events /
-  checkpoints / memory / skills / evals.
-
-- **`llm/`** — `completeStructured`: direct parse → re-prompt with the parse
-  error → constrained decoding via a schema tool. All harness-side extraction
-  (distiller, miner, judge) survives malformed JSON.
-
-- **`cli/`** — one binary (`run`, `resume`, `trace`, `memory`, `skill`,
-  `models`), interactive approval on TTY with non-TTY auto-deny.
+| Command | What it does |
+|---|---|
+| `agent-harness [chat]` | interactive coding agent (REPL — see [Interactive mode](#interactive-mode)) |
+| `agent-harness run "<task>"` | one task (`--model`, `--tools demo\|coding`, `--yolo`, `--capabilities`, `--fault`) |
+| `agent-harness resume [runId] [--chat]` | recover an interrupted run on the same run id; `--chat` continues it in the TUI |
+| `agent-harness trace show/summary/replay/query/list` | inspect and replay execution traces |
+| `agent-harness memory core/list/search/rebuild/status/history/distill` | memory inspection and maintenance |
+| `agent-harness skill mine/draft/promote/eval/baseline/list/retrieve/verify` | skill mining, promotion and A/B eval |
+| `agent-harness models` | list providers and models |
+| `agent-harness prune [--deep] [--dry-run]` | data retention |

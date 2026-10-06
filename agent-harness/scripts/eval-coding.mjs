@@ -39,12 +39,14 @@
 // baseline/ under the same flow dir).
 
 import { createHash } from 'node:crypto';
-import { closeSync, constants as FS, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import { closeSync, constants as FS, cpSync, existsSync, fstatSync, ftruncateSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { isInfraFailure, judgeRun, loadTaskSet, prepareTaskWorkspace, readBackVerified } from '../dist/learning/eval.js';
 import { RunManager } from '../dist/runtime/run-manager.js';
 import { resolveModel } from '../dist/providers.js';
+import { openDatabase } from '../dist/storage/db.js';
+import { SkillIndex } from '../dist/skills/retrieve.js';
 
 // Captured at load: fills chdir into the sandbox later, and the harness-path
 // list in _state.json is spelled relative to the invocation dir (repo root —
@@ -228,6 +230,22 @@ async function runCase(c, ctx) {
     for (const entry of readdirSync(sandboxDir)) {
       rmSync(join(sandboxDir, entry), { recursive: true, force: true });
     }
+    // Skill arms: the skill index lives in the run database and every case runs
+    // against a fresh sandbox DB — seed the sandbox with the promoted skill
+    // files and rebuild the in-sandbox index so `skills.only` resolves. The
+    // rendered <available_skills> paths are cwd-relative, so the SKILL.md
+    // files must live inside the sandbox for the model to read them.
+    if (ctx.skill) {
+      const promotedDst = join(sandboxDir, ".harness", "skills", "promoted");
+      mkdirSync(promotedDst, { recursive: true });
+      cpSync(join(REPO_ROOT, ".harness", "skills", "promoted"), promotedDst, { recursive: true });
+      const db = openDatabase(join(sandboxDir, ".harness", "harness.db"));
+      try {
+        new SkillIndex(db).rebuild(promotedDst);
+      } finally {
+        db.close();
+      }
+    }
     try {
       prepareTaskWorkspace(c.task); // template reset - every run starts clean
     } catch (err) {
@@ -245,7 +263,7 @@ async function runCase(c, ctx) {
         // set is operator-provided executable configuration.
         approval: { mode: 'auto-approve' },
         reporter: { onEvent: () => {} },
-        skills: false,
+        skills: ctx.skill ? { only: [ctx.skill] } : false,
         // Compaction experiments: a small value triggers the two-layer context
         // management on tractable fixtures; a huge value is the no-compaction arm.
         context:
@@ -374,7 +392,7 @@ function toTranscript(systemPrompt, messages) {
 function parseArgs(argv) {
   const a = { flow: '.claude/hillclimb/coding-tasks', variant: 'baseline',
               model: 'deepseek/deepseek-flash', reps: 1, concurrency: 1, timeoutS: 600,
-              cases: undefined, sets: undefined, preferenceTokens: undefined, approveHarness: false };
+              cases: undefined, sets: undefined, preferenceTokens: undefined, skill: undefined, approveHarness: false };
   // A flag at the end of argv would otherwise consume undefined - which for
   // --model equals the default and silently disables the served-model check.
   const val = (i) => { if (argv[i] === undefined) { eprint(`missing value for ${argv[i - 1]}`); usage(); process.exit(2); } return argv[i]; };
@@ -389,6 +407,7 @@ function parseArgs(argv) {
     else if (k === '--cases') a.cases = val(++i);
     else if (k === '--sets') a.sets = val(++i);
     else if (k === '--preference-tokens') a.preferenceTokens = val(++i);
+    else if (k === '--skill') a.skill = val(++i);
     else if (k === '--approve-harness') a.approveHarness = true;
     else if (k === '-h' || k === '--help') { usage(); process.exit(0); }
     else { eprint(`unknown argument: ${k}`); usage(); process.exit(2); }
@@ -412,7 +431,7 @@ function parseArgs(argv) {
   return a;
 }
 function usage() {
-  eprint('usage: node scripts/eval-coding.mjs --variant baseline|v<N> [--model ID] [--reps N] [--cases id1,id2] [--flow DIR] [--timeout-s N (0 = no ceiling)] [--approve-harness]');
+  eprint('usage: node scripts/eval-coding.mjs --variant baseline|v<N> [--model ID] [--reps N] [--cases id1,id2] [--sets f[:fam],...] [--skill name] [--preference-tokens N] [--flow DIR] [--timeout-s N (0 = no ceiling)] [--approve-harness]');
   eprint('  defaults: --flow .claude/hillclimb/coding-tasks --model deepseek/deepseek-flash --reps 1 (use --reps 2+ for a baseline) --timeout-s 600');
 }
 

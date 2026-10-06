@@ -1,0 +1,43 @@
+{
+  "metrics": [
+    {
+      "id": "pass",
+      "kind": "binary",
+      "label": "Task pass"
+    },
+    {
+      "id": "verified",
+      "kind": "binary",
+      "label": "Write→read"
+    }
+  ],
+  "perf_fields": [
+    {
+      "id": "latency_s",
+      "label": "latency",
+      "unit": "s"
+    },
+    {
+      "id": "tool_calls",
+      "label": "tools"
+    },
+    {
+      "id": "in_tokens",
+      "label": "tok in"
+    },
+    {
+      "id": "out_tokens",
+      "label": "tok out"
+    }
+  ],
+  "harness_paths": [
+    "evals/coding-hard-v1.json",
+    ".harness/skills/promoted/fix-failing-node-test-suite/SKILL.md",
+    ".harness/skills/promoted/powershell-test-fix-loop/SKILL.md",
+    ".harness/skills/promoted/write-then-readback-verify/SKILL.md",
+    "src/learning/eval.ts",
+    "src/learning/judge.ts",
+    "src/learning/protocol.ts"
+  ],
+  "harness_sha": "e6ef2bec53a5bdc370d2162ab71a1b5d8e2c90b416c7f5e75271b6b48d134f49"
+}

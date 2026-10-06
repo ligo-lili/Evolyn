@@ -1,0 +1,40 @@
+{
+  "metrics": [
+    {
+      "id": "pass",
+      "kind": "binary",
+      "label": "Task pass"
+    },
+    {
+      "id": "verified",
+      "kind": "binary",
+      "label": "Write→read"
+    }
+  ],
+  "perf_fields": [
+    {
+      "id": "latency_s",
+      "label": "latency",
+      "unit": "s"
+    },
+    {
+      "id": "tool_calls",
+      "label": "tools"
+    },
+    {
+      "id": "in_tokens",
+      "label": "tok in"
+    },
+    {
+      "id": "out_tokens",
+      "label": "tok out"
+    }
+  ],
+  "harness_paths": [
+    "evals/coding-compact-v1.json",
+    "src/learning/eval.ts",
+    "src/learning/judge.ts",
+    "src/learning/protocol.ts"
+  ],
+  "harness_sha": "efe455681461d94a40d62947cce22de90eb4322ad18f83a7b9e4c12808c9708a"
+}

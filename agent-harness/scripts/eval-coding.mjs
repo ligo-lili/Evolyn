@@ -246,6 +246,12 @@ async function runCase(c, ctx) {
         approval: { mode: 'auto-approve' },
         reporter: { onEvent: () => {} },
         skills: false,
+        // Compaction experiments: a small value triggers the two-layer context
+        // management on tractable fixtures; a huge value is the no-compaction arm.
+        context:
+          ctx.preferenceTokens !== undefined
+            ? { budget: { preferenceTokens: Number(ctx.preferenceTokens) } }
+            : undefined,
       });
       const messages = result.messages;
       const raw = { taskId: c.id, status: result.record.status, error: result.record.error };
@@ -368,7 +374,7 @@ function toTranscript(systemPrompt, messages) {
 function parseArgs(argv) {
   const a = { flow: '.claude/hillclimb/coding-tasks', variant: 'baseline',
               model: 'deepseek/deepseek-flash', reps: 1, concurrency: 1, timeoutS: 600,
-              cases: undefined, sets: undefined, approveHarness: false };
+              cases: undefined, sets: undefined, preferenceTokens: undefined, approveHarness: false };
   // A flag at the end of argv would otherwise consume undefined - which for
   // --model equals the default and silently disables the served-model check.
   const val = (i) => { if (argv[i] === undefined) { eprint(`missing value for ${argv[i - 1]}`); usage(); process.exit(2); } return argv[i]; };
@@ -382,6 +388,7 @@ function parseArgs(argv) {
     else if (k === '--timeout-s') a.timeoutS = +val(++i);
     else if (k === '--cases') a.cases = val(++i);
     else if (k === '--sets') a.sets = val(++i);
+    else if (k === '--preference-tokens') a.preferenceTokens = val(++i);
     else if (k === '--approve-harness') a.approveHarness = true;
     else if (k === '-h' || k === '--help') { usage(); process.exit(0); }
     else { eprint(`unknown argument: ${k}`); usage(); process.exit(2); }
